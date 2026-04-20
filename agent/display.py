@@ -20,6 +20,45 @@ _RESET = "\033[0m"
 
 logger = logging.getLogger(__name__)
 
+# Stable per-tool emoji fallbacks for runtime surfaces that use display helpers
+# before tool discovery has populated tools.registry (for example focused tests
+# that monkeypatch run_agent, API-server streaming, or early gateway progress
+# callbacks). Keep these aligned with the registry defaults for the most common
+# user-facing tools so chat surfaces don't regress to generic ⚙️ / ⚡ markers.
+_BUILTIN_TOOL_EMOJIS = {
+    "terminal": "💻",
+    "process": "⚙️",
+    "read_file": "📖",
+    "write_file": "✍️",
+    "patch": "🔧",
+    "search_files": "🔎",
+    "web_search": "🔍",
+    "web_extract": "📄",
+    "browser_navigate": "🌐",
+    "browser_snapshot": "📸",
+    "browser_click": "👆",
+    "browser_type": "⌨️",
+    "browser_scroll": "📜",
+    "browser_back": "◀️",
+    "browser_press": "⌨️",
+    "browser_get_images": "🖼️",
+    "browser_vision": "👁️",
+    "browser_console": "🖥️",
+    "vision_analyze": "👁️",
+    "execute_code": "🐍",
+    "delegate_task": "🔀",
+    "todo": "📋",
+    "memory": "🧠",
+    "session_search": "🔍",
+    "skill_view": "📚",
+    "skills_list": "📚",
+    "skill_manage": "📝",
+    "text_to_speech": "🔊",
+    "clarify": "❓",
+    "send_message": "📨",
+    "cronjob": "⏰",
+}
+
 _ANSI_RESET = "\033[0m"
 _ANSI_DIM = "\033[38;2;150;150;150m"
 _ANSI_FILE = "\033[38;2;180;160;255m"
@@ -101,7 +140,8 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     Resolution order:
     1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
     2. Tool registry's per-tool ``emoji`` field
-    3. *default* fallback
+    3. Built-in fallback map for common user-facing tools
+    4. *default* fallback
     """
     # 1. Skin override
     skin = _get_skin()
@@ -117,7 +157,11 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
             return emoji
     except Exception:
         pass
-    # 3. Hardcoded fallback
+    # 3. Stable fallback when registry discovery hasn't happened yet.
+    emoji = _BUILTIN_TOOL_EMOJIS.get(tool_name)
+    if emoji:
+        return emoji
+    # 4. Caller-supplied fallback
     return default
 
 

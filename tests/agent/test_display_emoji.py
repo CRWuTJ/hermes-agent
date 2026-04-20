@@ -52,6 +52,20 @@ class TestGetToolEmoji:
             result = get_tool_emoji("terminal")
             assert result == "💻"
 
+    def test_builtin_fallback_returns_core_tool_emoji_when_registry_is_empty(self):
+        """Known tools keep stable emojis even when the registry has no entries yet."""
+        skin = MagicMock()
+        skin.tool_emojis = {}
+        mock_reg = MagicMock()
+        mock_reg.get_emoji.return_value = ""
+        import sys
+        mock_module = MagicMock()
+        mock_module.registry = mock_reg
+        with mock_patch("agent.display._get_skin", return_value=skin), \
+             mock_patch.dict(sys.modules, {"tools.registry": mock_module}):
+            result = get_tool_emoji("terminal", default="⚙️")
+            assert result == "💻"
+
     def test_fallback_default(self):
         """When neither skin nor registry has an emoji, use the default."""
         skin = MagicMock()

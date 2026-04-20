@@ -582,6 +582,51 @@ class TestChatCompletionsEndpoint:
                 assert "Here are the files." in body
 
     @pytest.mark.asyncio
+    async def test_stream_tool_progress_uses_terminal_emoji_without_registry_entries(self, adapter):
+        """Streaming tool progress should keep the terminal emoji even before tool discovery."""
+        import asyncio
+        import sys
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                tp_cb = kwargs.get("tool_progress_callback")
+                if tp_cb:
+                    tp_cb("tool.started", "terminal", "ls -la", {"command": "ls -la"})
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Here are the files.")
+                return (
+                    {"final_response": "Here are the files.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            mock_registry = MagicMock()
+            mock_registry.get_emoji.return_value = ""
+            mock_module = MagicMock()
+            mock_module.registry = mock_registry
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent), \
+                 patch.dict(sys.modules, {"tools.registry": mock_module}):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list files"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                chunks = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in body.splitlines()
+                    if line.startswith("data: {")
+                ]
+                assert any("💻 ls -la" in (chunk["choices"][0].get("delta", {}).get("content") or "") for chunk in chunks)
+
+    @pytest.mark.asyncio
     async def test_stream_tool_progress_skips_internal_events(self, adapter):
         """Internal events (name starting with _) are not streamed."""
         import asyncio
