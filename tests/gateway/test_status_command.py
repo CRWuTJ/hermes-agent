@@ -1017,6 +1017,79 @@ async def test_task_command_can_reprioritize_queued_task_to_later_bucket():
 
 
 @pytest.mark.asyncio
+async def test_task_command_accepts_longform_reprioritize_action():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    queued_task = MessageTaskEnvelope(
+        task_id="task-hi",
+        session_key=session_entry.session_key,
+        message_event=_make_event("high priority queued follow-up"),
+        priority=10,
+        lane="background",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+    )
+    reprioritized_task = MessageTaskEnvelope(
+        task_id="task-hi",
+        session_key=session_entry.session_key,
+        message_event=queued_task.message_event,
+        priority=80,
+        lane="background",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+    )
+    adapter.pending_tasks_snapshot.return_value = [queued_task]
+    adapter.reprioritize_pending_task.return_value = reprioritized_task
+
+    with patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/task task-hi reprioritize later"))
+
+    adapter.reprioritize_pending_task.assert_called_once_with(session_entry.session_key, "task-hi", "later")
+    assert "Moved queued task `task-hi` to later priority." in result
+
+
+@pytest.mark.asyncio
+async def test_task_command_reprioritize_without_bucket_returns_usage():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    queued_task = MessageTaskEnvelope(
+        task_id="task-hi",
+        session_key=session_entry.session_key,
+        message_event=_make_event("high priority queued follow-up"),
+        priority=10,
+        lane="background",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+    )
+    adapter.pending_tasks_snapshot.return_value = [queued_task]
+
+    with patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/task task-hi reprioritize"))
+
+    adapter.reprioritize_pending_task.assert_not_called()
+    assert "Usage: /task <task_id>" in result
+    assert "/task bg_123abc reprioritize later" in result
+
+
+@pytest.mark.asyncio
 async def test_task_command_can_recover_starving_queued_task_via_shortcut():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),

@@ -6,6 +6,7 @@ from gateway.task_control import (
     build_task_detail_payload,
     describe_task_action_error,
     describe_task_action_result,
+    parse_task_command_args,
     queued_task_priority_bucket,
     queued_task_wait_age,
     queued_task_wait_seconds,
@@ -30,6 +31,22 @@ def test_queued_task_wait_helpers_compute_compact_age(monkeypatch):
 
     assert queued_task_wait_seconds(queued_at) == 300
     assert queued_task_wait_age(queued_at) == "5m"
+
+
+def test_parse_task_command_args_normalizes_longform_reprioritize_bucket():
+    assert parse_task_command_args("task-hi reprioritize later") == (
+        "task-hi",
+        "reprioritize",
+        "later",
+    )
+
+
+def test_parse_task_command_args_preserves_explicit_reprioritize_without_bucket():
+    assert parse_task_command_args("task-hi reprioritize") == (
+        "task-hi",
+        "reprioritize",
+        None,
+    )
 
 
 def test_describe_task_action_result_formats_foreground_for_chat():

@@ -24,6 +24,7 @@ import signal
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
@@ -76,6 +77,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
+from gateway.task_control import (
+    build_gateway_tasks_payload,
+    build_task_detail_payload,
+    describe_task_action_error as describe_shared_task_action_error,
+    describe_task_action_result as describe_shared_task_action_result,
+    describe_task_control as describe_shared_task_control,
+    parse_task_command_args as parse_shared_task_command_args,
+    queued_task_actions as shared_queued_task_actions,
+    queued_task_payload as shared_queued_task_payload,
+    queued_task_recovery_plan,
+    render_gateway_task_detail_block as render_shared_task_detail_block,
+    render_gateway_tasks_block as render_shared_tasks_block,
+    task_command_usage_text as shared_task_command_usage_text,
+)
+from task_lanes import TaskLaneRegistry, normalize_task_lane
 from utils import atomic_yaml_write
 _hermes_home = get_hermes_home()
 
@@ -286,6 +302,295 @@ logger = logging.getLogger(__name__)
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+task_lane_registry = TaskLaneRegistry()
+_runtime_status_adapters: Any = None
+
+
+def _set_runtime_status_adapters(adapters: Any) -> None:
+    global _runtime_status_adapters
+    _runtime_status_adapters = adapters
+
+
+
+def _current_live_task_status_payload() -> Dict[str, Any]:
+    try:
+        from gateway.status import normalize_live_tasks_payload
+
+        snapshot = task_lane_registry.snapshot()
+        if isinstance(snapshot, dict):
+            return normalize_live_tasks_payload(
+                {
+                    "active_count": sum(int(value or 0) for value in (snapshot.get("counts") or {}).values()),
+                    "lane_counts": snapshot.get("counts"),
+                    "tasks": snapshot.get("tasks"),
+                }
+            )
+    except Exception:
+        pass
+
+    return {
+        "active_count": 0,
+        "lane_counts": {
+            "interactive": 0,
+            "cron_scout": 0,
+            "housekeeping": 0,
+        },
+        "tasks": [],
+    }
+
+
+def _current_queued_task_status_payload(adapters: Any) -> Dict[str, Any]:
+    try:
+        from gateway.status import normalize_queued_tasks_payload
+
+        adapter_values = adapters.values() if isinstance(adapters, dict) else list(adapters or [])
+        raw_tasks: List[Dict[str, Any]] = []
+        for adapter in adapter_values:
+            snapshot_pending = getattr(adapter, "all_pending_tasks_snapshot", None)
+            if not callable(snapshot_pending):
+                continue
+            try:
+                pending = list(snapshot_pending() or [])
+            except Exception:
+                continue
+            actions = shared_queued_task_actions(adapter)
+            for envelope in pending:
+                raw_tasks.append(shared_queued_task_payload(envelope, actions=actions))
+
+        raw_tasks.sort(
+            key=lambda task: (
+                int(task.get("priority") or 50),
+                str(task.get("queued_at") or ""),
+                str(task.get("task_id") or ""),
+            )
+        )
+        return normalize_queued_tasks_payload({"tasks": raw_tasks})
+    except Exception:
+        return {
+            "queued_count": 0,
+            "lane_counts": {
+                "interactive": 0,
+                "cron_scout": 0,
+                "housekeeping": 0,
+            },
+            "bucket_counts": {
+                "now": 0,
+                "next": 0,
+                "later": 0,
+            },
+            "tasks": [],
+        }
+
+
+def _task_text_preview(value: Any, *, limit: int = 60) -> str:
+    raw = " ".join(str(value or "").split())
+    if not raw:
+        return ""
+    if len(raw) <= limit:
+        return raw
+    return raw[: max(0, limit - 3)] + "..."
+
+
+def _parse_task_command_args(raw_args: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    return parse_shared_task_command_args(raw_args)
+
+
+def _render_task_command_hints(task_id: str, *, actions: Optional[List[str]] = None) -> Optional[str]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return None
+    commands = [f"/task {task_id}"]
+    for action in actions or []:
+        action_text = str(action or "").strip()
+        if action_text:
+            commands.append(f"/task {task_id} {action_text}")
+    return f"↳ {' · '.join(commands)}"
+
+
+
+def _render_gateway_tasks_block(
+    *,
+    queued_tasks: list[Any],
+    live_tasks: list[Any],
+    queued_actions: Optional[Dict[str, List[str]]] = None,
+    live_actions: Optional[Dict[str, List[str]]] = None,
+) -> str:
+    queued_actions = queued_actions or {}
+    live_actions = live_actions or {}
+    lines = [
+        "📋 **Hermes Tasks**",
+        "",
+        f"**Queued for this chat:** {len(queued_tasks)}",
+    ]
+    for idx, task in enumerate(queued_tasks, start=1):
+        task_id = getattr(task, "task_id", "")
+        event = getattr(task, "message_event", None)
+        preview = _task_text_preview(getattr(event, "text", None))
+        parts = [
+            f"{idx}. `{task_id}`",
+            normalize_task_lane(getattr(task, "lane", None)),
+            f"priority={int(getattr(task, 'priority', 0) or 0)}",
+        ]
+        reply_policy = getattr(task, "reply_policy", None)
+        if reply_policy is not None:
+            parts.append(f"reply={reply_policy}")
+        if preview:
+            parts.append(preview)
+        lines.append(" · ".join(parts))
+        hint_line = _render_task_command_hints(str(task_id or ""), actions=queued_actions.get(str(task_id or ""), []))
+        if hint_line:
+            lines.append(f"   {hint_line}")
+
+    lines.extend([
+        "",
+        f"**Active runtime tasks:** {len(live_tasks)}",
+    ])
+    for idx, task in enumerate(live_tasks, start=1):
+        task_id = task.get("task_id") if isinstance(task, dict) else getattr(task, "task_id", "")
+        lane = task.get("lane") if isinstance(task, dict) else getattr(task, "lane", None)
+        label = task.get("label") if isinstance(task, dict) else getattr(task, "label", None)
+        source = task.get("source") if isinstance(task, dict) else getattr(task, "source", None)
+        parts = [f"{idx}. `{task_id}`", normalize_task_lane(lane)]
+        if label:
+            parts.append(str(label))
+        if source:
+            parts.append(f"source={source}")
+        lines.append(" · ".join(parts))
+        hint_line = _render_task_command_hints(str(task_id or ""), actions=live_actions.get(str(task_id or ""), []))
+        if hint_line:
+            lines.append(f"   {hint_line}")
+
+    if not queued_tasks and not live_tasks:
+        lines.append("No queued or active tasks.")
+
+    return "\n".join(lines)
+
+
+def _describe_task_control(*, task_id: str, state: str, actions: Optional[List[str]] = None, managed: bool = False) -> Optional[str]:
+    control_mode = "queued" if state == "queued" else ("managed_runtime" if managed else "read_only")
+    detail_payload = build_task_detail_payload(
+        task_id=task_id,
+        state=state,
+        task={
+            "actions": list(actions or []),
+            "control_mode": control_mode,
+        },
+    )
+    return describe_shared_task_control(detail_payload)
+
+
+
+def _render_gateway_task_detail_block(
+    *,
+    task_id: str,
+    state: str,
+    lane: Any,
+    priority: Any = None,
+    reply_policy: Any = None,
+    queued_at: Any = None,
+    wait_age: Any = None,
+    preview: Any = None,
+    label: Any = None,
+    kind: Any = None,
+    source: Any = None,
+    started_at: Any = None,
+    control: Any = None,
+    actions: Optional[List[str]] = None,
+    control_mode: Any = None,
+    priority_bucket_options: Optional[List[str]] = None,
+    starvation_alert: Any = None,
+) -> str:
+    detail_payload = build_task_detail_payload(
+        task_id=task_id,
+        state=state,
+        task={
+            "lane": lane,
+            "priority": priority,
+            "reply_policy": reply_policy,
+            "queued_at": queued_at,
+            "wait_age": wait_age,
+            "preview": preview,
+            "label": label,
+            "kind": kind,
+            "source": source,
+            "started_at": started_at,
+            "actions": list(actions or []),
+            "control_mode": control_mode,
+            "priority_bucket_options": list(priority_bucket_options or []),
+            "starvation_alert": dict(starvation_alert) if isinstance(starvation_alert, dict) else None,
+        },
+    )
+    rendered = render_shared_task_detail_block(detail_payload, preview_formatter=_task_text_preview)
+    if control and "**Control:**" not in rendered:
+        return f"{rendered}\n**Control:** {control}"
+    return rendered
+
+
+def _write_runtime_status_safe(**kwargs) -> None:
+    try:
+        from gateway.status import write_runtime_status
+
+        kwargs.setdefault("queued_tasks", _current_queued_task_status_payload(_runtime_status_adapters))
+        kwargs.setdefault("live_tasks", _current_live_task_status_payload())
+        write_runtime_status(**kwargs)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _track_runtime_task(
+    *,
+    task_id: str,
+    lane: Optional[str],
+    label: Optional[str] = None,
+    source: Optional[str] = None,
+    kind: Optional[str] = None,
+    control_mode: Optional[str] = None,
+    actions: Optional[List[str]] = None,
+):
+    with task_lane_registry.track(
+        task_id=task_id,
+        lane=lane,
+        label=label,
+        source=source,
+        kind=kind,
+        control_mode=control_mode,
+        actions=actions,
+    ):
+        _write_runtime_status_safe()
+        try:
+            yield
+        finally:
+            _write_runtime_status_safe()
+
+
+def _start_runtime_task(
+    *,
+    task_id: str,
+    lane: Optional[str],
+    label: Optional[str] = None,
+    source: Optional[str] = None,
+    kind: Optional[str] = None,
+    control_mode: Optional[str] = None,
+    actions: Optional[List[str]] = None,
+) -> None:
+    task_lane_registry.start_task(
+        task_id=task_id,
+        lane=lane,
+        label=label,
+        source=source,
+        kind=kind,
+        control_mode=control_mode,
+        actions=actions,
+    )
+    _write_runtime_status_safe()
+
+
+
+def _finish_runtime_task(task_id: str) -> None:
+    task_lane_registry.finish_task(task_id)
+    _write_runtime_status_safe()
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
@@ -347,6 +652,43 @@ def _dequeue_pending_text(adapter, session_key: str) -> str | None:
     if not text and getattr(event, "media_urls", None):
         text = _build_media_placeholder(event)
     return text
+
+
+def _queue_pending_event(adapter, session_key: str, event) -> None:
+    """Queue a follow-up event, preferring the adapter's FIFO implementation."""
+    if not adapter or event is None:
+        return
+    if hasattr(adapter, "queue_message"):
+        adapter.queue_message(session_key, event)
+        return
+    if hasattr(adapter, "_pending_messages"):
+        adapter._pending_messages[session_key] = event
+
+
+def _clear_pending_events(adapter, session_key: str) -> None:
+    """Discard any queued follow-ups for a session."""
+    if not adapter:
+        return
+    if hasattr(adapter, "clear_pending_messages"):
+        adapter.clear_pending_messages(session_key)
+        return
+    if hasattr(adapter, "get_pending_message"):
+        try:
+            adapter.get_pending_message(session_key)
+        except Exception:
+            pass
+    if hasattr(adapter, "_pending_messages"):
+        adapter._pending_messages.pop(session_key, None)
+
+
+def _adapter_busy_input_mode(adapter) -> str:
+    if adapter and hasattr(adapter, "get_busy_input_mode"):
+        try:
+            return adapter.get_busy_input_mode()
+        except Exception:
+            pass
+    raw = os.getenv("HERMES_BUSY_INPUT_MODE") or os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE")
+    return "queue" if str(raw or "").strip().lower() == "queue" else "interrupt"
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:
@@ -473,6 +815,7 @@ class GatewayRunner:
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        _set_runtime_status_adapters(self.adapters)
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
@@ -483,6 +826,7 @@ class GatewayRunner:
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
         self._smart_model_routing = self._load_smart_model_routing()
+        self._topic_routing = self._load_topic_routing()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -567,9 +911,73 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._managed_runtime_tasks: Dict[str, Dict[str, Any]] = {}
 
 
 
+
+    def _register_managed_runtime_task(
+        self,
+        *,
+        task_id: str,
+        task: Any,
+        cancel: Optional[Any] = None,
+        kind: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        registry = getattr(self, "_managed_runtime_tasks", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._managed_runtime_tasks = registry
+        entry = {"task": task, "cancel": cancel, "kind": kind}
+        registry[task_id] = entry
+
+        if hasattr(task, "add_done_callback"):
+            def _cleanup(done_task, *, _task_id: str = task_id):
+                current = getattr(self, "_managed_runtime_tasks", {}).get(_task_id)
+                if current and current.get("task") is done_task:
+                    getattr(self, "_managed_runtime_tasks", {}).pop(_task_id, None)
+
+            task.add_done_callback(_cleanup)
+        return entry
+
+    def _get_managed_runtime_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        registry = getattr(self, "_managed_runtime_tasks", {})
+        if not isinstance(registry, dict):
+            return None
+        return registry.get(task_id)
+
+    def _managed_runtime_task_actions(self, task_id: str) -> List[str]:
+        entry = self._get_managed_runtime_task(task_id)
+        if not entry:
+            return []
+        task = entry.get("task")
+        if task is not None and hasattr(task, "done") and task.done():
+            return []
+        cancel_cb = entry.get("cancel")
+        if callable(cancel_cb):
+            return ["cancel"]
+        if task is not None and hasattr(task, "cancel"):
+            return ["cancel"]
+        return []
+
+    def _queued_task_actions(self, adapter: Any) -> List[str]:
+        return shared_queued_task_actions(adapter)
+
+    def _cancel_managed_runtime_task(self, task_id: str) -> bool:
+        entry = self._get_managed_runtime_task(task_id)
+        if not entry:
+            return False
+        task = entry.get("task")
+        if task is not None and hasattr(task, "done") and task.done():
+            return False
+        cancel_cb = entry.get("cancel")
+        if callable(cancel_cb):
+            cancel_cb()
+            return True
+        if task is not None and hasattr(task, "cancel"):
+            task.cancel()
+            return True
+        return False
 
     # -- Setup skill availability ----------------------------------------
 
@@ -744,11 +1152,20 @@ class GatewayRunner:
     ):
         """Run the sync memory flush in a thread pool so it won't block the event loop."""
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            self._flush_memories_for_session,
-            old_session_id,
-        )
+        with _track_runtime_task(
+            task_id=f"flush:{old_session_id}",
+            lane="housekeeping",
+            label="memory flush",
+            source="gateway",
+            kind="memory_flush",
+            control_mode="read_only",
+            actions=[],
+        ):
+            await loop.run_in_executor(
+                None,
+                self._flush_memories_for_session,
+                old_session_id,
+            )
 
     @property
     def should_exit_cleanly(self) -> bool:
@@ -1041,6 +1458,20 @@ class GatewayRunner:
             pass
         return {}
 
+    @staticmethod
+    def _load_topic_routing() -> dict:
+        """Load optional Telegram DM topic routing config."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                    return cfg.get("topic_routing", {}) or {}
+        except Exception:
+            pass
+        return {}
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -1056,11 +1487,7 @@ class GatewayRunner:
                 logger.info("Active profile: %s", _profile)
         except Exception:
             pass
-        try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="starting", exit_reason=None)
-        except Exception:
-            pass
+        _write_runtime_status_safe(gateway_state="starting", exit_reason=None)
         
         # Warn if no user allowlists are configured and open access is not opted in
         _any_allowlist = any(
@@ -1176,21 +1603,13 @@ class GatewayRunner:
             if startup_nonretryable_errors:
                 reason = "; ".join(startup_nonretryable_errors)
                 logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
+                _write_runtime_status_safe(gateway_state="startup_failed", exit_reason=reason)
                 self._request_clean_exit(reason)
                 return True
             if enabled_platform_count > 0:
                 reason = "; ".join(startup_retryable_errors) or "all configured messaging platforms failed to connect"
                 logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
+                _write_runtime_status_safe(gateway_state="startup_failed", exit_reason=reason)
                 return False
             logger.warning("No messaging platforms enabled.")
             logger.info("Gateway will continue running for cron job execution.")
@@ -1199,11 +1618,7 @@ class GatewayRunner:
         self.delivery_router.adapters = self.adapters
         
         self._running = True
-        try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="running", exit_reason=None)
-        except Exception:
-            pass
+        _write_runtime_status_safe(gateway_state="running", exit_reason=None)
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -1518,12 +1933,9 @@ class GatewayRunner:
         self._pending_approvals.clear()
         self._shutdown_event.set()
         
-        from gateway.status import remove_pid_file, write_runtime_status
+        from gateway.status import remove_pid_file
         remove_pid_file()
-        try:
-            write_runtime_status(gateway_state="stopped", exit_reason=self._exit_reason)
-        except Exception:
-            pass
+        _write_runtime_status_safe(gateway_state="stopped", exit_reason=self._exit_reason)
         
         logger.info("Gateway stopped")
     
@@ -1643,7 +2055,9 @@ class GatewayRunner:
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -1904,6 +2318,10 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+            if event.get_command() == "tasks":
+                return await self._handle_tasks_command(event)
+            if event.get_command() == "task":
+                return await self._handle_task_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -1921,8 +2339,7 @@ class GatewayRunner:
                     running_agent.interrupt("Stop requested")
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
-                if adapter and hasattr(adapter, 'get_pending_message'):
-                    adapter.get_pending_message(_quick_key)  # consume and discard
+                _clear_pending_events(adapter, _quick_key)
                 self._pending_messages.pop(_quick_key, None)
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]
@@ -1942,8 +2359,7 @@ class GatewayRunner:
                     running_agent.interrupt("Session reset requested")
                 # Clear any pending messages so the old text doesn't replay
                 adapter = self.adapters.get(source.platform)
-                if adapter and hasattr(adapter, 'get_pending_message'):
-                    adapter.get_pending_message(_quick_key)  # consume and discard
+                _clear_pending_events(adapter, _quick_key)
                 self._pending_messages.pop(_quick_key, None)
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
@@ -1965,7 +2381,7 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    _queue_pending_event(adapter, _quick_key, queued_event)
                 return "Queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -1984,19 +2400,7 @@ class GatewayRunner:
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
                 adapter = self.adapters.get(source.platform)
-                if adapter:
-                    # Reuse adapter queue semantics so photo bursts merge cleanly.
-                    if _quick_key in adapter._pending_messages:
-                        existing = adapter._pending_messages[_quick_key]
-                        if getattr(existing, "message_type", None) == MessageType.PHOTO:
-                            existing.media_urls.extend(event.media_urls)
-                            existing.media_types.extend(event.media_types)
-                            if event.text:
-                                existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
-                        else:
-                            adapter._pending_messages[_quick_key] = event
-                    else:
-                        adapter._pending_messages[_quick_key] = event
+                _queue_pending_event(adapter, _quick_key, event)
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
@@ -2011,15 +2415,24 @@ class GatewayRunner:
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
-                if adapter:
-                    adapter._pending_messages[_quick_key] = event
+                _queue_pending_event(adapter, _quick_key, event)
                 return None
+
+            adapter = self.adapters.get(source.platform)
+            if _adapter_busy_input_mode(adapter) == "queue":
+                logger.debug(
+                    "PRIORITY queue for session %s — busy_input_mode=queue",
+                    _quick_key[:20],
+                )
+                _queue_pending_event(adapter, _quick_key, event)
+                return None
+
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
-            running_agent.interrupt(event.text)
-            if _quick_key in self._pending_messages:
-                self._pending_messages[_quick_key] += "\n" + event.text
-            else:
-                self._pending_messages[_quick_key] = event.text
+            _queue_pending_event(adapter, _quick_key, event)
+            _interrupt_text = event.text
+            if not _interrupt_text and getattr(event, "media_urls", None):
+                _interrupt_text = _build_media_placeholder(event)
+            running_agent.interrupt(_interrupt_text)
             return None
 
         # Check for commands
@@ -2055,6 +2468,12 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "tasks":
+            return await self._handle_tasks_command(event)
+
+        if canonical == "task":
+            return await self._handle_task_command(event)
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
@@ -2278,6 +2697,24 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
+        # ── Telegram DM Topic Routing ────────────────────────────────
+        # If enabled, check whether this message should:
+        # - stay in the current session
+        # - resume an existing titled session
+        # - start a new session with an auto-generated title
+        # This allows natural conversation flow without manual /resume /new /title.
+        if (
+            source.platform == Platform.TELEGRAM
+            and source.chat_type == "dm"
+            and not source.thread_id
+            and not event.get_command()
+            and self._topic_routing.get("enabled", False)
+        ):
+            try:
+                await self._maybe_route_telegram_dm_session(event, source, _quick_key)
+            except Exception as _tr_err:
+                logger.debug("Topic routing error (non-fatal): %s", _tr_err)
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -2289,7 +2726,16 @@ class GatewayRunner:
         self._running_agents_ts[_quick_key] = time.time()
 
         try:
-            return await self._handle_message_with_agent(event, source, _quick_key)
+            with _track_runtime_task(
+                task_id=_quick_key,
+                lane="interactive",
+                label="message turn",
+                source="gateway",
+                kind="live_turn",
+                control_mode="read_only",
+                actions=[],
+            ):
+                return await self._handle_message_with_agent(event, source, _quick_key)
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -2580,10 +3026,20 @@ class GatewayRunner:
                 # extreme, regardless of token estimates.  This breaks the
                 # death spiral where API disconnects prevent token data
                 # collection, which prevents compression, which causes more
-                # disconnects.  400 messages is well above normal sessions
-                # but catches runaway growth before it becomes unrecoverable.
-                # (#2153)
+                # disconnects.  400 messages is a generic cross-platform cap.
+                #
+                # Telegram DMs need a stricter bound: tool-heavy gateway
+                # turns can accumulate hundreds of assistant/tool messages
+                # long before a 1M-context model hits the 85% token threshold,
+                # which leads to very large request bodies, slow retries, and
+                # poor `/new`-style UX.  Compress earlier for Telegram DMs.
+                # (#2153, #2170)
                 _HARD_MSG_LIMIT = 400
+                if (
+                    source.platform == Platform.TELEGRAM
+                    and source.chat_type == "dm"
+                ):
+                    _HARD_MSG_LIMIT = 180
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
@@ -3371,6 +3827,20 @@ class GatewayRunner:
         # Check if there's an active agent
         session_key = session_entry.session_key
         is_running = session_key in self._running_agents
+        adapter = self.adapters.get(source.platform)
+        queued_tasks = 0
+        next_task = None
+        if adapter and session_key:
+            try:
+                if hasattr(adapter, "pending_task_count"):
+                    queued_tasks = int(adapter.pending_task_count(session_key) or 0)
+                elif hasattr(adapter, "_pending_messages"):
+                    queued_tasks = 1 if session_key in adapter._pending_messages else 0
+                if queued_tasks and hasattr(adapter, "peek_pending_task"):
+                    next_task = adapter.peek_pending_task(session_key)
+            except Exception:
+                queued_tasks = 0
+                next_task = None
 
         title = None
         if self._session_db:
@@ -3379,23 +3849,406 @@ class GatewayRunner:
             except Exception:
                 title = None
 
-        lines = [
-            "📊 **Hermes Gateway Status**",
-            "",
-            f"**Session ID:** `{session_entry.session_id}`",
-        ]
-        if title:
-            lines.append(f"**Title:** {title}")
-        lines.extend([
-            f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {session_entry.total_tokens:,}",
-            f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
-            "",
-            f"**Connected Platforms:** {', '.join(connected_platforms)}",
-        ])
+        from gateway.status import build_gateway_status_payload, render_gateway_chat_status_block
 
-        return "\n".join(lines)
+        status_payload = build_gateway_status_payload(
+            queued_tasks=_current_queued_task_status_payload(self.adapters),
+            live_tasks=_current_live_task_status_payload(),
+        )
+        return render_gateway_chat_status_block(
+            session_id=session_entry.session_id,
+            created_at=session_entry.created_at,
+            updated_at=session_entry.updated_at,
+            total_tokens=session_entry.total_tokens,
+            agent_running=is_running,
+            queued_tasks=queued_tasks,
+            connected_platforms=connected_platforms,
+            status_payload=status_payload,
+            title=title,
+            next_task=next_task,
+        )
+
+    async def _handle_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /tasks command."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        adapter = self.adapters.get(source.platform)
+
+        queued_tasks = []
+        if adapter and session_key:
+            try:
+                if hasattr(adapter, "pending_tasks_snapshot"):
+                    queued_tasks = list(adapter.pending_tasks_snapshot(session_key) or [])
+                elif hasattr(adapter, "peek_pending_task"):
+                    next_task = adapter.peek_pending_task(session_key)
+                    queued_tasks = [next_task] if next_task else []
+            except Exception:
+                queued_tasks = []
+
+        try:
+            live_snapshot = task_lane_registry.status_snapshot() or {}
+        except Exception:
+            live_snapshot = {}
+
+        live_task_items = []
+        for task in list((live_snapshot or {}).get("tasks") or []):
+            if not isinstance(task, dict):
+                continue
+            task_payload = dict(task)
+            task_id = str(task_payload.get("task_id") or "").strip()
+            managed_entry = self._get_managed_runtime_task(task_id) if task_id else None
+            if task_id and not task_payload.get("actions"):
+                actions = self._managed_runtime_task_actions(task_id)
+                if actions:
+                    task_payload["actions"] = actions
+            if managed_entry and not task_payload.get("kind") and managed_entry.get("kind"):
+                task_payload["kind"] = managed_entry.get("kind")
+            if managed_entry and not task_payload.get("control_mode") and task_payload.get("actions"):
+                task_payload["control_mode"] = "managed_runtime"
+            live_task_items.append(task_payload)
+
+        queued_action_verbs = self._queued_task_actions(adapter)
+        tasks_payload = build_gateway_tasks_payload(
+            queued={
+                "tasks": [
+                    shared_queued_task_payload(task, actions=queued_action_verbs)
+                    for task in queued_tasks
+                ],
+            },
+            live={
+                **(live_snapshot if isinstance(live_snapshot, dict) else {}),
+                "tasks": live_task_items,
+            },
+        )
+        return render_shared_tasks_block(tasks_payload, preview_formatter=_task_text_preview)
+
+    async def _handle_task_command(self, event: MessageEvent) -> str:
+        """Handle /task <task_id> detail and control commands."""
+        task_id, action, target_bucket = _parse_task_command_args(event.get_command_args().strip())
+        if not task_id:
+            return shared_task_command_usage_text()
+        if action == "reprioritize" and not target_bucket:
+            return shared_task_command_usage_text()
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        adapter = self.adapters.get(source.platform)
+
+        queued_tasks = []
+        if adapter and session_key:
+            try:
+                if hasattr(adapter, "pending_tasks_snapshot"):
+                    queued_tasks = list(adapter.pending_tasks_snapshot(session_key) or [])
+                elif hasattr(adapter, "peek_pending_task"):
+                    next_task = adapter.peek_pending_task(session_key)
+                    queued_tasks = [next_task] if next_task else []
+            except Exception:
+                queued_tasks = []
+
+        try:
+            live_tasks = list((task_lane_registry.status_snapshot() or {}).get("tasks") or [])
+        except Exception:
+            live_tasks = []
+
+        queued_task = next((item for item in queued_tasks if getattr(item, "task_id", None) == task_id), None)
+        live_task = next((item for item in live_tasks if (item or {}).get("task_id") == task_id), None)
+        queued_actions = self._queued_task_actions(adapter)
+        queued_status = build_gateway_tasks_payload(
+            queued={
+                "tasks": [
+                    shared_queued_task_payload(task, actions=queued_actions)
+                    for task in queued_tasks
+                ],
+            },
+            live={"tasks": []},
+        ).get("queued", {})
+        queued_task_payload = next(
+            (
+                item
+                for item in list((queued_status or {}).get("tasks") or [])
+                if isinstance(item, dict) and str(item.get("task_id") or "") == task_id
+            ),
+            None,
+        )
+
+        if action == "recover":
+            if queued_task is not None:
+                recovery_plan = queued_task_recovery_plan(queued_task_payload)
+                if recovery_plan is None:
+                    return describe_shared_task_action_error(
+                        task_id=task_id,
+                        action="recover",
+                        reason_code="recover_not_recommended",
+                        surface="chat",
+                        markdown_task_id=True,
+                    )
+                recovery_action = recovery_plan.get("action")
+                if recovery_action == "reprioritize":
+                    reprioritize_pending = getattr(adapter, "reprioritize_pending_task", None) if adapter else None
+                    if not callable(reprioritize_pending):
+                        return describe_shared_task_action_error(
+                            task_id=task_id,
+                            action="reprioritize",
+                            reason_code="reprioritize_not_supported",
+                            surface="chat",
+                            markdown_task_id=True,
+                        )
+                    target_bucket = recovery_plan.get("target_bucket")
+                    updated = reprioritize_pending(session_key, task_id, str(target_bucket or ""))
+                    if updated is not None:
+                        return describe_shared_task_action_result(
+                            task_id=task_id,
+                            action="recover",
+                            status="recovered",
+                            target_bucket=target_bucket,
+                            markdown_task_id=True,
+                        )
+                    return describe_shared_task_action_error(
+                        task_id=task_id,
+                        action="recover",
+                        reason_code="task_not_found",
+                        surface="chat",
+                        markdown_task_id=True,
+                        include_tasks_hint=True,
+                    )
+                foreground_pending = getattr(adapter, "foreground_pending_task", None) if adapter else None
+                if not callable(foreground_pending):
+                    return describe_shared_task_action_error(
+                        task_id=task_id,
+                        action="foreground",
+                        reason_code="foreground_not_supported",
+                        surface="chat",
+                        markdown_task_id=True,
+                    )
+                foregrounded = foreground_pending(session_key, task_id)
+                if foregrounded is not None:
+                    disposition, _envelope = foregrounded
+                    return describe_shared_task_action_result(
+                        task_id=task_id,
+                        action="recover",
+                        status=(disposition if disposition in {"started", "queued_next"} else "started"),
+                        markdown_task_id=True,
+                    )
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="recover",
+                    reason_code="task_not_found",
+                    surface="chat",
+                    markdown_task_id=True,
+                    include_tasks_hint=True,
+                )
+            if live_task is not None:
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="recover",
+                    reason_code="recover_requires_queued_task",
+                    surface="chat",
+                    markdown_task_id=True,
+                )
+            return describe_shared_task_action_error(
+                task_id=task_id,
+                action="recover",
+                reason_code="task_not_found",
+                surface="chat",
+                markdown_task_id=True,
+                include_tasks_hint=True,
+            )
+
+        if action == "reprioritize":
+            reprioritize_pending = getattr(adapter, "reprioritize_pending_task", None) if adapter else None
+            if queued_task is not None:
+                if not callable(reprioritize_pending):
+                    return describe_shared_task_action_error(
+                        task_id=task_id,
+                        action="reprioritize",
+                        reason_code="reprioritize_not_supported",
+                        surface="chat",
+                        markdown_task_id=True,
+                    )
+                updated = reprioritize_pending(session_key, task_id, str(target_bucket or ""))
+                if updated is not None:
+                    return describe_shared_task_action_result(
+                        task_id=task_id,
+                        action="reprioritize",
+                        status="reprioritized",
+                        target_bucket=target_bucket,
+                        markdown_task_id=True,
+                    )
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="reprioritize",
+                    reason_code="task_not_found",
+                    surface="chat",
+                    markdown_task_id=True,
+                    include_tasks_hint=True,
+                )
+            if live_task is not None:
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="reprioritize",
+                    reason_code="reprioritize_requires_queued_task",
+                    surface="chat",
+                    markdown_task_id=True,
+                )
+            return describe_shared_task_action_error(
+                task_id=task_id,
+                action="reprioritize",
+                reason_code="task_not_found",
+                surface="chat",
+                markdown_task_id=True,
+                include_tasks_hint=True,
+            )
+
+        if action == "foreground":
+            foreground_pending = getattr(adapter, "foreground_pending_task", None) if adapter else None
+            if queued_task is not None:
+                if not callable(foreground_pending):
+                    return describe_shared_task_action_error(
+                        task_id=task_id,
+                        action="foreground",
+                        reason_code="foreground_not_supported",
+                        surface="chat",
+                        markdown_task_id=True,
+                    )
+                foregrounded = foreground_pending(session_key, task_id)
+                if foregrounded is not None:
+                    disposition, _envelope = foregrounded
+                    return describe_shared_task_action_result(
+                        task_id=task_id,
+                        action="foreground",
+                        status=(disposition if disposition in {"started", "queued_next"} else "started"),
+                        markdown_task_id=True,
+                    )
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="foreground",
+                    reason_code="task_not_found",
+                    surface="chat",
+                    markdown_task_id=True,
+                    include_tasks_hint=True,
+                )
+            if live_task is not None:
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="foreground",
+                    reason_code="task_already_active",
+                    surface="chat",
+                    markdown_task_id=True,
+                )
+            return describe_shared_task_action_error(
+                task_id=task_id,
+                action="foreground",
+                reason_code="task_not_found",
+                surface="chat",
+                markdown_task_id=True,
+                include_tasks_hint=True,
+            )
+
+        if action == "cancel":
+            cancel_pending = getattr(adapter, "cancel_pending_task", None) if adapter else None
+            if queued_task is not None:
+                if not callable(cancel_pending):
+                    return describe_shared_task_action_error(
+                        task_id=task_id,
+                        action="cancel",
+                        reason_code="cancel_not_supported",
+                        surface="chat",
+                        markdown_task_id=True,
+                    )
+                removed = cancel_pending(session_key, task_id)
+                if removed is not None:
+                    return describe_shared_task_action_result(
+                        task_id=task_id,
+                        action="cancel",
+                        status="cancelled",
+                        markdown_task_id=True,
+                    )
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="cancel",
+                    reason_code="task_not_found",
+                    surface="chat",
+                    markdown_task_id=True,
+                    include_tasks_hint=True,
+                )
+            if live_task is not None:
+                if self._cancel_managed_runtime_task(task_id):
+                    return describe_shared_task_action_result(
+                        task_id=task_id,
+                        action="cancel",
+                        status="cancellation_requested",
+                        markdown_task_id=True,
+                    )
+                return describe_shared_task_action_error(
+                    task_id=task_id,
+                    action="cancel",
+                    reason_code="cancel_handle_missing",
+                    surface="chat",
+                    markdown_task_id=True,
+                )
+            return describe_shared_task_action_error(
+                task_id=task_id,
+                action="cancel",
+                reason_code="task_not_found",
+                surface="chat",
+                markdown_task_id=True,
+                include_tasks_hint=True,
+            )
+
+        if queued_task is not None:
+            event_obj = getattr(queued_task, "message_event", None)
+            source_obj = getattr(event_obj, "source", None)
+            platform = getattr(source_obj, "platform", None)
+            source_label = getattr(platform, "value", None) or (str(platform) if platform is not None else None)
+            priority_bucket_options = ["now", "next", "later"] if "reprioritize" in queued_actions else []
+            starvation_alert = (queued_task_payload or {}).get("starvation_alert") if isinstance(queued_task_payload, dict) else None
+            return _render_gateway_task_detail_block(
+                task_id=task_id,
+                state="queued",
+                lane=getattr(queued_task, "lane", None),
+                priority=getattr(queued_task, "priority", None),
+                reply_policy=getattr(queued_task, "reply_policy", None),
+                queued_at=getattr(queued_task, "queued_at", None),
+                preview=getattr(event_obj, "text", None),
+                kind="queued_message",
+                source=source_label,
+                control=_describe_task_control(task_id=task_id, state="queued", actions=queued_actions),
+                actions=queued_actions,
+                control_mode="queued",
+                priority_bucket_options=priority_bucket_options,
+                starvation_alert=starvation_alert,
+            )
+
+        if live_task is not None:
+            managed_entry = self._get_managed_runtime_task(task_id) or {}
+            actions = live_task.get("actions") if isinstance(live_task, dict) else None
+            if not actions:
+                actions = self._managed_runtime_task_actions(task_id) or None
+            kind = (live_task.get("kind") if isinstance(live_task, dict) else None) or managed_entry.get("kind") or "live_turn"
+            control_mode = (live_task.get("control_mode") if isinstance(live_task, dict) else None) or (
+                "managed_runtime" if managed_entry else "read_only"
+            )
+            return _render_gateway_task_detail_block(
+                task_id=task_id,
+                state="active",
+                lane=live_task.get("lane"),
+                label=live_task.get("label"),
+                kind=kind,
+                source=live_task.get("source"),
+                started_at=live_task.get("started_at"),
+                control=_describe_task_control(
+                    task_id=task_id,
+                    state="active",
+                    actions=actions,
+                    managed=(str(control_mode or "").strip().lower() == "managed_runtime"),
+                ),
+                actions=actions,
+                control_mode=control_mode,
+            )
+
+        return f"Task not found: `{task_id}`\nUse /tasks to list queued and active tasks."
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
@@ -4518,30 +5371,57 @@ class GatewayRunner:
 
         source = event.source
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        agent_holder = [None]
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id)
+            self._run_background_task(prompt, source, task_id, agent_holder=agent_holder)
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
+
+        def _cancel_runtime_task() -> None:
+            agent = agent_holder[0]
+            if agent is not None:
+                try:
+                    agent.interrupt("Background task cancelled")
+                except Exception:
+                    pass
+            if hasattr(_task, "cancel"):
+                _task.cancel()
+
+        self._register_managed_runtime_task(
+            task_id=task_id,
+            task=_task,
+            cancel=_cancel_runtime_task,
+            kind="background",
+        )
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self, prompt: str, source: "SessionSource", task_id: str, agent_holder: Optional[list] = None
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
-        from run_agent import AIAgent
-
         adapter = self.adapters.get(source.platform)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
+        from run_agent import AIAgent
+
         _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
 
+        _start_runtime_task(
+            task_id=task_id,
+            lane="background",
+            label="background task",
+            source="gateway",
+            kind="background",
+            control_mode="managed_runtime",
+            actions=["cancel"],
+        )
         try:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
@@ -4586,6 +5466,8 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                if agent_holder is not None:
+                    agent_holder[0] = agent
 
                 return agent.run_conversation(
                     user_message=prompt,
@@ -4658,6 +5540,8 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+        finally:
+            _finish_runtime_task(task_id)
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:
         """Handle /btw <question> — ephemeral side question in the same chat."""
@@ -4682,7 +5566,8 @@ class GatewayRunner:
 
         import uuid as _uuid
         task_id = f"btw_{datetime.now().strftime('%H%M%S')}_{_uuid.uuid4().hex[:6]}"
-        _task = asyncio.create_task(self._run_btw_task(question, source, session_key, task_id))
+        agent_holder = [None]
+        _task = asyncio.create_task(self._run_btw_task(question, source, session_key, task_id, agent_holder=agent_holder))
         self._background_tasks.add(_task)
         self._active_btw_tasks[session_key] = _task
 
@@ -4693,11 +5578,28 @@ class GatewayRunner:
 
         _task.add_done_callback(_cleanup)
 
+        def _cancel_runtime_task() -> None:
+            agent = agent_holder[0]
+            if agent is not None:
+                try:
+                    agent.interrupt("/btw task cancelled")
+                except Exception:
+                    pass
+            if hasattr(_task, "cancel"):
+                _task.cancel()
+
+        self._register_managed_runtime_task(
+            task_id=task_id,
+            task=_task,
+            cancel=_cancel_runtime_task,
+            kind="btw",
+        )
+
         preview = question[:60] + ("..." if len(question) > 60 else "")
         return f'💬 /btw: "{preview}"\nReply will appear here shortly.'
 
     async def _run_btw_task(
-        self, question: str, source, session_key: str, task_id: str,
+        self, question: str, source, session_key: str, task_id: str, agent_holder: Optional[list] = None,
     ) -> None:
         """Execute an ephemeral /btw side question and deliver the answer."""
         from run_agent import AIAgent
@@ -4709,6 +5611,15 @@ class GatewayRunner:
 
         _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
 
+        _start_runtime_task(
+            task_id=task_id,
+            lane="background",
+            label="btw task",
+            source="gateway",
+            kind="btw",
+            control_mode="managed_runtime",
+            actions=["cancel"],
+        )
         try:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
@@ -4763,6 +5674,8 @@ class GatewayRunner:
                     skip_context_files=True,
                     persist_session=False,
                 )
+                if agent_holder is not None:
+                    agent_holder[0] = agent
                 return agent.run_conversation(
                     user_message=btw_prompt,
                     conversation_history=history_snapshot,
@@ -4818,6 +5731,8 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+        finally:
+            _finish_runtime_task(task_id)
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
@@ -5256,6 +6171,126 @@ class GatewayRunner:
             f"Branch: `{new_session_id}`\n"
             f"Use `/resume` to switch back to the original."
         )
+
+    async def _maybe_route_telegram_dm_session(
+        self, event: MessageEvent, source, session_key: str
+    ) -> None:
+        """Apply topic routing for Telegram DM messages.
+
+        This method is called before the sentinel claim, allowing it to
+        switch/reset the session before normal message handling begins.
+
+        The router decides:
+        - stay: keep current session
+        - resume: switch to an existing titled session
+        - new: reset to a fresh session
+
+        This is a no-op if routing decides to stay, or if there's an error.
+        """
+        if not self._session_db:
+            return
+
+        message_text = (event.text or "").strip()
+        if not message_text:
+            return
+
+        # Get current session info
+        current_entry = self.session_store.get_or_create_session(source)
+        current_title = (
+            self._session_db.get_session_title(current_entry.session_id)
+            if self._session_db
+            else None
+        )
+
+        # Gather candidate sessions (titled, not current)
+        try:
+            user_source = source.platform.value if source.platform else None
+            sessions = self._session_db.list_sessions_rich(source=user_source, limit=20)
+            candidates = [
+                s
+                for s in sessions
+                if s.get("title") and s.get("id") != current_entry.session_id
+            ]
+        except Exception as e:
+            logger.debug("Failed to list candidate sessions: %s", e)
+            return
+
+        # Run the router
+        from agent.topic_router import route_telegram_dm_turn
+
+        result = route_telegram_dm_turn(
+            message=message_text,
+            current_session_id=current_entry.session_id,
+            current_title=current_title,
+            candidates=candidates,
+            config=self._topic_routing,
+        )
+
+        logger.debug(
+            "Topic routing result: action=%s target=%s confidence=%.2f reason=%s",
+            result.action,
+            result.target_title,
+            result.confidence,
+            result.reason,
+        )
+
+        # Apply the routing decision
+        if result.action == "stay":
+            # No change needed
+            return
+
+        elif result.action == "resume" and result.target_session_id:
+            # Switch to existing session
+            logger.info(
+                "Topic routing: switching from %s to %s (%s)",
+                current_entry.session_id[:12],
+                result.target_session_id[:12],
+                result.target_title,
+            )
+
+            # Flush memories for current session
+            try:
+                _flush_task = asyncio.create_task(
+                    self._async_flush_memories(current_entry.session_id)
+                )
+                self._background_tasks.add(_flush_task)
+                _flush_task.add_done_callback(self._background_tasks.discard)
+            except Exception as e:
+                logger.debug("Memory flush on auto-resume failed: %s", e)
+
+            # Evict cached agent
+            self._evict_cached_agent(session_key)
+
+            # Clear running agent lock
+            if session_key in self._running_agents:
+                del self._running_agents[session_key]
+
+            # Switch session
+            self.session_store.switch_session(session_key, result.target_session_id)
+
+        elif result.action == "new":
+            # Reset to new session (optionally with auto-title)
+            logger.info(
+                "Topic routing: resetting session %s (reason: %s)",
+                current_entry.session_id[:12],
+                result.reason,
+            )
+
+            # Evict cached agent
+            self._evict_cached_agent(session_key)
+
+            # Reset session
+            self.session_store.reset_session(session_key)
+
+            # If router suggested a title, apply it
+            if result.target_title:
+                try:
+                    new_entry = self.session_store.get_or_create_session(source)
+                    self._session_db.set_session_title(
+                        new_entry.session_id, result.target_title
+                    )
+                except Exception as e:
+                    logger.debug("Failed to set auto-title: %s", e)
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the session's last agent run."""
@@ -7051,6 +8086,8 @@ class GatewayRunner:
                     if agent:
                         pending_event = adapter.get_pending_message(session_key)
                         pending_text = pending_event.text if pending_event else None
+                        if not pending_text and pending_event and getattr(pending_event, "media_urls", None):
+                            pending_text = _build_media_placeholder(pending_event)
                         logger.debug("Interrupt detected from adapter, signaling agent...")
                         agent.interrupt(pending_text)
                         break
@@ -7231,9 +8268,9 @@ class GatewayRunner:
             pending = None
             if result and adapter and session_key:
                 if result.get("interrupted"):
-                    pending = _dequeue_pending_text(adapter, session_key)
-                    if not pending and result.get("interrupt_message"):
-                        pending = result.get("interrupt_message")
+                    pending = result.get("interrupt_message")
+                    if not pending:
+                        pending = _dequeue_pending_text(adapter, session_key)
                 else:
                     pending = _dequeue_pending_text(adapter, session_key)
                     if pending:
@@ -7279,8 +8316,13 @@ class GatewayRunner:
                     )
                     # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
-                    if adapter and hasattr(adapter, 'queue_message'):
-                        adapter.queue_message(session_key, pending)
+                    if adapter:
+                        from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
+                        _queue_pending_event(
+                            adapter,
+                            session_key,
+                            _ME(text=pending, message_type=_MT.TEXT, source=source),
+                        )
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
@@ -7293,8 +8335,11 @@ class GatewayRunner:
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
-                            await adapter.send(source.chat_id, first_response,
-                                               metadata=getattr(event, "metadata", None))
+                            await adapter.send(
+                                source.chat_id,
+                                first_response,
+                                metadata=_progress_metadata,
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation

@@ -109,6 +109,29 @@ class TestHandleBackgroundCommand:
         assert len(created_tasks) == 1  # background task was created
 
     @pytest.mark.asyncio
+    async def test_background_command_registers_runtime_cancel_handle(self):
+        runner = _make_runner()
+
+        created_tasks = []
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            mock_task = MagicMock()
+            created_tasks.append(mock_task)
+            return mock_task
+
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            event = _make_event(text="/background Summarize the top HN stories")
+            result = await runner._handle_background_command(event)
+
+        task_id = next(line.split("Task ID:", 1)[1].strip() for line in result.split("\n") if "Task ID:" in line)
+        assert len(created_tasks) == 1
+        assert task_id in runner._managed_runtime_tasks
+        entry = runner._managed_runtime_tasks[task_id]
+        assert entry["task"] is created_tasks[0]
+        assert callable(entry["cancel"])
+
+    @pytest.mark.asyncio
     async def test_prompt_truncated_in_preview(self):
         """Long prompts are truncated to 60 chars in the confirmation message."""
         runner = _make_runner()

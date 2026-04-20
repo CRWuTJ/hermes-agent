@@ -122,6 +122,34 @@ def queued_task_actions(adapter: Any) -> List[str]:
     return actions
 
 
+def parse_task_command_args(raw_args: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    tokens = [token for token in str(raw_args or "").split() if token]
+    if not tokens:
+        return None, None, None
+
+    task_id = tokens[0]
+    if len(tokens) == 1:
+        return task_id, None, None
+
+    action = str(tokens[1] or "").strip().lower()
+    bucket = normalize_priority_bucket(action)
+    if bucket:
+        return task_id, "reprioritize", bucket
+    if action in {"foreground", "cancel", "recover"}:
+        return task_id, action, None
+    if action == "reprioritize":
+        return task_id, "reprioritize", normalize_priority_bucket(tokens[2] if len(tokens) >= 3 else None)
+    return task_id, None, None
+
+
+def task_command_usage_text() -> str:
+    return (
+        "Usage: /task <task_id> [foreground|cancel|recover|now|next|later|reprioritize <bucket>]\n"
+        "Examples: /task bg_123abc · /task bg_123abc foreground · /task bg_123abc later · "
+        "/task bg_123abc reprioritize later · /task bg_123abc recover · /task bg_123abc cancel"
+    )
+
+
 def queued_task_source_label(message_event: Any) -> str:
     source = getattr(message_event, "source", None)
     platform = getattr(source, "platform", None)

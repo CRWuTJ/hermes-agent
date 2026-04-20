@@ -89,6 +89,30 @@ class LongPreviewAgent:
         }
 
 
+class QueuedFollowupAgent:
+    calls = []
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.__class__.calls.append(message)
+        if message == "hello":
+            return {
+                "final_response": "first response",
+                "messages": [{"role": "assistant", "content": "first response"}],
+                "api_calls": 1,
+                "interrupted": False,
+            }
+        return {
+            "final_response": "queued response",
+            "messages": [{"role": "assistant", "content": "queued response"}],
+            "api_calls": 1,
+            "interrupted": False,
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -235,6 +259,54 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     assert adapter.sent
     assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
     assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_sends_first_response_before_processing_queued_followup(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    QueuedFollowupAgent.calls = []
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = QueuedFollowupAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    pending = iter(["queued follow-up", None])
+    monkeypatch.setattr(gateway_run, "_dequeue_pending_text", lambda *_args, **_kwargs: next(pending))
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-queued",
+        session_key="agent:main:telegram:group:12345:17585",
+    )
+
+    assert QueuedFollowupAgent.calls == ["hello", "queued follow-up"]
+    assert adapter.sent == [
+        {
+            "chat_id": "12345",
+            "content": "first response",
+            "reply_to": None,
+            "metadata": {"thread_id": "17585"},
+        }
+    ]
+    assert result["final_response"] == "queued response"
 
 
 # ---------------------------------------------------------------------------

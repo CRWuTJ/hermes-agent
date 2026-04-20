@@ -41,6 +41,7 @@ def _make_runner():
     runner._pending_approvals = {}
     runner._voice_mode = {}
     runner._background_tasks = set()
+    runner._topic_routing = {"enabled": False}
     runner._is_user_authorized = lambda _source: True
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
@@ -172,6 +173,24 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
         # Let first message complete
         barrier.set()
         await task1
+
+
+@pytest.mark.asyncio
+async def test_running_agent_queue_mode_queues_without_interrupt(monkeypatch):
+    """When busy_input_mode=queue, runner-level follow-ups should enqueue without interrupting."""
+    monkeypatch.setenv("HERMES_BUSY_INPUT_MODE", "queue")
+    runner = _make_runner()
+    event = _make_event(text="follow up")
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    runner._running_agents[session_key] = fake_agent
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    fake_agent.interrupt.assert_not_called()
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key] is event
 
 
 # ------------------------------------------------------------------

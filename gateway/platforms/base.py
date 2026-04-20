@@ -27,6 +27,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
+from gateway.task_control import queued_task_priority_value
 from hermes_constants import get_hermes_dir
 
 
@@ -433,6 +434,21 @@ class MessageEvent:
         return parts[1] if len(parts) > 1 else ""
 
 
+@dataclass
+class MessageTaskEnvelope:
+    """Queue-ready task wrapper for a message event."""
+
+    task_id: str
+    session_key: str
+    message_event: MessageEvent
+    priority: int = 50
+    lane: str = "interactive"
+    reply_policy: str = "user_visible"
+    cancellation_policy: str = "preserve"
+    queued_at: datetime = field(default_factory=datetime.now)
+    reason: str = "busy_followup"
+
+
 @dataclass 
 class SendResult:
     """Result of sending a message."""
@@ -492,6 +508,8 @@ class BasePlatformAdapter(ABC):
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        self._pending_message_queues: Dict[str, List[MessageEvent]] = {}
+        self._pending_task_queues: Dict[str, List[MessageTaskEnvelope]] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -1135,6 +1153,252 @@ class BasePlatformAdapter(ABC):
             return f"{existing_text}\n\n{new_text}".strip()
         return existing_text
 
+    @staticmethod
+    def _normalize_busy_input_mode(value: Any) -> str:
+        return "queue" if str(value or "").strip().lower() == "queue" else "interrupt"
+
+    def get_busy_input_mode(self) -> str:
+        """Return how busy-session follow-ups should be handled."""
+        raw = None
+        if isinstance(getattr(self.config, "extra", None), dict):
+            raw = self.config.extra.get("busy_input_mode")
+        if raw is None:
+            raw = os.getenv("HERMES_BUSY_INPUT_MODE")
+        if raw is None:
+            raw = os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE")
+        return self._normalize_busy_input_mode(raw)
+
+    def _build_task_envelope(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        task_id: Optional[str] = None,
+        priority: int = 50,
+        lane: str = "interactive",
+        reply_policy: str = "user_visible",
+        cancellation_policy: str = "preserve",
+        reason: str = "busy_followup",
+    ) -> MessageTaskEnvelope:
+        return MessageTaskEnvelope(
+            task_id=task_id or f"task-{event.message_id or uuid.uuid4().hex[:10]}",
+            session_key=session_key,
+            message_event=event,
+            priority=priority,
+            lane=lane,
+            reply_policy=reply_policy,
+            cancellation_policy=cancellation_policy,
+            reason=reason,
+        )
+
+    def _ensure_pending_task_queue(self, session_key: str) -> List[MessageTaskEnvelope]:
+        queue = self._pending_task_queues.get(session_key)
+        if queue is None:
+            queue = []
+            existing = self._pending_messages.get(session_key)
+            if existing is not None:
+                queue.append(self._build_task_envelope(session_key, existing))
+            self._pending_task_queues[session_key] = queue
+        self._pending_message_queues.setdefault(session_key, [item.message_event for item in queue])
+        return queue
+
+    @staticmethod
+    def _pending_task_insert_index(queue: List[MessageTaskEnvelope], priority: int) -> int:
+        for idx, pending in enumerate(queue):
+            if priority < pending.priority:
+                return idx
+        return len(queue)
+
+    def queue_message(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        task_id: Optional[str] = None,
+        priority: int = 50,
+        lane: str = "interactive",
+        reply_policy: str = "user_visible",
+        cancellation_policy: str = "preserve",
+        reason: str = "busy_followup",
+    ) -> MessageTaskEnvelope:
+        """Queue a pending message with priority ordering and FIFO tie-breaking."""
+        queue = self._ensure_pending_task_queue(session_key)
+        envelope = self._build_task_envelope(
+            session_key,
+            event,
+            task_id=task_id,
+            priority=priority,
+            lane=lane,
+            reply_policy=reply_policy,
+            cancellation_policy=cancellation_policy,
+            reason=reason,
+        )
+        if queue and queue[-1].message_event is event:
+            pass
+        elif (
+            queue
+            and queue[-1].message_event.message_type == MessageType.PHOTO
+            and event.message_type == MessageType.PHOTO
+        ):
+            existing = queue[-1].message_event
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
+        else:
+            insert_at = self._pending_task_insert_index(queue, envelope.priority)
+            queue.insert(insert_at, envelope)
+        self._pending_message_queues[session_key] = [item.message_event for item in queue]
+        if queue:
+            self._pending_messages[session_key] = queue[0].message_event
+        return envelope
+
+    def peek_pending_task(self, session_key: str) -> Optional[MessageTaskEnvelope]:
+        queue = self._pending_task_queues.get(session_key)
+        if queue:
+            return queue[0]
+        existing = self._pending_messages.get(session_key)
+        if existing is None:
+            return None
+        return self._build_task_envelope(session_key, existing)
+
+    def pending_task_count(self, session_key: str) -> int:
+        queue = self._pending_task_queues.get(session_key)
+        if queue is not None:
+            return len(queue)
+        return 1 if session_key in self._pending_messages else 0
+
+    def pending_tasks_snapshot(self, session_key: str) -> List[MessageTaskEnvelope]:
+        queue = self._pending_task_queues.get(session_key)
+        if queue is not None:
+            return list(queue)
+        existing = self._pending_messages.get(session_key)
+        if existing is None:
+            return []
+        return [self._build_task_envelope(session_key, existing)]
+
+    def all_pending_tasks_snapshot(self) -> List[MessageTaskEnvelope]:
+        session_keys = list(dict.fromkeys([
+            *self._pending_task_queues.keys(),
+            *self._pending_messages.keys(),
+        ]))
+        tasks: List[MessageTaskEnvelope] = []
+        for session_key in session_keys:
+            tasks.extend(self.pending_tasks_snapshot(session_key))
+        return tasks
+
+    def cancel_pending_task(self, session_key: str, task_id: str) -> Optional[MessageTaskEnvelope]:
+        """Remove a specific queued task envelope for a session."""
+        queue = self._pending_task_queues.get(session_key)
+        legacy_queue = self._pending_message_queues.get(session_key)
+        if queue is not None:
+            for idx, envelope in enumerate(list(queue)):
+                if envelope.task_id != task_id:
+                    continue
+                removed = queue.pop(idx)
+                if legacy_queue and idx < len(legacy_queue):
+                    legacy_queue.pop(idx)
+                if queue:
+                    self._pending_messages[session_key] = queue[0].message_event
+                else:
+                    self.clear_pending_messages(session_key)
+                return removed
+            return None
+
+        existing = self._pending_messages.get(session_key)
+        if existing is None:
+            return None
+        envelope = self._build_task_envelope(session_key, existing)
+        if envelope.task_id != task_id:
+            return None
+        self.clear_pending_messages(session_key)
+        return envelope
+
+    def clear_pending_messages(self, session_key: str) -> None:
+        self._pending_task_queues.pop(session_key, None)
+        self._pending_message_queues.pop(session_key, None)
+        self._pending_messages.pop(session_key, None)
+
+    def _schedule_message_processing(self, event: MessageEvent, session_key: str):
+        """Mark a session active and spawn background processing for one message."""
+        self._active_sessions[session_key] = asyncio.Event()
+        task = asyncio.create_task(self._process_message_background(event, session_key))
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            return task
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def foreground_pending_task(self, session_key: str, task_id: str) -> Optional[Tuple[str, MessageTaskEnvelope]]:
+        """Promote a queued task to run now, or next if the session is busy."""
+        queue = self._pending_task_queues.get(session_key)
+        legacy_queue = self._pending_message_queues.get(session_key)
+        is_active = session_key in self._active_sessions
+
+        if queue is not None:
+            for idx, envelope in enumerate(list(queue)):
+                if envelope.task_id != task_id:
+                    continue
+                if is_active:
+                    if idx != 0:
+                        queue.insert(0, queue.pop(idx))
+                        if legacy_queue and idx < len(legacy_queue):
+                            legacy_queue.insert(0, legacy_queue.pop(idx))
+                        self._pending_messages[session_key] = queue[0].message_event
+                    return "queued_next", envelope
+
+                foregrounded = queue.pop(idx)
+                if legacy_queue and idx < len(legacy_queue):
+                    legacy_queue.pop(idx)
+                if queue:
+                    self._pending_messages[session_key] = queue[0].message_event
+                else:
+                    self.clear_pending_messages(session_key)
+                self._schedule_message_processing(foregrounded.message_event, session_key)
+                return "started", foregrounded
+            return None
+
+        existing = self._pending_messages.get(session_key)
+        if existing is None:
+            return None
+        envelope = self._build_task_envelope(session_key, existing)
+        if envelope.task_id != task_id:
+            return None
+        if is_active:
+            return "queued_next", envelope
+        self.clear_pending_messages(session_key)
+        self._schedule_message_processing(envelope.message_event, session_key)
+        return "started", envelope
+
+    def reprioritize_pending_task(self, session_key: str, task_id: str, bucket: str) -> Optional[MessageTaskEnvelope]:
+        """Move a queued task into the requested now/next/later priority bucket."""
+        priority_value = queued_task_priority_value(bucket)
+        if priority_value is None:
+            return None
+
+        queue = self._ensure_pending_task_queue(session_key)
+        legacy_queue = self._pending_message_queues.get(session_key)
+        for idx, envelope in enumerate(list(queue)):
+            if envelope.task_id != task_id:
+                continue
+            updated = queue.pop(idx)
+            legacy_event = None
+            if legacy_queue and idx < len(legacy_queue):
+                legacy_event = legacy_queue.pop(idx)
+            updated.priority = int(priority_value)
+            insert_at = self._pending_task_insert_index(queue, updated.priority)
+            queue.insert(insert_at, updated)
+            if legacy_queue is not None:
+                legacy_queue.insert(insert_at, legacy_event or updated.message_event)
+            if queue:
+                self._pending_messages[session_key] = queue[0].message_event
+            else:
+                self.clear_pending_messages(session_key)
+            return updated
+        return None
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -1165,7 +1429,7 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
-            if cmd in ("approve", "deny", "status", "stop", "new", "reset"):
+            if cmd in ("approve", "deny", "status", "tasks", "task", "stop", "new", "reset"):
                 logger.debug(
                     "[%s] Command '/%s' bypassing active-session guard for %s",
                     self.name, cmd, session_key,
@@ -1189,19 +1453,20 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                existing = self._pending_messages.get(session_key)
-                if existing and existing.message_type == MessageType.PHOTO:
-                    existing.media_urls.extend(event.media_urls)
-                    existing.media_types.extend(event.media_types)
-                    if event.text:
-                        existing.text = self._merge_caption(existing.text, event.text)
-                else:
-                    self._pending_messages[session_key] = event
+                self.queue_message(session_key, event)
                 return  # Don't interrupt now - will run after current task completes
+
+            self.queue_message(session_key, event)
+            if self.get_busy_input_mode() == "queue":
+                logger.debug(
+                    "[%s] New message while session %s is active — queueing without interrupt",
+                    self.name,
+                    session_key,
+                )
+                return
 
             # Default behavior for non-photo follow-ups: interrupt the running agent
             logger.debug("[%s] New message while session %s is active — triggering interrupt", self.name, session_key)
-            self._pending_messages[session_key] = event
             # Signal the interrupt (the processing task checks this)
             self._active_sessions[session_key].set()
             return  # Don't process now - will be handled after current task finishes
@@ -1211,18 +1476,7 @@ class BasePlatformAdapter(ABC):
         # starts would also pass the _active_sessions check and spawn a
         # duplicate task.  (grammY sequentialize / aiogram EventIsolation
         # pattern — set the guard synchronously, not inside the task.)
-        self._active_sessions[session_key] = asyncio.Event()
-
-        # Spawn background task to process this message
-        task = asyncio.create_task(self._process_message_background(event, session_key))
-        try:
-            self._background_tasks.add(task)
-        except TypeError:
-            # Some tests stub create_task() with lightweight sentinels that are not
-            # hashable and do not support lifecycle callbacks.
-            return
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
+        self._schedule_message_processing(event, session_key)
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -1454,8 +1708,8 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, processing_ok)
 
             # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            pending_event = self.get_pending_message(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued message from interrupt", self.name)
                 # Clean up current session before processing pending
                 if session_key in self._active_sessions:
@@ -1521,6 +1775,8 @@ class BasePlatformAdapter(ABC):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        self._pending_task_queues.clear()
+        self._pending_message_queues.clear()
         self._pending_messages.clear()
         self._active_sessions.clear()
 
@@ -1528,9 +1784,31 @@ class BasePlatformAdapter(ABC):
         """Check if there's a pending interrupt for a session."""
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
     
+    def get_pending_task(self, session_key: str) -> Optional[MessageTaskEnvelope]:
+        """Get and clear the next queued task envelope for a session."""
+        queue = self._pending_task_queues.get(session_key)
+        legacy_queue = self._pending_message_queues.get(session_key)
+        if queue is not None:
+            if not queue:
+                self.clear_pending_messages(session_key)
+                return None
+            envelope = queue.pop(0)
+            if legacy_queue:
+                legacy_queue.pop(0)
+            if queue:
+                self._pending_messages[session_key] = queue[0].message_event
+            else:
+                self.clear_pending_messages(session_key)
+            return envelope
+        existing = self._pending_messages.pop(session_key, None)
+        if existing is None:
+            return None
+        return self._build_task_envelope(session_key, existing)
+
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        envelope = self.get_pending_task(session_key)
+        return envelope.message_event if envelope else None
     
     def build_source(
         self,

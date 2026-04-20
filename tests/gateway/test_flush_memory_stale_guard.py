@@ -11,7 +11,7 @@ import sys
 import types
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +43,23 @@ _TRANSCRIPT_4_MSGS = [
     {"role": "user", "content": "remember my name is Alice"},
     {"role": "assistant", "content": "Got it, Alice!"},
 ]
+
+
+@pytest.mark.asyncio
+async def test_async_flush_memories_tracks_housekeeping_lane():
+    runner = _make_runner()
+    runner._flush_memories_for_session = MagicMock()
+
+    with patch("gateway.run.task_lane_registry.track") as track_mock:
+        track_mock.return_value.__enter__.return_value = None
+        track_mock.return_value.__exit__.return_value = False
+        await runner._async_flush_memories("session_housekeeping")
+
+    track_mock.assert_called_once()
+    kwargs = track_mock.call_args.kwargs
+    assert kwargs["lane"] == "housekeeping"
+    assert kwargs["task_id"] == "flush:session_housekeeping"
+    runner._flush_memories_for_session.assert_called_once_with("session_housekeeping")
 
 
 class TestCronSessionBypass:
