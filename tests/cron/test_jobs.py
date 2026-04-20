@@ -11,9 +11,11 @@ from cron.jobs import (
     parse_schedule,
     compute_next_run,
     create_job,
+    describe_job_lane,
     load_jobs,
     save_jobs,
     get_job,
+    job_with_lane_metadata,
     list_jobs,
     update_job,
     pause_job,
@@ -232,6 +234,26 @@ class TestJobCRUD:
     def test_default_delivery_local_no_origin(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
+
+
+class TestJobLanePresentation:
+    def test_job_with_lane_metadata_tracks_default_lane(self, tmp_cron_dir):
+        job = create_job(prompt="Scout backlog", schedule="every 1h")
+
+        presented = job_with_lane_metadata(job)
+
+        assert presented["lane"] is None
+        assert presented["effective_lane"] == "cron_scout"
+        assert presented["lane_source"] == "default"
+
+    def test_describe_job_lane_tracks_explicit_lane(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Flush stale state",
+            schedule="every 1h",
+            lane="housekeeping",
+        )
+
+        assert describe_job_lane(job) == "housekeeping (explicit)"
 
 
 class TestUpdateJob:
@@ -458,10 +480,10 @@ class TestGetDueJobs:
     def test_past_due_within_window_returned(self, tmp_cron_dir):
         """Jobs within the dynamic grace window are still considered due (not stale).
 
-        For an hourly job, grace = 30 min (half the period, clamped to [120s, 2h]).
+        For an hourly job, grace now expands to 2h (3 periods, capped at 2h).
         """
         job = create_job(prompt="Due now", schedule="every 1h")
-        # Force next_run_at to 10 minutes ago (within the 30-min grace for hourly)
+        # Force next_run_at to 10 minutes ago (comfortably within the 2h grace for hourly)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
         save_jobs(jobs)
@@ -473,12 +495,12 @@ class TestGetDueJobs:
     def test_stale_past_due_skipped(self, tmp_cron_dir):
         """Recurring jobs past their dynamic grace window are fast-forwarded, not fired.
 
-        For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
+        For an hourly job, grace now caps at 2h. Setting 125 min late exceeds the window.
         """
         job = create_job(prompt="Stale", schedule="every 1h")
-        # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
+        # Force next_run_at to 125 minutes ago (beyond the 2h grace for hourly)
         jobs = load_jobs()
-        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=125)).isoformat()
         save_jobs(jobs)
 
         due = get_due_jobs()

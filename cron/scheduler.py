@@ -47,7 +47,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "sms", "email", "webhook",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, effective_job_lane
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -60,6 +60,70 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+
+def _resolve_tick_lock_path() -> Path:
+    """Return the tick lock file, honoring test/runtime overrides."""
+    override_file = str(os.getenv("HERMES_CRON_LOCK_FILE") or "").strip()
+    if override_file:
+        return Path(override_file)
+    override_dir = str(os.getenv("HERMES_CRON_LOCK_DIR") or "").strip()
+    if override_dir:
+        return Path(override_dir) / _LOCK_FILE.name
+    return _LOCK_FILE
+
+
+_LANE_PRIORITY = {
+    "interactive": 0,
+    "cron_scout": 1,
+    "housekeeping": 2,
+}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r — using default %s", name, raw, default)
+        return default
+
+
+def _select_due_jobs_for_tick(due_jobs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Prioritize due jobs by lane and defer low-priority overflow.
+
+    Current defaults are intentionally conservative:
+    - interactive deliveries first
+    - cron/scout work second
+    - housekeeping last, capped to one per tick unless overridden
+    """
+    max_jobs = _env_int("HERMES_CRON_MAX_JOBS_PER_TICK", 0)
+    housekeeping_limit = max(0, _env_int("HERMES_CRON_HOUSEKEEPING_PER_TICK", 1))
+
+    ordered = sorted(
+        enumerate(due_jobs),
+        key=lambda item: (_LANE_PRIORITY.get(effective_job_lane(item[1]), 99), item[0]),
+    )
+
+    selected: list[dict] = []
+    deferred: list[dict] = []
+    housekeeping_used = 0
+
+    for _, job in ordered:
+        lane = effective_job_lane(job)
+        if lane == "housekeeping" and housekeeping_used >= housekeeping_limit:
+            deferred.append(job)
+            continue
+        if max_jobs > 0 and len(selected) >= max_jobs:
+            deferred.append(job)
+            continue
+        selected.append(job)
+        if lane == "housekeeping":
+            housekeeping_used += 1
+
+    return selected, deferred
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -823,12 +887,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _resolve_tick_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_path, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
@@ -849,8 +914,16 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
+        selected_jobs, deferred_jobs = _select_due_jobs_for_tick(due_jobs)
+        if deferred_jobs:
+            logger.info(
+                "Deferring %s cron job(s) this tick: %s",
+                len(deferred_jobs),
+                ", ".join(f"{job.get('id', '?')}[{effective_job_lane(job)}]" for job in deferred_jobs[:8]),
+            )
+
         executed = 0
-        for job in due_jobs:
+        for job in selected_jobs:
             try:
                 # For recurring jobs (cron/interval), advance next_run_at to the
                 # next future occurrence BEFORE execution.  This way, if the

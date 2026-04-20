@@ -36,6 +36,12 @@ CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+LANE_ORDER = ("interactive", "cron_scout", "housekeeping")
+LANE_DISPLAY_NAMES = {
+    "interactive": "interactive",
+    "cron_scout": "cron/scout",
+    "housekeeping": "housekeeping",
+}
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -55,12 +61,77 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def _normalize_lane(lane: Optional[str]) -> Optional[str]:
+    if lane is None:
+        return None
+    raw = str(lane).strip().lower().replace("-", "_")
+    if raw == "":
+        return None
+    if raw in {"interactive", "cron_scout", "housekeeping"}:
+        return raw
+    raise ValueError("lane must be one of: interactive, cron_scout, housekeeping")
+
+
+def lane_display_name(lane: Optional[str]) -> str:
+    normalized = _normalize_lane(lane) if lane is not None else None
+    if normalized is None:
+        return "(unset)"
+    return LANE_DISPLAY_NAMES.get(normalized, normalized)
+
+
+def effective_job_lane(job: Dict[str, Any]) -> str:
+    explicit = _normalize_lane(job.get("lane"))
+    if explicit is not None:
+        return explicit
+    deliver = str(job.get("deliver", "local") or "local").strip().lower()
+    if deliver != "local":
+        return "interactive"
+    return "cron_scout"
+
+
+def job_lane_metadata(job: Dict[str, Any]) -> Dict[str, str]:
+    explicit_lane = _normalize_lane(job.get("lane"))
+    return {
+        "effective_lane": explicit_lane or effective_job_lane(job),
+        "lane_source": "explicit" if explicit_lane is not None else "default",
+    }
+
+
+def job_with_lane_metadata(job: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(job)
+    payload["lane"] = _normalize_lane(payload.get("lane"))
+    payload.update(job_lane_metadata(payload))
+    return payload
+
+
+def describe_job_lane(job: Dict[str, Any]) -> str:
+    metadata = job_lane_metadata(job)
+    return f"{lane_display_name(metadata['effective_lane'])} ({metadata['lane_source']})"
+
+
+def summarize_job_lanes(
+    jobs: List[Dict[str, Any]],
+    *,
+    due_jobs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, int]]:
+    summary = {
+        "active": {lane: 0 for lane in LANE_ORDER},
+        "due": {lane: 0 for lane in LANE_ORDER},
+    }
+    for job in jobs:
+        summary["active"][effective_job_lane(job)] += 1
+    for job in due_jobs or []:
+        summary["due"][effective_job_lane(job)] += 1
+    return summary
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
+    normalized["lane"] = _normalize_lane(normalized.get("lane"))
     return normalized
 
 
@@ -252,18 +323,19 @@ def _recoverable_oneshot_run_at(
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
-    Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
-    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    For high-frequency recurring jobs we want a much wider catch-up window than
+    half a period, otherwise a healthy gateway that is briefly busy can keep
+    skipping due work forever. Use at least 3 schedule periods, clamped between
+    5 minutes and 2 hours.
     """
-    MIN_GRACE = 120
+    MIN_GRACE = 300
     MAX_GRACE = 7200  # 2 hours
 
     kind = schedule.get("kind")
 
     if kind == "interval":
         period_seconds = schedule.get("minutes", 1) * 60
-        grace = period_seconds // 2
+        grace = period_seconds * 3
         return max(MIN_GRACE, min(grace, MAX_GRACE))
 
     if kind == "cron" and HAS_CRONITER:
@@ -273,7 +345,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
             first = cron.get_next(datetime)
             second = cron.get_next(datetime)
             period_seconds = int((second - first).total_seconds())
-            grace = period_seconds // 2
+            grace = period_seconds * 3
             return max(MIN_GRACE, min(grace, MAX_GRACE))
         except Exception:
             pass
@@ -376,6 +448,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    lane: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -395,6 +468,7 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        lane: Optional scheduler lane (interactive, cron_scout, housekeeping)
 
     Returns:
         The created job dict
@@ -425,6 +499,7 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_lane = _normalize_lane(lane)
 
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
     job = {
@@ -455,6 +530,7 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "lane": normalized_lane,
     }
 
     jobs = load_jobs()

@@ -1115,7 +1115,9 @@ class TestTickAdvanceBeforeRun:
             "schedule": {"kind": "cron", "expr": "15 6 * * *"},
         }
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
              patch("cron.scheduler.advance_next_run", side_effect=fake_advance) as adv_mock, \
              patch("cron.scheduler.run_job", side_effect=fake_run_job), \
              patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
@@ -1128,6 +1130,78 @@ class TestTickAdvanceBeforeRun:
         adv_mock.assert_called_once_with("test-advance")
         # advance must happen before run
         assert call_order == [("advance", "test-advance"), ("run", "test-advance")]
+
+
+class TestTickLaneSelection:
+    """Verify tick() prioritizes high-value lanes before housekeeping."""
+
+    @staticmethod
+    def _make_job(job_id: str, *, deliver: str = "local", lane: str | None = None) -> dict:
+        job = {
+            "id": job_id,
+            "name": job_id,
+            "prompt": f"run {job_id}",
+            "enabled": True,
+            "deliver": deliver,
+            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+        }
+        if lane is not None:
+            job["lane"] = lane
+        return job
+
+    def test_tick_prioritizes_interactive_then_scout_before_housekeeping(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_CRON_MAX_JOBS_PER_TICK", "2")
+        run_order: list[str] = []
+        due_jobs = [
+            self._make_job("hk-1", lane="housekeeping"),
+            self._make_job("interactive-1", deliver="origin"),
+            self._make_job("scout-1", deliver="local"),
+        ]
+
+        def fake_run_job(job):
+            run_order.append(job["id"])
+            return True, f"# {job['id']}", f"done {job['id']}", None
+
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=due_jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"):
+            from cron.scheduler import tick
+            executed = tick(verbose=False)
+
+        assert executed == 2
+        assert run_order == ["interactive-1", "scout-1"]
+
+    def test_tick_limits_housekeeping_jobs_per_tick(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_CRON_HOUSEKEEPING_PER_TICK", "1")
+        run_order: list[str] = []
+        due_jobs = [
+            self._make_job("hk-1", lane="housekeeping"),
+            self._make_job("hk-2", lane="housekeeping"),
+            self._make_job("scout-1", deliver="local"),
+        ]
+
+        def fake_run_job(job):
+            run_order.append(job["id"])
+            return True, f"# {job['id']}", f"done {job['id']}", None
+
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=due_jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"):
+            from cron.scheduler import tick
+            executed = tick(verbose=False)
+
+        assert executed == 2
+        assert run_order == ["scout-1", "hk-1"]
 
 
 class TestSendMediaViaAdapter:
