@@ -10,6 +10,8 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
+- GET  /api/status                 — machine-readable gateway/runtime status
+- GET  /openapi.json               — OpenAPI contract for Hermes control-plane endpoints
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -27,6 +29,7 @@ import os
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 try:
@@ -40,6 +43,18 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+)
+from gateway.task_control import (
+    build_gateway_tasks_payload,
+    build_task_action_error_payload as shared_build_task_action_error_payload,
+    build_task_action_payload as shared_build_task_action_payload,
+    build_task_detail_payload,
+    normalize_priority_bucket,
+    queued_task_actions as shared_queued_task_actions,
+    queued_task_iso as shared_queued_task_iso,
+    queued_task_payload as shared_queued_task_payload,
+    queued_task_recovery_plan,
+    queued_task_source_label as shared_queued_task_source_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -308,6 +323,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self.gateway_runner = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -989,6 +1005,7 @@ class APIServerAdapter(BasePlatformAdapter):
     try:
         from cron.jobs import (
             list_jobs as _cron_list,
+            get_due_jobs as _cron_get_due,
             get_job as _cron_get,
             create_job as _cron_create,
             update_job as _cron_update,
@@ -996,12 +1013,18 @@ class APIServerAdapter(BasePlatformAdapter):
             pause_job as _cron_pause,
             resume_job as _cron_resume,
             trigger_job as _cron_trigger,
+            job_with_lane_metadata as _cron_present_job,
+            summarize_job_lanes as _cron_summarize_lanes,
+            _normalize_lane as _cron_normalize_lane,
+            LANE_ORDER as _cron_lane_order,
+            LANE_DISPLAY_NAMES as _cron_lane_display_names,
         )
         # Wrap as staticmethod to prevent descriptor binding — these are plain
         # module functions, not instance methods.  Without this, self._cron_*()
         # injects ``self`` as the first positional argument and every call
         # raises TypeError.
         _cron_list = staticmethod(_cron_list)
+        _cron_get_due = staticmethod(_cron_get_due)
         _cron_get = staticmethod(_cron_get)
         _cron_create = staticmethod(_cron_create)
         _cron_update = staticmethod(_cron_update)
@@ -1009,13 +1032,24 @@ class APIServerAdapter(BasePlatformAdapter):
         _cron_pause = staticmethod(_cron_pause)
         _cron_resume = staticmethod(_cron_resume)
         _cron_trigger = staticmethod(_cron_trigger)
+        _cron_present_job = staticmethod(_cron_present_job)
+        _cron_summarize_lanes = staticmethod(_cron_summarize_lanes)
+        _cron_normalize_lane = staticmethod(_cron_normalize_lane)
+        _CRON_LANE_ORDER = tuple(_cron_lane_order)
+        _CRON_LANE_DISPLAY_NAMES = dict(_cron_lane_display_names)
         _CRON_AVAILABLE = True
     except ImportError:
         pass
 
+    _CRON_LANE_ORDER = ("interactive", "cron_scout", "housekeeping")
+    _CRON_LANE_DISPLAY_NAMES = {
+        "interactive": "interactive",
+        "cron_scout": "cron/scout",
+        "housekeeping": "housekeeping",
+    }
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "lane"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -1036,6 +1070,1504 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    def _job_payload(self, job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Return an API-friendly job payload with shared lane metadata."""
+        if not job:
+            return job
+        return self._cron_present_job(job)
+
+    def _normalize_job_lane_or_error(self, lane: Any) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Normalize lane input once so create/update share the same API behavior."""
+        try:
+            return self._cron_normalize_lane(lane), None
+        except ValueError as exc:
+            return None, web.json_response({"error": str(exc)}, status=400)
+
+    def _lane_capabilities_payload(self) -> Dict[str, Any]:
+        """Expose lane enums/defaults so API clients don't have to hardcode them."""
+        return {
+            "lane_values": list(self._CRON_LANE_ORDER),
+            "lane_labels": dict(self._CRON_LANE_DISPLAY_NAMES),
+            "default_lane_by_deliver": {
+                "local": "cron_scout",
+                "non_local": "interactive",
+            },
+            "clear_lane_values": [None, ""],
+        }
+
+    def _openapi_contract(self) -> Dict[str, Any]:
+        """Return an OpenAPI document for the Hermes control-plane endpoints."""
+        lane_values = list(self._CRON_LANE_ORDER)
+        lane_labels = dict(self._CRON_LANE_DISPLAY_NAMES)
+
+        def _nullable(schema: Dict[str, Any]) -> Dict[str, Any]:
+            return {"anyOf": [schema, {"type": "null"}]}
+
+        def _nullable_ref(name: str) -> Dict[str, Any]:
+            return {"anyOf": [{"$ref": f"#/components/schemas/{name}"}, {"type": "null"}]}
+
+        def _nullable_string(*, fmt: Optional[str] = None) -> Dict[str, Any]:
+            schema: Dict[str, Any] = {"type": "string"}
+            if fmt:
+                schema["format"] = fmt
+            return _nullable(schema)
+
+        schemas: Dict[str, Any] = {
+            "CronLaneValue": {
+                "type": "string",
+                "enum": lane_values,
+                "description": "Canonical scheduler lane used by Hermes cron routing.",
+            },
+            "CronLaneCounts": {
+                "type": "object",
+                "properties": {lane: {"type": "integer", "minimum": 0} for lane in lane_values},
+                "required": lane_values,
+                "additionalProperties": False,
+            },
+            "CronJobOrigin": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string"},
+                    "chat_id": {"type": "string"},
+                    "chat_name": _nullable_string(),
+                    "thread_id": _nullable_string(),
+                },
+                "additionalProperties": True,
+            },
+            "CronRepeatState": {
+                "type": "object",
+                "properties": {
+                    "times": _nullable({"type": "integer", "minimum": 1}),
+                    "completed": {"type": "integer", "minimum": 0},
+                },
+                "required": ["times", "completed"],
+                "additionalProperties": False,
+            },
+            "CronSchedule": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "minutes": {"type": "integer", "minimum": 1},
+                    "expr": {"type": "string"},
+                    "run_at": {"type": "string", "format": "date-time"},
+                    "display": {"type": "string"},
+                },
+                "required": ["kind"],
+                "additionalProperties": True,
+            },
+            "CronJob": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "pattern": "[a-f0-9]{12}"},
+                    "name": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "skill": _nullable_string(),
+                    "model": _nullable_string(),
+                    "provider": _nullable_string(),
+                    "base_url": _nullable_string(),
+                    "script": _nullable_string(),
+                    "schedule": {"$ref": "#/components/schemas/CronSchedule"},
+                    "schedule_display": {"type": "string"},
+                    "repeat": {"$ref": "#/components/schemas/CronRepeatState"},
+                    "enabled": {"type": "boolean"},
+                    "state": {"type": "string"},
+                    "paused_at": _nullable_string(fmt="date-time"),
+                    "paused_reason": _nullable_string(),
+                    "created_at": {"type": "string", "format": "date-time"},
+                    "next_run_at": _nullable_string(fmt="date-time"),
+                    "last_run_at": _nullable_string(fmt="date-time"),
+                    "last_status": _nullable_string(),
+                    "last_error": _nullable_string(),
+                    "last_delivery_error": _nullable_string(),
+                    "deliver": {"type": "string"},
+                    "origin": _nullable_ref("CronJobOrigin"),
+                    "lane": _nullable_ref("CronLaneValue"),
+                    "effective_lane": {"$ref": "#/components/schemas/CronLaneValue"},
+                    "lane_source": {
+                        "type": "string",
+                        "enum": ["explicit", "default"],
+                    },
+                },
+                "required": ["id", "name", "deliver", "lane", "effective_lane", "lane_source"],
+                "additionalProperties": True,
+            },
+            "CronJobEnvelope": {
+                "type": "object",
+                "properties": {
+                    "job": {"$ref": "#/components/schemas/CronJob"},
+                },
+                "required": ["job"],
+                "additionalProperties": False,
+            },
+            "CronJobSummary": {
+                "type": "object",
+                "properties": {
+                    "active_jobs": {"type": "integer", "minimum": 0},
+                    "total_jobs": {"type": "integer", "minimum": 0},
+                    "lane_counts": {"$ref": "#/components/schemas/CronLaneCounts"},
+                    "due_now": {"$ref": "#/components/schemas/CronLaneCounts"},
+                },
+                "required": ["active_jobs", "total_jobs", "lane_counts", "due_now"],
+                "additionalProperties": False,
+            },
+            "CronJobLaneCapabilities": {
+                "type": "object",
+                "properties": {
+                    "lane_values": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/CronLaneValue"},
+                    },
+                    "lane_labels": {
+                        "type": "object",
+                        "properties": {lane: {"type": "string", "enum": [label]} for lane, label in lane_labels.items()},
+                        "required": lane_values,
+                        "additionalProperties": False,
+                    },
+                    "default_lane_by_deliver": {
+                        "type": "object",
+                        "properties": {
+                            "local": {"$ref": "#/components/schemas/CronLaneValue"},
+                            "non_local": {"$ref": "#/components/schemas/CronLaneValue"},
+                        },
+                        "required": ["local", "non_local"],
+                        "additionalProperties": False,
+                    },
+                    "clear_lane_values": {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                },
+                "required": ["lane_values", "lane_labels", "default_lane_by_deliver", "clear_lane_values"],
+                "additionalProperties": False,
+            },
+            "CronJobListResponse": {
+                "type": "object",
+                "properties": {
+                    "jobs": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/CronJob"},
+                    },
+                    "summary": {"$ref": "#/components/schemas/CronJobSummary"},
+                    "capabilities": {"$ref": "#/components/schemas/CronJobLaneCapabilities"},
+                },
+                "required": ["jobs", "summary", "capabilities"],
+                "additionalProperties": False,
+            },
+            "OpenAIErrorDetail": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "type": {"type": "string"},
+                    "param": _nullable_string(),
+                    "code": _nullable_string(),
+                },
+                "required": ["message", "type"],
+                "additionalProperties": False,
+            },
+            "ControlPlaneAuthErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "error": {"$ref": "#/components/schemas/OpenAIErrorDetail"},
+                },
+                "required": ["error"],
+                "additionalProperties": False,
+            },
+            "ControlPlaneErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                },
+                "required": ["error"],
+                "additionalProperties": False,
+            },
+            "TaskActionErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                    "reason_code": {
+                        "type": "string",
+                        "enum": [
+                            "task_not_found",
+                            "task_already_active",
+                            "foreground_not_supported",
+                            "cancel_not_supported",
+                            "cancel_handle_missing",
+                            "reprioritize_not_supported",
+                            "reprioritize_requires_queued_task",
+                            "recover_requires_queued_task",
+                            "recover_not_recommended",
+                            "invalid_priority_bucket",
+                            "invalid_request_body",
+                        ],
+                    },
+                },
+                "required": ["error", "reason_code"],
+                "additionalProperties": False,
+            },
+            "CreateCronJobRequest": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "deliver": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "repeat": {"type": "integer", "minimum": 1},
+                    "lane": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/CronLaneValue"},
+                            {"type": "string", "enum": [""]},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": ["name", "schedule"],
+                "additionalProperties": False,
+            },
+            "UpdateCronJobRequest": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "deliver": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "skill": {"type": "string"},
+                    "repeat": {"type": "integer", "minimum": 1},
+                    "enabled": {"type": "boolean"},
+                    "lane": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/CronLaneValue"},
+                            {"type": "string", "enum": [""]},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "additionalProperties": False,
+            },
+            "DeleteCronJobResponse": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                },
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+            "GatewayPlatformStatus": {
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string"},
+                    "error_code": _nullable_string(),
+                    "error_message": _nullable_string(),
+                    "updated_at": _nullable_string(fmt="date-time"),
+                },
+                "additionalProperties": True,
+            },
+            "LiveTask": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lane": {"$ref": "#/components/schemas/CronLaneValue"},
+                    "label": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "control_mode": {
+                        "type": "string",
+                        "enum": ["managed_runtime", "read_only"],
+                    },
+                    "actions": {"type": "array", "items": {"type": "string"}},
+                    "source": {"type": "string"},
+                    "started_at": _nullable_string(fmt="date-time"),
+                    "running_seconds": {"type": "integer", "minimum": 0},
+                    "running_age": {"type": "string"},
+                },
+                "required": ["task_id", "lane", "kind", "control_mode", "actions"],
+                "additionalProperties": True,
+            },
+            "LiveTaskStatus": {
+                "type": "object",
+                "properties": {
+                    "active_count": {"type": "integer", "minimum": 0},
+                    "lane_counts": {"$ref": "#/components/schemas/CronLaneCounts"},
+                    "tasks": {"type": "array", "items": {"$ref": "#/components/schemas/LiveTask"}},
+                },
+                "required": ["active_count", "lane_counts", "tasks"],
+                "additionalProperties": False,
+            },
+            "QueuedTask": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "state": {"type": "string", "enum": ["queued"]},
+                    "session_key": {"type": "string"},
+                    "lane": {"$ref": "#/components/schemas/CronLaneValue"},
+                    "priority": {"type": "integer"},
+                    "priority_bucket": {"type": "string", "enum": ["now", "next", "later"]},
+                    "priority_bucket_options": {"type": "array", "items": {"type": "string", "enum": ["now", "next", "later"]}},
+                    "reply_policy": {"type": "string"},
+                    "cancellation_policy": {"type": "string"},
+                    "queued_at": _nullable_string(fmt="date-time"),
+                    "wait_seconds": {"type": "integer", "minimum": 0},
+                    "wait_age": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "preview": _nullable_string(),
+                    "kind": {"type": "string"},
+                    "control_mode": {"type": "string", "enum": ["queued"]},
+                    "actions": {"type": "array", "items": {"type": "string", "enum": ["foreground", "reprioritize", "cancel"]}},
+                    "source": {"type": "string"},
+                    "starvation_alert": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedStarvationAlert"},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": [
+                    "task_id",
+                    "state",
+                    "session_key",
+                    "lane",
+                    "priority",
+                    "reply_policy",
+                    "cancellation_policy",
+                    "queued_at",
+                    "wait_seconds",
+                    "wait_age",
+                    "reason",
+                    "kind",
+                    "control_mode",
+                    "actions",
+                    "priority_bucket_options",
+                    "source",
+                ],
+                "additionalProperties": False,
+            },
+            "QueuedBucketStarvation": {
+                "type": "object",
+                "properties": {
+                    "bucket": {"type": "string", "enum": ["now", "next", "later"]},
+                    "queued_count": {"type": "integer", "minimum": 0},
+                    "oldest_wait_seconds": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 0},
+                            {"type": "null"},
+                        ]
+                    },
+                    "oldest_wait_age": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "oldest_task_id": {"type": "string"},
+                },
+                "required": ["bucket", "queued_count", "oldest_wait_seconds", "oldest_wait_age", "oldest_task_id"],
+                "additionalProperties": False,
+            },
+            "QueuedStarvationAlert": {
+                "type": "object",
+                "properties": {
+                    "level": {"type": "string", "enum": ["warning"]},
+                    "reason_code": {"type": "string", "enum": ["bucket_wait_threshold_exceeded"]},
+                    "reason": {"type": "string"},
+                    "bucket": {"type": "string", "enum": ["now", "next", "later"]},
+                    "threshold_seconds": {"type": "integer", "minimum": 0},
+                    "threshold_age": {"type": "string"},
+                    "current_wait_seconds": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 0},
+                            {"type": "null"},
+                        ]
+                    },
+                    "current_wait_age": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "oldest_task_id": {"type": "string"},
+                    "suggested_action": {"type": "string", "enum": ["foreground", "reprioritize"]},
+                    "suggested_bucket": {
+                        "anyOf": [
+                            {"type": "string", "enum": ["now", "next", "later"]},
+                            {"type": "null"},
+                        ]
+                    },
+                    "suggested_command": {"type": "string"},
+                },
+                "required": [
+                    "level",
+                    "reason_code",
+                    "reason",
+                    "bucket",
+                    "threshold_seconds",
+                    "threshold_age",
+                    "current_wait_seconds",
+                    "current_wait_age",
+                    "oldest_task_id",
+                    "suggested_action",
+                    "suggested_bucket",
+                    "suggested_command",
+                ],
+                "additionalProperties": False,
+            },
+            "QueuedTaskStatus": {
+                "type": "object",
+                "properties": {
+                    "queued_count": {"type": "integer", "minimum": 0},
+                    "lane_counts": {"$ref": "#/components/schemas/CronLaneCounts"},
+                    "bucket_counts": {
+                        "type": "object",
+                        "properties": {
+                            "now": {"type": "integer", "minimum": 0},
+                            "next": {"type": "integer", "minimum": 0},
+                            "later": {"type": "integer", "minimum": 0}
+                        },
+                        "required": ["now", "next", "later"],
+                        "additionalProperties": False
+                    },
+                    "next_task": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedTask"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "oldest_waiting": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedTask"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "starving_bucket": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedBucketStarvation"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "starvation_alert": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedStarvationAlert"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "tasks": {"type": "array", "items": {"$ref": "#/components/schemas/QueuedTask"}},
+                },
+                "required": ["queued_count", "lane_counts", "bucket_counts", "next_task", "oldest_waiting", "starving_bucket", "starvation_alert", "tasks"],
+                "additionalProperties": False,
+            },
+            "GatewayTasksResponse": {
+                "type": "object",
+                "properties": {
+                    "queued": {"$ref": "#/components/schemas/QueuedTaskStatus"},
+                    "live": {"$ref": "#/components/schemas/LiveTaskStatus"},
+                },
+                "required": ["queued", "live"],
+                "additionalProperties": False,
+            },
+            "TaskDetailResponse": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "state": {"type": "string", "enum": ["queued", "active"]},
+                    "task": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedTask"},
+                            {"$ref": "#/components/schemas/LiveTask"},
+                        ]
+                    },
+                },
+                "required": ["task_id", "state", "task"],
+                "additionalProperties": False,
+            },
+            "TaskReprioritizeRequest": {
+                "type": "object",
+                "properties": {
+                    "bucket": {"type": "string", "enum": ["now", "next", "later"]},
+                },
+                "required": ["bucket"],
+                "additionalProperties": False,
+            },
+            "TaskActionResponse": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "action": {"type": "string", "enum": ["foreground", "reprioritize", "recover", "cancel"]},
+                    "status": {
+                        "type": "string",
+                        "enum": ["started", "queued_next", "reprioritized", "recovered", "cancelled", "cancellation_requested"],
+                    },
+                    "message": {"type": "string"},
+                    "task": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/QueuedTask"},
+                            {"$ref": "#/components/schemas/LiveTask"},
+                        ]
+                    },
+                },
+                "required": ["task_id", "action", "status", "message", "task"],
+                "additionalProperties": False,
+            },
+            "CronStatusSummary": {
+                "type": "object",
+                "properties": {
+                    "active_jobs": {"type": "integer", "minimum": 0},
+                    "total_jobs": {"type": "integer", "minimum": 0},
+                    "lane_counts": {"$ref": "#/components/schemas/CronLaneCounts"},
+                    "due_now": {"$ref": "#/components/schemas/CronLaneCounts"},
+                },
+                "required": ["active_jobs", "total_jobs", "lane_counts", "due_now"],
+                "additionalProperties": False,
+            },
+            "GatewayStatus": {
+                "type": "object",
+                "properties": {
+                    "gateway_state": {"type": "string"},
+                    "exit_reason": _nullable_string(),
+                    "updated_at": _nullable_string(fmt="date-time"),
+                    "platforms": {
+                        "type": "object",
+                        "additionalProperties": {"$ref": "#/components/schemas/GatewayPlatformStatus"},
+                    },
+                    "queued_tasks": {"$ref": "#/components/schemas/QueuedTaskStatus"},
+                    "live_tasks": {"$ref": "#/components/schemas/LiveTaskStatus"},
+                    "cron": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/CronStatusSummary"},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": ["gateway_state", "exit_reason", "updated_at", "platforms", "queued_tasks", "live_tasks", "cron"],
+                "additionalProperties": False,
+            },
+        }
+
+        job_id_param = {
+            "name": "job_id",
+            "in": "path",
+            "required": True,
+            "schema": {"type": "string", "pattern": "[a-f0-9]{12}"},
+            "description": "Hermes cron job ID.",
+        }
+        task_id_param = {
+            "name": "task_id",
+            "in": "path",
+            "required": True,
+            "schema": {"type": "string", "minLength": 1},
+            "description": "Hermes queued or active task ID.",
+        }
+
+        json_response = lambda schema_name, description: {  # noqa: E731
+            "description": description,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": f"#/components/schemas/{schema_name}"},
+                }
+            },
+        }
+        auth_error_response = lambda description="Invalid or missing bearer token.": json_response(  # noqa: E731
+            "ControlPlaneAuthErrorResponse", description
+        )
+        simple_error_response = lambda description: json_response("ControlPlaneErrorResponse", description)  # noqa: E731
+        task_action_error_response = lambda description: json_response("TaskActionErrorResponse", description)  # noqa: E731
+
+        return {
+            "openapi": "3.1.0",
+            "info": {
+                "title": "Hermes Control Plane API",
+                "version": "1.0.0",
+                "description": (
+                    "Machine-readable contract for Hermes control-plane endpoints: "
+                    "gateway status, task control, and cron job management surfaces."
+                ),
+            },
+            "servers": [{"url": f"http://{self._host}:{self._port}"}],
+            "security": [{"bearerAuth": []}],
+            "paths": {
+                "/api/status": {
+                    "get": {
+                        "summary": "Get gateway runtime status",
+                        "operationId": "getGatewayStatus",
+                        "tags": ["control-plane"],
+                        "responses": {
+                            "200": json_response("GatewayStatus", "Machine-readable gateway/runtime status."),
+                            "401": auth_error_response(),
+                            "500": simple_error_response("Internal error while building gateway status."),
+                        },
+                    }
+                },
+                "/api/tasks": {
+                    "get": {
+                        "summary": "List queued and active gateway tasks",
+                        "operationId": "getGatewayTasks",
+                        "tags": ["control-plane"],
+                        "responses": {
+                            "200": json_response("GatewayTasksResponse", "Queued task backlog plus active runtime tasks."),
+                            "401": auth_error_response(),
+                            "500": simple_error_response("Internal error while building task control-plane status."),
+                        },
+                    }
+                },
+                "/api/tasks/{task_id}": {
+                    "get": {
+                        "summary": "Get one queued or active gateway task",
+                        "operationId": "getGatewayTask",
+                        "tags": ["control-plane"],
+                        "parameters": [task_id_param],
+                        "responses": {
+                            "200": json_response("TaskDetailResponse", "Queued or active task detail."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Task was not found."),
+                            "500": simple_error_response("Internal error while building task detail."),
+                        },
+                    }
+                },
+                "/api/tasks/{task_id}/foreground": {
+                    "post": {
+                        "summary": "Foreground a queued task",
+                        "operationId": "foregroundGatewayTask",
+                        "tags": ["control-plane"],
+                        "parameters": [task_id_param],
+                        "responses": {
+                            "200": json_response("TaskActionResponse", "Foregrounded task action result."),
+                            "400": task_action_error_response("Task is active or cannot be foregrounded."),
+                            "401": auth_error_response(),
+                            "404": task_action_error_response("Task was not found."),
+                            "500": simple_error_response("Internal error while foregrounding a task."),
+                        },
+                    }
+                },
+                "/api/tasks/{task_id}/reprioritize": {
+                    "post": {
+                        "summary": "Change a queued task's priority bucket",
+                        "operationId": "reprioritizeGatewayTask",
+                        "tags": ["control-plane"],
+                        "parameters": [task_id_param],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/TaskReprioritizeRequest"}
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": json_response("TaskActionResponse", "Queued task reprioritized."),
+                            "400": task_action_error_response("Priority bucket is invalid or task cannot be reprioritized."),
+                            "401": auth_error_response(),
+                            "404": task_action_error_response("Task was not found."),
+                            "500": simple_error_response("Internal error while reprioritizing a task."),
+                        },
+                    }
+                },
+                "/api/tasks/{task_id}/recover": {
+                    "post": {
+                        "summary": "Apply the current starvation recovery recommendation for a queued task",
+                        "operationId": "recoverGatewayTask",
+                        "tags": ["control-plane"],
+                        "parameters": [task_id_param],
+                        "responses": {
+                            "200": json_response("TaskActionResponse", "Queued task recovered via the current recommendation."),
+                            "400": task_action_error_response("Task has no active recovery recommendation or cannot be recovered."),
+                            "401": auth_error_response(),
+                            "404": task_action_error_response("Task was not found."),
+                            "500": simple_error_response("Internal error while recovering a task."),
+                        },
+                    }
+                },
+                "/api/tasks/{task_id}/cancel": {
+                    "post": {
+                        "summary": "Cancel a queued or managed runtime task",
+                        "operationId": "cancelGatewayTask",
+                        "tags": ["control-plane"],
+                        "parameters": [task_id_param],
+                        "responses": {
+                            "200": json_response("TaskActionResponse", "Task cancellation action result."),
+                            "400": task_action_error_response("Task cannot be cancelled from the control plane."),
+                            "401": auth_error_response(),
+                            "404": task_action_error_response("Task was not found."),
+                            "500": simple_error_response("Internal error while cancelling a task."),
+                        },
+                    }
+                },
+                "/api/jobs": {
+                    "get": {
+                        "summary": "List cron jobs",
+                        "operationId": "listCronJobs",
+                        "tags": ["cron-jobs"],
+                        "responses": {
+                            "200": json_response("CronJobListResponse", "Cron job list plus lane summary and capabilities."),
+                            "401": auth_error_response(),
+                            "500": simple_error_response("Internal error while listing cron jobs."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                    "post": {
+                        "summary": "Create a cron job",
+                        "operationId": "createCronJob",
+                        "tags": ["cron-jobs"],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CreateCronJobRequest"},
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": json_response("CronJobEnvelope", "Created cron job payload."),
+                            "400": simple_error_response("Validation error while creating a cron job."),
+                            "401": auth_error_response(),
+                            "500": simple_error_response("Internal error while creating a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                },
+                "/api/jobs/{job_id}": {
+                    "parameters": [job_id_param],
+                    "get": {
+                        "summary": "Get one cron job",
+                        "operationId": "getCronJob",
+                        "tags": ["cron-jobs"],
+                        "responses": {
+                            "200": json_response("CronJobEnvelope", "Single cron job payload."),
+                            "400": simple_error_response("Invalid cron job ID format."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Cron job was not found."),
+                            "500": simple_error_response("Internal error while fetching a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                    "patch": {
+                        "summary": "Update a cron job",
+                        "operationId": "updateCronJob",
+                        "tags": ["cron-jobs"],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/UpdateCronJobRequest"},
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": json_response("CronJobEnvelope", "Updated cron job payload."),
+                            "400": simple_error_response("Validation error while updating a cron job."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Cron job was not found."),
+                            "500": simple_error_response("Internal error while updating a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                    "delete": {
+                        "summary": "Delete a cron job",
+                        "operationId": "deleteCronJob",
+                        "tags": ["cron-jobs"],
+                        "responses": {
+                            "200": json_response("DeleteCronJobResponse", "Deletion acknowledgement."),
+                            "400": simple_error_response("Invalid cron job ID format."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Cron job was not found."),
+                            "500": simple_error_response("Internal error while deleting a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                },
+                "/api/jobs/{job_id}/pause": {
+                    "parameters": [job_id_param],
+                    "post": {
+                        "summary": "Pause a cron job",
+                        "operationId": "pauseCronJob",
+                        "tags": ["cron-jobs"],
+                        "responses": {
+                            "200": json_response("CronJobEnvelope", "Paused cron job payload."),
+                            "400": simple_error_response("Invalid cron job ID format."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Cron job was not found."),
+                            "500": simple_error_response("Internal error while pausing a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                },
+                "/api/jobs/{job_id}/resume": {
+                    "parameters": [job_id_param],
+                    "post": {
+                        "summary": "Resume a cron job",
+                        "operationId": "resumeCronJob",
+                        "tags": ["cron-jobs"],
+                        "responses": {
+                            "200": json_response("CronJobEnvelope", "Resumed cron job payload."),
+                            "400": simple_error_response("Invalid cron job ID format."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Cron job was not found."),
+                            "500": simple_error_response("Internal error while resuming a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                },
+                "/api/jobs/{job_id}/run": {
+                    "parameters": [job_id_param],
+                    "post": {
+                        "summary": "Trigger a cron job immediately",
+                        "operationId": "runCronJob",
+                        "tags": ["cron-jobs"],
+                        "responses": {
+                            "200": json_response("CronJobEnvelope", "Triggered cron job payload."),
+                            "400": simple_error_response("Invalid cron job ID format."),
+                            "401": auth_error_response(),
+                            "404": simple_error_response("Cron job was not found."),
+                            "500": simple_error_response("Internal error while triggering a cron job."),
+                            "501": simple_error_response("Cron module not available."),
+                        },
+                    },
+                },
+            },
+            "components": {
+                "securitySchemes": {
+                    "bearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer",
+                        "bearerFormat": "API key",
+                    }
+                },
+                "schemas": schemas,
+            },
+        }
+
+    def _empty_live_tasks_payload(self) -> Dict[str, Any]:
+        return {
+            "active_count": 0,
+            "lane_counts": {lane: 0 for lane in self._CRON_LANE_ORDER},
+            "tasks": [],
+        }
+
+    def _empty_queued_tasks_payload(self) -> Dict[str, Any]:
+        return {
+            "queued_count": 0,
+            "lane_counts": {lane: 0 for lane in self._CRON_LANE_ORDER},
+            "bucket_counts": {bucket: 0 for bucket in ("now", "next", "later")},
+            "next_task": None,
+            "oldest_waiting": None,
+            "starving_bucket": None,
+            "starvation_alert": None,
+            "tasks": [],
+        }
+
+    @staticmethod
+    def _queued_task_sort_key(task: Dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            int(task.get("priority") or 50),
+            str(task.get("queued_at") or ""),
+            str(task.get("task_id") or ""),
+        )
+
+    @staticmethod
+    def _queued_task_actions(adapter: Any) -> List[str]:
+        return shared_queued_task_actions(adapter)
+
+    @staticmethod
+    def _queued_task_source_label(message_event: Any) -> str:
+        return shared_queued_task_source_label(message_event)
+
+    @staticmethod
+    def _queued_task_iso(value: Any) -> Optional[str]:
+        return shared_queued_task_iso(value)
+
+    def _queued_task_payload(self, envelope: Any, *, actions: Optional[List[str]] = None) -> Dict[str, Any]:
+        return shared_queued_task_payload(envelope, actions=actions)
+
+    def _normalize_queued_task_payload(self, task_payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            from gateway.status import normalize_queued_tasks_payload
+
+            normalized = normalize_queued_tasks_payload({"tasks": [task_payload]})
+            tasks = normalized.get("tasks") if isinstance(normalized, dict) else None
+            if isinstance(tasks, list) and tasks:
+                return dict(tasks[0])
+        except Exception:
+            pass
+
+        try:
+            from task_lanes import normalize_status_task_lane
+
+            fallback = dict(task_payload)
+            fallback["lane"] = normalize_status_task_lane(fallback.get("lane"))
+            fallback["state"] = "queued"
+            fallback["control_mode"] = "queued"
+            fallback["actions"] = list(fallback.get("actions") or [])
+            return fallback
+        except Exception:
+            return dict(task_payload)
+
+    def _control_adapters(self) -> List[Any]:
+        runner = getattr(self, "gateway_runner", None)
+        adapters = getattr(runner, "adapters", {}) if runner is not None else {}
+        if not isinstance(adapters, dict):
+            return []
+        return [candidate for candidate in adapters.values() if candidate is not self]
+
+    def _find_queued_task(self, task_id: str) -> tuple[Optional[Any], Optional[Any]]:
+        for candidate in self._control_adapters():
+            snapshot_pending = getattr(candidate, "all_pending_tasks_snapshot", None)
+            if not callable(snapshot_pending):
+                continue
+            try:
+                pending = list(snapshot_pending() or [])
+            except Exception:
+                continue
+            for envelope in pending:
+                if str(getattr(envelope, "task_id", "") or "") == task_id:
+                    return candidate, envelope
+        return None, None
+
+    def _find_live_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        tasks = self._live_tasks_status_payload().get("tasks")
+        if not isinstance(tasks, list):
+            return None
+        for task in tasks:
+            if isinstance(task, dict) and str(task.get("task_id") or "") == task_id:
+                return dict(task)
+        return None
+
+    @staticmethod
+    def _task_detail_payload(*, task_id: str, state: str, task: Dict[str, Any]) -> Dict[str, Any]:
+        return build_task_detail_payload(task_id=task_id, state=state, task=task)
+
+    @staticmethod
+    def _task_action_payload(
+        *,
+        task_id: str,
+        action: str,
+        status: str,
+        task: Dict[str, Any],
+        message: Optional[str] = None,
+        target_bucket: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return shared_build_task_action_payload(
+            task_id=task_id,
+            action=action,
+            status=status,
+            message=message,
+            task=task,
+            target_bucket=target_bucket,
+        )
+
+    @staticmethod
+    def _task_action_error_payload(*, task_id: str, action: str, reason_code: str, message: Optional[str] = None) -> Dict[str, Any]:
+        return shared_build_task_action_error_payload(
+            task_id=task_id,
+            action=action,
+            reason_code=reason_code,
+            message=message,
+        )
+
+    def _queued_tasks_status_payload(self) -> Dict[str, Any]:
+        raw_tasks: List[Dict[str, Any]] = []
+        for candidate in self._control_adapters():
+            snapshot_pending = getattr(candidate, "all_pending_tasks_snapshot", None)
+            if not callable(snapshot_pending):
+                continue
+            try:
+                pending = list(snapshot_pending() or [])
+            except Exception:
+                continue
+            actions = self._queued_task_actions(candidate)
+            for envelope in pending:
+                raw_tasks.append(self._queued_task_payload(envelope, actions=actions))
+
+        raw_tasks.sort(key=self._queued_task_sort_key)
+
+        try:
+            from gateway.status import normalize_queued_tasks_payload
+
+            return normalize_queued_tasks_payload({"tasks": raw_tasks})
+        except Exception:
+            payload = self._empty_queued_tasks_payload()
+            payload["tasks"] = raw_tasks
+            payload["queued_count"] = len(raw_tasks)
+            if raw_tasks:
+                payload["next_task"] = self._normalize_queued_task_payload(raw_tasks[0])
+            return payload
+
+    def _live_tasks_status_payload(self, runtime_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = runtime_status if isinstance(runtime_status, dict) else {}
+        live_tasks = payload.get("live_tasks") if isinstance(payload.get("live_tasks"), dict) else None
+        if not live_tasks:
+            try:
+                from gateway.run import _current_live_task_status_payload
+
+                live_tasks = _current_live_task_status_payload()
+            except Exception:
+                try:
+                    from gateway.run import task_lane_registry
+
+                    live_tasks = task_lane_registry.status_snapshot()
+                except Exception:
+                    live_tasks = self._empty_live_tasks_payload()
+
+        try:
+            from gateway.status import normalize_live_tasks_payload
+
+            return normalize_live_tasks_payload(live_tasks)
+        except Exception:
+            return self._empty_live_tasks_payload()
+
+    def _tasks_payload(self, runtime_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return build_gateway_tasks_payload(
+            queued=self._queued_tasks_status_payload(),
+            live=self._live_tasks_status_payload(runtime_status),
+        )
+
+    def _cron_status_payload(self) -> Optional[Dict[str, Any]]:
+        if not self._CRON_AVAILABLE:
+            return None
+        jobs = self._cron_list(include_disabled=True)
+        active_jobs = [job for job in jobs if job.get("enabled", True)]
+        lane_summary = self._cron_summarize_lanes(active_jobs, due_jobs=self._cron_get_due())
+        return {
+            "active_jobs": len(active_jobs),
+            "total_jobs": len(jobs),
+            "lane_counts": lane_summary["active"],
+            "due_now": lane_summary["due"],
+        }
+
+    async def _handle_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/status — machine-readable gateway/runtime status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            try:
+                from gateway.status import build_gateway_status_payload, read_runtime_status
+
+                runtime_status = read_runtime_status() or {}
+            except Exception:
+                runtime_status = {}
+                from gateway.status import build_gateway_status_payload
+
+            return web.json_response(
+                build_gateway_status_payload(
+                    runtime_status=runtime_status,
+                    queued_tasks=self._queued_tasks_status_payload(),
+                    live_tasks=self._live_tasks_status_payload(runtime_status),
+                    cron_payload=self._cron_status_payload(),
+                )
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    def _task_id_or_error(self, request: "web.Request") -> tuple[str, Optional["web.Response"]]:
+        task_id = str(request.match_info.get("task_id") or "").strip()
+        if not task_id:
+            return "", web.json_response({"error": "Task ID is required"}, status=400)
+        return task_id, None
+
+    async def _reprioritize_bucket_or_error(
+        self,
+        request: "web.Request",
+        *,
+        task_id: str,
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return None, web.json_response(
+                self._task_action_error_payload(
+                    task_id=task_id,
+                    action="reprioritize",
+                    reason_code="invalid_request_body",
+                ),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            body = {}
+        bucket = normalize_priority_bucket(body.get("bucket"))
+        if bucket:
+            return bucket, None
+        return None, web.json_response(
+            self._task_action_error_payload(
+                task_id=task_id,
+                action="reprioritize",
+                reason_code="invalid_priority_bucket",
+            ),
+            status=400,
+        )
+
+    def _queued_task_status_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+        queued_status = self._queued_tasks_status_payload()
+        for task in list((queued_status or {}).get("tasks") or []):
+            if isinstance(task, dict) and str(task.get("task_id") or "") == task_id:
+                return dict(task)
+        return None
+
+    def _task_detail_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+        queued_task = self._queued_task_status_by_id(task_id)
+        if queued_task is not None:
+            return self._task_detail_payload(task_id=task_id, state="queued", task=queued_task)
+
+        live_task = self._find_live_task(task_id)
+        if live_task is not None:
+            return self._task_detail_payload(task_id=task_id, state="active", task=live_task)
+
+        return None
+
+    async def _handle_tasks(self, request: "web.Request") -> "web.Response":
+        """GET /api/tasks — queued backlog plus active runtime tasks."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            return web.json_response(self._tasks_payload())
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_task_detail(self, request: "web.Request") -> "web.Response":
+        """GET /api/tasks/{task_id} — queued or active task detail."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        task_id, task_err = self._task_id_or_error(request)
+        if task_err:
+            return task_err
+        try:
+            payload = self._task_detail_by_id(task_id)
+            if payload is None:
+                return web.json_response({"error": "Task not found"}, status=404)
+            return web.json_response(payload)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_foreground_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/tasks/{task_id}/foreground — promote a queued task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        task_id, task_err = self._task_id_or_error(request)
+        if task_err:
+            return task_err
+        try:
+            candidate, queued_task = self._find_queued_task(task_id)
+            if queued_task is not None:
+                foreground_pending = getattr(candidate, "foreground_pending_task", None) if candidate is not None else None
+                if not callable(foreground_pending):
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="foreground",
+                            reason_code="foreground_not_supported",
+                        ),
+                        status=400,
+                    )
+                foregrounded = foreground_pending(str(getattr(queued_task, "session_key", "") or ""), task_id)
+                if foregrounded is None:
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="foreground",
+                            reason_code="task_not_found",
+                        ),
+                        status=404,
+                    )
+                disposition, envelope = foregrounded
+                status = disposition if disposition in {"started", "queued_next"} else "started"
+                task_payload = self._normalize_queued_task_payload(
+                    self._queued_task_payload(envelope, actions=self._queued_task_actions(candidate))
+                )
+                return web.json_response(
+                    self._task_action_payload(
+                        task_id=task_id,
+                        action="foreground",
+                        status=status,
+                        task=task_payload,
+                    )
+                )
+
+            if self._find_live_task(task_id) is not None:
+                return web.json_response(
+                    self._task_action_error_payload(
+                        task_id=task_id,
+                        action="foreground",
+                        reason_code="task_already_active",
+                    ),
+                    status=400,
+                )
+            return web.json_response(
+                self._task_action_error_payload(
+                    task_id=task_id,
+                    action="foreground",
+                    reason_code="task_not_found",
+                ),
+                status=404,
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_reprioritize_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/tasks/{task_id}/reprioritize — change a queued task's priority bucket."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        task_id, task_err = self._task_id_or_error(request)
+        if task_err:
+            return task_err
+        bucket, bucket_err = await self._reprioritize_bucket_or_error(request, task_id=task_id)
+        if bucket_err:
+            return bucket_err
+        try:
+            candidate, queued_task = self._find_queued_task(task_id)
+            if queued_task is not None:
+                reprioritize_pending = getattr(candidate, "reprioritize_pending_task", None) if candidate is not None else None
+                if not callable(reprioritize_pending):
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="reprioritize",
+                            reason_code="reprioritize_not_supported",
+                        ),
+                        status=400,
+                    )
+                updated = reprioritize_pending(str(getattr(queued_task, "session_key", "") or ""), task_id, bucket)
+                if updated is None:
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="reprioritize",
+                            reason_code="task_not_found",
+                        ),
+                        status=404,
+                    )
+                task_payload = self._normalize_queued_task_payload(
+                    self._queued_task_payload(updated, actions=self._queued_task_actions(candidate))
+                )
+                return web.json_response(
+                    self._task_action_payload(
+                        task_id=task_id,
+                        action="reprioritize",
+                        status="reprioritized",
+                        target_bucket=bucket,
+                        task=task_payload,
+                    )
+                )
+
+            if self._find_live_task(task_id) is not None:
+                return web.json_response(
+                    self._task_action_error_payload(
+                        task_id=task_id,
+                        action="reprioritize",
+                        reason_code="reprioritize_requires_queued_task",
+                    ),
+                    status=400,
+                )
+            return web.json_response(
+                self._task_action_error_payload(
+                    task_id=task_id,
+                    action="reprioritize",
+                    reason_code="task_not_found",
+                ),
+                status=404,
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_recover_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/tasks/{task_id}/recover — apply the queued task's current recovery recommendation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        task_id, task_err = self._task_id_or_error(request)
+        if task_err:
+            return task_err
+        try:
+            candidate, queued_task = self._find_queued_task(task_id)
+            if queued_task is not None:
+                queued_task_payload = self._queued_task_status_by_id(task_id)
+                recovery_plan = queued_task_recovery_plan(queued_task_payload)
+                if recovery_plan is None:
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="recover",
+                            reason_code="recover_not_recommended",
+                        ),
+                        status=400,
+                    )
+                recovery_action = str(recovery_plan.get("action") or "").strip().lower()
+                target_bucket = normalize_priority_bucket(recovery_plan.get("target_bucket"))
+                if recovery_action == "reprioritize":
+                    reprioritize_pending = getattr(candidate, "reprioritize_pending_task", None) if candidate is not None else None
+                    if not callable(reprioritize_pending):
+                        return web.json_response(
+                            self._task_action_error_payload(
+                                task_id=task_id,
+                                action="reprioritize",
+                                reason_code="reprioritize_not_supported",
+                            ),
+                            status=400,
+                        )
+                    updated = reprioritize_pending(str(getattr(queued_task, "session_key", "") or ""), task_id, str(target_bucket or ""))
+                    if updated is None:
+                        return web.json_response(
+                            self._task_action_error_payload(
+                                task_id=task_id,
+                                action="recover",
+                                reason_code="task_not_found",
+                            ),
+                            status=404,
+                        )
+                    task_payload = self._normalize_queued_task_payload(
+                        self._queued_task_payload(updated, actions=self._queued_task_actions(candidate))
+                    )
+                    return web.json_response(
+                        self._task_action_payload(
+                            task_id=task_id,
+                            action="recover",
+                            status="recovered",
+                            target_bucket=target_bucket,
+                            task=task_payload,
+                        )
+                    )
+                foreground_pending = getattr(candidate, "foreground_pending_task", None) if candidate is not None else None
+                if not callable(foreground_pending):
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="foreground",
+                            reason_code="foreground_not_supported",
+                        ),
+                        status=400,
+                    )
+                foregrounded = foreground_pending(str(getattr(queued_task, "session_key", "") or ""), task_id)
+                if foregrounded is None:
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="recover",
+                            reason_code="task_not_found",
+                        ),
+                        status=404,
+                    )
+                disposition, envelope = foregrounded
+                task_payload = self._normalize_queued_task_payload(
+                    self._queued_task_payload(envelope, actions=self._queued_task_actions(candidate))
+                )
+                return web.json_response(
+                    self._task_action_payload(
+                        task_id=task_id,
+                        action="recover",
+                        status=(disposition if disposition in {"started", "queued_next"} else "started"),
+                        task=task_payload,
+                    )
+                )
+
+            if self._find_live_task(task_id) is not None:
+                return web.json_response(
+                    self._task_action_error_payload(
+                        task_id=task_id,
+                        action="recover",
+                        reason_code="recover_requires_queued_task",
+                    ),
+                    status=400,
+                )
+
+            return web.json_response(
+                self._task_action_error_payload(
+                    task_id=task_id,
+                    action="recover",
+                    reason_code="task_not_found",
+                ),
+                status=404,
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_cancel_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/tasks/{task_id}/cancel — cancel a queued or managed runtime task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        task_id, task_err = self._task_id_or_error(request)
+        if task_err:
+            return task_err
+        try:
+            candidate, queued_task = self._find_queued_task(task_id)
+            if queued_task is not None:
+                cancel_pending = getattr(candidate, "cancel_pending_task", None) if candidate is not None else None
+                if not callable(cancel_pending):
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="cancel",
+                            reason_code="cancel_not_supported",
+                        ),
+                        status=400,
+                    )
+                removed = cancel_pending(str(getattr(queued_task, "session_key", "") or ""), task_id)
+                if removed is None:
+                    return web.json_response(
+                        self._task_action_error_payload(
+                            task_id=task_id,
+                            action="cancel",
+                            reason_code="task_not_found",
+                        ),
+                        status=404,
+                    )
+                task_payload = self._normalize_queued_task_payload(
+                    self._queued_task_payload(removed, actions=self._queued_task_actions(candidate))
+                )
+                return web.json_response(
+                    self._task_action_payload(
+                        task_id=task_id,
+                        action="cancel",
+                        status="cancelled",
+                        task=task_payload,
+                    )
+                )
+
+            if self._find_live_task(task_id) is not None:
+                runner = getattr(self, "gateway_runner", None)
+                cancel_runtime = getattr(runner, "_cancel_managed_runtime_task", None) if runner is not None else None
+                if callable(cancel_runtime) and cancel_runtime(task_id):
+                    live_task = self._find_live_task(task_id) or {}
+                    return web.json_response(
+                        self._task_action_payload(
+                            task_id=task_id,
+                            action="cancel",
+                            status="cancellation_requested",
+                            task=live_task,
+                        )
+                    )
+                return web.json_response(
+                    self._task_action_error_payload(
+                        task_id=task_id,
+                        action="cancel",
+                        reason_code="cancel_handle_missing",
+                    ),
+                    status=400,
+                )
+
+            return web.json_response(
+                self._task_action_error_payload(
+                    task_id=task_id,
+                    action="cancel",
+                    reason_code="task_not_found",
+                ),
+                status=404,
+            )
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_openapi(self, request: "web.Request") -> "web.Response":
+        """GET /openapi.json — OpenAPI contract for Hermes control-plane endpoints."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(self._openapi_contract())
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -1047,7 +2579,21 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in ("true", "1")
             jobs = self._cron_list(include_disabled=include_disabled)
-            return web.json_response({"jobs": jobs})
+            jobs_payload = [self._job_payload(job) for job in jobs]
+            active_jobs = [job for job in jobs if job.get("enabled", True)]
+            lane_summary = self._cron_summarize_lanes(active_jobs, due_jobs=self._cron_get_due())
+            return web.json_response(
+                {
+                    "jobs": jobs_payload,
+                    "summary": {
+                        "active_jobs": len(active_jobs),
+                        "total_jobs": len(jobs),
+                        "lane_counts": lane_summary["active"],
+                        "due_now": lane_summary["due"],
+                    },
+                    "capabilities": self._lane_capabilities_payload(),
+                }
+            )
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1067,6 +2613,12 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+
+            normalized_lane = None
+            if "lane" in body:
+                normalized_lane, lane_err = self._normalize_job_lane_or_error(body.get("lane"))
+                if lane_err:
+                    return lane_err
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -1093,9 +2645,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if "lane" in body:
+                kwargs["lane"] = normalized_lane
 
             job = self._cron_create(**kwargs)
-            return web.json_response({"job": job})
+            return web.json_response({"job": self._job_payload(job)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1114,7 +2668,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = self._cron_get(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": self._job_payload(job)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1135,6 +2689,10 @@ class APIServerAdapter(BasePlatformAdapter):
             sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
+            if "lane" in sanitized:
+                sanitized["lane"], lane_err = self._normalize_job_lane_or_error(sanitized.get("lane"))
+                if lane_err:
+                    return lane_err
             # Validate lengths if present
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
                 return web.json_response(
@@ -1147,7 +2705,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = self._cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": self._job_payload(job)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1185,7 +2743,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = self._cron_pause(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": self._job_payload(job)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1204,7 +2762,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = self._cron_resume(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": self._job_payload(job)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1223,7 +2781,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = self._cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": self._job_payload(job)})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -1609,6 +3167,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/api/status", self._handle_status)
+            self._app.router.add_get("/api/tasks", self._handle_tasks)
+            self._app.router.add_get("/api/tasks/{task_id}", self._handle_task_detail)
+            self._app.router.add_post("/api/tasks/{task_id}/foreground", self._handle_foreground_task)
+            self._app.router.add_post("/api/tasks/{task_id}/reprioritize", self._handle_reprioritize_task)
+            self._app.router.add_post("/api/tasks/{task_id}/recover", self._handle_recover_task)
+            self._app.router.add_post("/api/tasks/{task_id}/cancel", self._handle_cancel_task)
+            self._app.router.add_get("/openapi.json", self._handle_openapi)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)

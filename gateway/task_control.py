@@ -445,10 +445,13 @@ def render_gateway_tasks_block(
         parts = [f"{idx}. `{task_id}`", normalize_task_lane(task.get("lane"))]
         label = task.get("label")
         source = task.get("source")
+        running_age = str(task.get("running_age") or "").strip()
         if label:
             parts.append(str(label))
         if source:
             parts.append(f"source={source}")
+        if running_age:
+            parts.append(f"running {running_age}")
         lines.append(" · ".join(parts))
         hint_line = render_task_command_hints(task_id, actions=task.get("actions"))
         if hint_line:
@@ -477,6 +480,24 @@ def build_task_detail_payload(*, task_id: str, state: str, task: Dict[str, Any])
             raw_wait_seconds=task_payload.get("wait_seconds"),
             raw_wait_age=task_payload.get("wait_age"),
         )
+    if task_payload.get("started_at") is not None:
+        running_seconds = queued_task_wait_seconds(
+            task_payload.get("started_at"),
+            raw_wait_seconds=task_payload.get("running_seconds"),
+        )
+        running_age = queued_task_wait_age(
+            task_payload.get("started_at"),
+            raw_wait_seconds=running_seconds,
+            raw_wait_age=task_payload.get("running_age"),
+        )
+        if running_seconds is not None:
+            task_payload["running_seconds"] = running_seconds
+        else:
+            task_payload.pop("running_seconds", None)
+        if running_age is not None:
+            task_payload["running_age"] = running_age
+        else:
+            task_payload.pop("running_age", None)
     return {
         "task_id": str(task_id or "").strip(),
         "state": str(state or "").strip(),
@@ -651,6 +672,7 @@ def render_gateway_task_detail_block(
     kind = humanize_task_kind(task.get("kind"))
     source = task.get("source")
     started_at = task.get("started_at")
+    running_age = task.get("running_age")
     preview = task.get("preview")
     actions = normalize_task_actions(task.get("actions"))
     control = describe_task_control(payload)
@@ -685,6 +707,8 @@ def render_gateway_task_detail_block(
         lines.append(f"**Source:** {source}")
     if started_at:
         lines.append(f"**Started:** {started_at}")
+    if running_age:
+        lines.append(f"**Running:** {running_age}")
     if preview_formatter is not None:
         preview_text = preview_formatter(preview)
     else:

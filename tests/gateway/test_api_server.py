@@ -13,8 +13,13 @@ Tests cover:
 """
 
 import json
+import re
 import time
 import uuid
+import warnings
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,6 +35,8 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.base import MessageEvent, MessageTaskEnvelope, MessageType
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +227,121 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/v1/health", adapter._handle_health)
+    app.router.add_get("/api/status", adapter._handle_status)
+    app.router.add_get("/api/tasks", adapter._handle_tasks)
+    app.router.add_get("/api/tasks/{task_id}", adapter._handle_task_detail)
+    app.router.add_post("/api/tasks/{task_id}/foreground", adapter._handle_foreground_task)
+    app.router.add_post("/api/tasks/{task_id}/reprioritize", adapter._handle_reprioritize_task)
+    app.router.add_post("/api/tasks/{task_id}/recover", adapter._handle_recover_task)
+    app.router.add_post("/api/tasks/{task_id}/cancel", adapter._handle_cancel_task)
+    app.router.add_get("/openapi.json", adapter._handle_openapi)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     return app
+
+
+_DOCS_PATH = Path(__file__).resolve().parents[2] / "website" / "docs" / "user-guide" / "features" / "api-server.md"
+
+
+def _read_api_server_docs() -> str:
+    return _DOCS_PATH.read_text(encoding="utf-8")
+
+
+def _markdown_section(markdown: str, heading: str) -> str:
+    match = re.search(rf"^{re.escape(heading)}\s*$", markdown, flags=re.MULTILINE)
+    assert match, f"Missing heading: {heading}"
+    level = len(heading) - len(heading.lstrip("#"))
+    remainder = markdown[match.end() :]
+    next_heading = re.search(rf"^(?:#{{1,{level}}})\s", remainder, flags=re.MULTILINE)
+    end = match.end() + next_heading.start() if next_heading else len(markdown)
+    return markdown[match.end() : end]
+
+
+def _markdown_json_blocks(markdown: str, heading: str) -> list[dict]:
+    section = _markdown_section(markdown, heading)
+    blocks = re.findall(r"```json\n(.*?)\n```", section, flags=re.DOTALL)
+    assert blocks, f"Missing JSON block under heading: {heading}"
+    return [json.loads(block) for block in blocks]
+
+
+def _assert_matches_openapi_schema(openapi: dict, schema_name: str, instance: dict) -> None:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        from jsonschema import Draft202012Validator, RefResolver
+
+        resolver = RefResolver.from_schema(openapi)
+        schema = openapi["components"]["schemas"][schema_name]
+        Draft202012Validator(schema, resolver=resolver).validate(instance)
+
+
+def _make_task_source(chat_id: str = "123") -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type="dm",
+        user_id="user-123",
+        user_name="tester",
+    )
+
+
+def _make_task_event(text: str, *, source: SessionSource | None = None, message_id: str = "msg-1") -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source or _make_task_source(),
+        message_id=message_id,
+    )
+
+
+def _make_queued_task(
+    *,
+    task_id: str = "task-hi",
+    session_key: str = "telegram:user:123",
+    priority: int = 10,
+    lane: str = "cron_scout",
+    preview: str = "high priority queued follow-up",
+    reply_policy: str = "status_only",
+    cancellation_policy: str = "preserve",
+    reason: str = "busy_followup",
+) -> MessageTaskEnvelope:
+    return MessageTaskEnvelope(
+        task_id=task_id,
+        session_key=session_key,
+        message_event=_make_task_event(preview),
+        priority=priority,
+        lane=lane,
+        reply_policy=reply_policy,
+        cancellation_policy=cancellation_policy,
+        queued_at=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
+        reason=reason,
+    )
+
+
+def _make_live_tasks_payload(*, tasks: list[dict]) -> dict:
+    lane_counts = {"interactive": 0, "cron_scout": 0, "housekeeping": 0}
+    for task in tasks:
+        lane = task.get("lane")
+        if lane in lane_counts:
+            lane_counts[lane] += 1
+    return {
+        "active_count": len(tasks),
+        "lane_counts": lane_counts,
+        "tasks": tasks,
+    }
+
+
+def _attach_control_runner(adapter: APIServerAdapter, control_adapter: Any | None = None, *, cancel_runtime_result: bool = False) -> MagicMock:
+    runner = MagicMock()
+    runner.adapters = {}
+    if control_adapter is not None:
+        runner.adapters["telegram"] = control_adapter
+    runner.adapters["api"] = adapter
+    runner._cancel_managed_runtime_task = MagicMock(return_value=cancel_runtime_result)
+    adapter.gateway_runner = runner
+    return runner
 
 
 @pytest.fixture
@@ -1683,3 +1799,613 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+class TestControlPlaneStatusEndpoint:
+    @pytest.mark.asyncio
+    async def test_api_status_returns_live_tasks_and_cron_summary(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task()
+        stale_task = _make_queued_task(task_id="task-stale", priority=80, lane="housekeeping")
+        stale_task.queued_at = datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc)
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task, stale_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+        runtime_status = {
+            "gateway_state": "running",
+            "exit_reason": None,
+            "updated_at": "2026-04-19T12:00:00+00:00",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "error_code": None,
+                    "error_message": None,
+                    "updated_at": "2026-04-19T12:00:00+00:00",
+                }
+            },
+            "live_tasks": _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "bg-1",
+                        "lane": "cron_scout",
+                        "label": "background task",
+                        "kind": "background",
+                        "control_mode": "managed_runtime",
+                        "actions": ["cancel"],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        }
+        monkeypatch.setattr("gateway.status.read_runtime_status", lambda: runtime_status)
+        monkeypatch.setattr(APIServerAdapter, "_CRON_AVAILABLE", True)
+        monkeypatch.setattr(
+            APIServerAdapter,
+            "_cron_list",
+            staticmethod(
+                lambda include_disabled=True: [
+                    {"id": "job-1", "deliver": "origin", "enabled": True},
+                    {"id": "job-2", "deliver": "local", "lane": "housekeeping", "enabled": True},
+                    {"id": "job-3", "deliver": "origin", "enabled": False},
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            APIServerAdapter,
+            "_cron_get_due",
+            staticmethod(lambda: [{"id": "job-2", "deliver": "local", "lane": "housekeeping", "enabled": True}]),
+        )
+        monkeypatch.setattr(
+            APIServerAdapter,
+            "_cron_summarize_lanes",
+            staticmethod(
+                lambda jobs, due_jobs=None: {
+                    "active": {"interactive": 1, "cron_scout": 0, "housekeeping": 1},
+                    "due": {"interactive": 0, "cron_scout": 0, "housekeeping": 1},
+                }
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/status")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["gateway_state"] == "running"
+        assert data["platforms"]["telegram"]["state"] == "connected"
+        assert data["queued_tasks"]["queued_count"] == 2
+        assert data["queued_tasks"]["bucket_counts"] == {"now": 1, "next": 0, "later": 1}
+        assert data["queued_tasks"]["next_task"]["task_id"] == "task-hi"
+        assert data["queued_tasks"]["next_task"]["priority_bucket"] == "now"
+        assert data["queued_tasks"]["next_task"]["wait_seconds"] == 300
+        assert data["queued_tasks"]["next_task"]["wait_age"] == "5m"
+        assert data["queued_tasks"]["oldest_waiting"]["task_id"] == "task-stale"
+        assert data["queued_tasks"]["oldest_waiting"]["priority_bucket"] == "later"
+        assert data["queued_tasks"]["oldest_waiting"]["wait_seconds"] == 7500
+        assert data["queued_tasks"]["oldest_waiting"]["wait_age"] == "2h 5m"
+        assert data["queued_tasks"]["starving_bucket"] == {
+            "bucket": "later",
+            "queued_count": 1,
+            "oldest_wait_seconds": 7500,
+            "oldest_wait_age": "2h 5m",
+            "oldest_task_id": "task-stale",
+        }
+        assert data["queued_tasks"]["starvation_alert"] == {
+            "level": "warning",
+            "reason_code": "bucket_wait_threshold_exceeded",
+            "reason": "later bucket exceeded starvation threshold",
+            "bucket": "later",
+            "threshold_seconds": 7200,
+            "threshold_age": "2h",
+            "current_wait_seconds": 7500,
+            "current_wait_age": "2h 5m",
+            "oldest_task_id": "task-stale",
+            "suggested_action": "reprioritize",
+            "suggested_bucket": "next",
+            "suggested_command": "/task task-stale recover",
+        }
+        assert data["queued_tasks"]["tasks"][0]["priority_bucket"] == "now"
+        assert data["queued_tasks"]["tasks"][0]["wait_seconds"] == 300
+        assert data["queued_tasks"]["tasks"][0]["wait_age"] == "5m"
+        assert data["live_tasks"]["tasks"][0]["kind"] == "background"
+        assert data["live_tasks"]["tasks"][0]["control_mode"] == "managed_runtime"
+        assert data["live_tasks"]["tasks"][0]["running_seconds"] == 299
+        assert data["live_tasks"]["tasks"][0]["running_age"] == "4m"
+        assert data["cron"]["active_jobs"] == 2
+        assert data["cron"]["lane_counts"] == {
+            "interactive": 1,
+            "cron_scout": 0,
+            "housekeeping": 1,
+        }
+        assert data["cron"]["due_now"] == {
+            "interactive": 0,
+            "cron_scout": 0,
+            "housekeeping": 1,
+        }
+
+
+class TestTasksEndpoint:
+    @pytest.mark.asyncio
+    async def test_api_tasks_returns_queued_and_live_payload(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "turn-1",
+                        "lane": "interactive",
+                        "label": "message turn",
+                        "kind": "live_turn",
+                        "control_mode": "read_only",
+                        "actions": [],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/tasks")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["queued"]["queued_count"] == 1
+        queued = data["queued"]["tasks"][0]
+        assert queued["task_id"] == "task-hi"
+        assert queued["priority_bucket"] == "now"
+        assert queued["priority_bucket_options"] == ["now", "next", "later"]
+        assert queued["wait_seconds"] == 300
+        assert queued["wait_age"] == "5m"
+        assert queued["actions"] == ["foreground", "reprioritize", "cancel"]
+        assert queued["source"] == "telegram"
+        live = data["live"]["tasks"][0]
+        assert live["task_id"] == "turn-1"
+        assert live["control_mode"] == "read_only"
+        assert live["actions"] == []
+        assert live["running_seconds"] == 299
+        assert live["running_age"] == "4m"
+
+    @pytest.mark.asyncio
+    async def test_api_task_detail_returns_queued_task(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/tasks/task-hi")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["state"] == "queued"
+        assert data["task"]["priority_bucket"] == "now"
+        assert data["task"]["priority_bucket_options"] == ["now", "next", "later"]
+        assert data["task"]["wait_seconds"] == 300
+        assert data["task"]["wait_age"] == "5m"
+        assert data["task"]["actions"] == ["foreground", "reprioritize", "cancel"]
+
+    @pytest.mark.asyncio
+    async def test_api_task_detail_returns_active_task(self, adapter, monkeypatch):
+        _attach_control_runner(adapter)
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "bg-1",
+                        "lane": "cron_scout",
+                        "label": "background task",
+                        "kind": "background",
+                        "control_mode": "managed_runtime",
+                        "actions": ["cancel"],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/tasks/bg-1")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["state"] == "active"
+        assert data["task"]["kind"] == "background"
+        assert data["task"]["control_mode"] == "managed_runtime"
+        assert data["task"]["actions"] == ["cancel"]
+        assert data["task"]["running_seconds"] == 299
+        assert data["task"]["running_age"] == "4m"
+
+    @pytest.mark.asyncio
+    async def test_api_task_detail_returns_404_for_missing_task(self, adapter):
+        _attach_control_runner(adapter)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/tasks/missing-task")
+            data = await resp.json()
+
+        assert resp.status == 404
+        assert data == {"error": "Task not found"}
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_foreground_returns_started(self, adapter):
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock(return_value=("started", queued_task))
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-hi/foreground")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["action"] == "foreground"
+        assert data["status"] == "started"
+        assert data["message"] == "Foregrounded queued task task-hi — starting now."
+        assert data["task"]["actions"] == ["foreground", "reprioritize", "cancel"]
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_foreground_rejects_active_task(self, adapter, monkeypatch):
+        _attach_control_runner(adapter)
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "turn-1",
+                        "lane": "interactive",
+                        "label": "message turn",
+                        "kind": "live_turn",
+                        "control_mode": "read_only",
+                        "actions": [],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/turn-1/foreground")
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data == {
+            "error": "Task is already active — foreground is only supported for queued tasks.",
+            "reason_code": "task_already_active",
+        }
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_reprioritize_updates_queued_task(self, adapter):
+        queued_task = _make_queued_task()
+        reprioritized_task = _make_queued_task(priority=80)
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock(return_value=reprioritized_task)
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-hi/reprioritize", json={"bucket": "later"})
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["action"] == "reprioritize"
+        assert data["status"] == "reprioritized"
+        assert data["message"] == "Moved queued task task-hi to later priority."
+        assert data["task"]["priority"] == 80
+        assert data["task"]["priority_bucket"] == "later"
+        assert data["task"]["priority_bucket_options"] == ["now", "next", "later"]
+        assert data["task"]["actions"] == ["foreground", "reprioritize", "cancel"]
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_reprioritize_rejects_invalid_bucket(self, adapter):
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-hi/reprioritize", json={"bucket": "urgent"})
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data == {
+            "error": "Priority bucket must be one of: now, next, later.",
+            "reason_code": "invalid_priority_bucket",
+        }
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_reprioritize_rejects_active_task(self, adapter, monkeypatch):
+        _attach_control_runner(adapter)
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "turn-1",
+                        "lane": "interactive",
+                        "label": "message turn",
+                        "kind": "live_turn",
+                        "control_mode": "read_only",
+                        "actions": [],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/turn-1/reprioritize", json={"bucket": "later"})
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data == {
+            "error": "Task is already active — reprioritize is only supported for queued tasks.",
+            "reason_code": "reprioritize_requires_queued_task",
+        }
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_recover_uses_starvation_recommendation(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task(task_id="task-stale", priority=80, lane="housekeeping")
+        queued_task.queued_at = datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc)
+        recovered_task = _make_queued_task(task_id="task-stale", priority=50, lane="housekeeping")
+        recovered_task.queued_at = queued_task.queued_at
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock(return_value=recovered_task)
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-stale/recover")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["action"] == "recover"
+        assert data["status"] == "recovered"
+        assert data["message"] == "Recovered queued task task-stale — moved it to next priority."
+        control_adapter.reprioritize_pending_task.assert_called_once_with("telegram:user:123", "task-stale", "next")
+        assert data["task"]["priority"] == 50
+        assert data["task"]["priority_bucket"] == "next"
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_recover_rejects_non_starving_queued_task(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-hi/recover")
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data == {
+            "error": "Task doesn't currently have a recovery recommendation.",
+            "reason_code": "recover_not_recommended",
+        }
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_cancel_returns_cancellation_requested_for_managed_runtime_task(self, adapter, monkeypatch):
+        runner = _attach_control_runner(adapter, cancel_runtime_result=True)
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "bg-1",
+                        "lane": "cron_scout",
+                        "label": "background task",
+                        "kind": "background",
+                        "control_mode": "managed_runtime",
+                        "actions": ["cancel"],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/bg-1/cancel")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["action"] == "cancel"
+        assert data["status"] == "cancellation_requested"
+        assert data["message"] == "Cancellation requested for active task bg-1."
+        runner._cancel_managed_runtime_task.assert_called_once_with("bg-1")
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_cancel_rejects_live_task_without_handle(self, adapter, monkeypatch):
+        _attach_control_runner(adapter, cancel_runtime_result=False)
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "turn-1",
+                        "lane": "interactive",
+                        "label": "message turn",
+                        "kind": "live_turn",
+                        "control_mode": "read_only",
+                        "actions": [],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/turn-1/cancel")
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data == {
+            "error": "Task is active but doesn't expose a cancel handle yet.",
+            "reason_code": "cancel_handle_missing",
+        }
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_cancel_missing_task_returns_404(self, adapter):
+        _attach_control_runner(adapter)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/missing-task/cancel")
+            data = await resp.json()
+
+        assert resp.status == 404
+        assert data == {
+            "error": "Task not found",
+            "reason_code": "task_not_found",
+        }
+
+
+class TestOpenAPIEndpoint:
+    @pytest.mark.asyncio
+    async def test_openapi_json_exposes_task_control_contracts(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/openapi.json")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert "/api/status" in data["paths"]
+        assert "/api/tasks" in data["paths"]
+        assert "/api/tasks/{task_id}" in data["paths"]
+        assert "/api/tasks/{task_id}/foreground" in data["paths"]
+        assert "/api/tasks/{task_id}/reprioritize" in data["paths"]
+        assert "/api/tasks/{task_id}/recover" in data["paths"]
+        assert "/api/tasks/{task_id}/cancel" in data["paths"]
+        assert data["components"]["schemas"]["GatewayStatus"]["properties"]["queued_tasks"]["$ref"] == "#/components/schemas/QueuedTaskStatus"
+        queued_status_schema = data["components"]["schemas"]["QueuedTaskStatus"]
+        assert queued_status_schema["properties"]["next_task"]["anyOf"][0]["$ref"] == "#/components/schemas/QueuedTask"
+        assert queued_status_schema["properties"]["oldest_waiting"]["anyOf"][0]["$ref"] == "#/components/schemas/QueuedTask"
+        assert queued_status_schema["properties"]["starving_bucket"]["anyOf"][0]["$ref"] == "#/components/schemas/QueuedBucketStarvation"
+        assert queued_status_schema["properties"]["starvation_alert"]["anyOf"][0]["$ref"] == "#/components/schemas/QueuedStarvationAlert"
+        starvation_alert_schema = data["components"]["schemas"]["QueuedStarvationAlert"]
+        assert set(starvation_alert_schema["properties"]["suggested_action"]["enum"]) == {"foreground", "reprioritize"}
+        assert starvation_alert_schema["properties"]["suggested_bucket"]["anyOf"][0]["enum"] == ["now", "next", "later"]
+        assert starvation_alert_schema["properties"]["suggested_command"]["type"] == "string"
+        assert set(data["paths"]["/api/tasks/{task_id}/reprioritize"]["post"]["responses"].keys()) == {"200", "400", "401", "404", "500"}
+        assert set(data["paths"]["/api/tasks/{task_id}/recover"]["post"]["responses"].keys()) == {"200", "400", "401", "404", "500"}
+        queued_task_schema = data["components"]["schemas"]["QueuedTask"]
+        assert queued_task_schema["properties"]["priority_bucket"]["enum"] == ["now", "next", "later"]
+        assert queued_task_schema["properties"]["priority_bucket_options"]["items"]["enum"] == ["now", "next", "later"]
+        assert queued_task_schema["properties"]["wait_seconds"]["type"] == "integer"
+        assert queued_task_schema["properties"]["wait_age"]["type"] == "string"
+        assert queued_task_schema["properties"]["actions"]["items"]["enum"] == ["foreground", "reprioritize", "cancel"]
+        assert queued_task_schema["properties"]["starvation_alert"]["anyOf"][0]["$ref"] == "#/components/schemas/QueuedStarvationAlert"
+        live_task_schema = data["components"]["schemas"]["LiveTask"]
+        assert live_task_schema["properties"]["running_seconds"]["type"] == "integer"
+        assert live_task_schema["properties"]["running_age"]["type"] == "string"
+        task_action_schema = data["components"]["schemas"]["TaskActionResponse"]
+        assert task_action_schema["properties"]["action"]["enum"] == ["foreground", "reprioritize", "recover", "cancel"]
+        assert task_action_schema["properties"]["status"]["enum"] == [
+            "started",
+            "queued_next",
+            "reprioritized",
+            "recovered",
+            "cancelled",
+            "cancellation_requested",
+        ]
+        assert "TaskActionErrorResponse" in data["components"]["schemas"]
+
+
+class TestOpenAPIDocsParity:
+    @pytest.mark.asyncio
+    async def test_task_control_docs_examples_match_openapi(self, adapter):
+        openapi = adapter._openapi_contract()
+        docs = _read_api_server_docs()
+
+        get_status_example = _markdown_json_blocks(docs, "### GET /api/status")[0]
+        get_tasks_example = _markdown_json_blocks(docs, "### GET /api/tasks")[0]
+        get_task_example = _markdown_json_blocks(docs, "#### GET /api/tasks/{task_id}")[0]
+        reprioritize_request, reprioritize_response = _markdown_json_blocks(
+            docs,
+            "#### POST /api/tasks/{task_id}/reprioritize",
+        )
+        recover_response = _markdown_json_blocks(docs, "#### POST /api/tasks/{task_id}/recover")[0]
+        openapi_snippet = _markdown_json_blocks(docs, "### GET /openapi.json")[0]
+
+        _assert_matches_openapi_schema(openapi, "GatewayStatus", get_status_example)
+        _assert_matches_openapi_schema(openapi, "GatewayTasksResponse", get_tasks_example)
+        _assert_matches_openapi_schema(openapi, "TaskDetailResponse", get_task_example)
+        _assert_matches_openapi_schema(openapi, "TaskReprioritizeRequest", reprioritize_request)
+        _assert_matches_openapi_schema(openapi, "TaskActionResponse", reprioritize_response)
+        _assert_matches_openapi_schema(openapi, "TaskActionResponse", recover_response)
+
+        assert "/api/tasks/{task_id}/reprioritize" in openapi_snippet["paths"]
+        assert "/api/tasks/{task_id}/recover" in openapi_snippet["paths"]
+        assert "TaskActionErrorResponse" in openapi_snippet["components"]["schemas"]
+        queued_task_props = openapi_snippet["components"]["schemas"]["QueuedTask"]["properties"]
+        assert "priority_bucket" in queued_task_props
+        assert "priority_bucket_options" in queued_task_props
+        assert "starvation_alert" in queued_task_props
