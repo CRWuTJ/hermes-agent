@@ -1394,6 +1394,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "properties": {
                     "active_count": {"type": "integer", "minimum": 0},
                     "lane_counts": {"$ref": "#/components/schemas/CronLaneCounts"},
+                    "oldest_running": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/LiveTask"},
+                            {"type": "null"},
+                        ]
+                    },
                     "tasks": {"type": "array", "items": {"$ref": "#/components/schemas/LiveTask"}},
                 },
                 "required": ["active_count", "lane_counts", "tasks"],
@@ -1943,6 +1949,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "active_count": 0,
             "lane_counts": {lane: 0 for lane in self._CRON_LANE_ORDER},
+            "oldest_running": None,
             "tasks": [],
         }
 

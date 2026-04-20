@@ -2366,6 +2366,8 @@ class TestOpenAPIEndpoint:
         live_task_schema = data["components"]["schemas"]["LiveTask"]
         assert live_task_schema["properties"]["running_seconds"]["type"] == "integer"
         assert live_task_schema["properties"]["running_age"]["type"] == "string"
+        live_status_schema = data["components"]["schemas"]["LiveTaskStatus"]
+        assert live_status_schema["properties"]["oldest_running"]["anyOf"][0]["$ref"] == "#/components/schemas/LiveTask"
         task_action_schema = data["components"]["schemas"]["TaskActionResponse"]
         assert task_action_schema["properties"]["action"]["enum"] == ["foreground", "reprioritize", "recover", "cancel"]
         assert task_action_schema["properties"]["status"]["enum"] == [

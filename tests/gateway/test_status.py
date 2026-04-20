@@ -338,6 +338,18 @@ class TestGatewayRuntimeStatus:
                     "cron_scout": 2,
                     "housekeeping": 0,
                 },
+                "oldest_running": {
+                    "task_id": "bg-1",
+                    "lane": "cron_scout",
+                    "label": "background task",
+                    "kind": "background",
+                    "control_mode": "managed_runtime",
+                    "actions": ["cancel"],
+                    "source": "gateway",
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "running_seconds": 300,
+                    "running_age": "5m",
+                },
                 "tasks": [
                     {
                         "task_id": "bg-1",
@@ -415,6 +427,49 @@ class TestGatewayRuntimeStatus:
 
         assert payload["live_tasks"]["tasks"][0]["running_seconds"] == 300
         assert payload["live_tasks"]["tasks"][0]["running_age"] == "5m"
+
+    def test_build_gateway_status_payload_derives_oldest_running_live_task(self, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 1, 1, 0, 5, 0, tzinfo=timezone.utc),
+        )
+
+        payload = status.build_gateway_status_payload(
+            runtime_status={
+                "gateway_state": "running",
+                "updated_at": "2026-01-01T00:05:00+00:00",
+                "platforms": {},
+                "live_tasks": {
+                    "active_count": 2,
+                    "lane_counts": {
+                        "interactive": 1,
+                        "cron_scout": 1,
+                        "housekeeping": 0,
+                    },
+                    "tasks": [
+                        {
+                            "task_id": "bg-1",
+                            "lane": "cron_scout",
+                            "label": "background task",
+                            "source": "gateway",
+                            "started_at": "2026-01-01T00:00:00+00:00",
+                        },
+                        {
+                            "task_id": "turn-1",
+                            "lane": "interactive",
+                            "label": "message turn",
+                            "source": "gateway",
+                            "started_at": "2026-01-01T00:02:00+00:00",
+                        },
+                    ],
+                },
+            },
+            cron_payload=None,
+        )
+
+        assert payload["live_tasks"]["oldest_running"]["task_id"] == "bg-1"
+        assert payload["live_tasks"]["oldest_running"]["running_seconds"] == 300
+        assert payload["live_tasks"]["oldest_running"]["running_age"] == "5m"
 
     def test_render_status_activity_lines_supports_chat_and_cli_styles(self):
         payload = {
@@ -545,6 +600,47 @@ class TestGatewayRuntimeStatus:
             "  Oldest wait:  task-later · housekeeping · later (80) · waiting 2h 5m since 2026-04-19T10:00:00+00:00",
             "  Starving:     later · 1 queued · oldest wait 2h 5m · task-later",
             "  Alert:        warning · later bucket exceeded 2h threshold · waiting 2h 5m · /task task-later recover",
+        ]
+
+    def test_render_status_activity_lines_include_longest_running_summary(self, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 1, 1, 0, 5, 0, tzinfo=timezone.utc),
+        )
+        payload = {
+            "live_tasks": {
+                "active_count": 2,
+                "lane_counts": {
+                    "interactive": 1,
+                    "cron_scout": 1,
+                    "housekeeping": 0,
+                },
+                "tasks": [
+                    {
+                        "task_id": "bg-1",
+                        "lane": "cron_scout",
+                        "label": "background task",
+                        "source": "gateway",
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                    },
+                    {
+                        "task_id": "turn-1",
+                        "lane": "interactive",
+                        "label": "message turn",
+                        "source": "gateway",
+                        "started_at": "2026-01-01T00:02:00+00:00",
+                    },
+                ],
+            },
+        }
+
+        assert status.render_status_activity_lines(payload, style="chat") == [
+            "**Active Lanes:** interactive=1 | cron/scout=1 | housekeeping=0",
+            "**Longest Running:** `bg-1 · cron/scout · background task · running 5m since 2026-01-01T00:00:00+00:00`",
+        ]
+        assert status.render_status_activity_lines(payload, style="cli") == [
+            "  Active lanes: interactive=1 | cron/scout=1 | housekeeping=0",
+            "  Longest run:  bg-1 · cron/scout · background task · running 5m since 2026-01-01T00:00:00+00:00",
         ]
 
     def test_render_status_activity_block_supports_chat_and_cli_styles(self):

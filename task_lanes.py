@@ -168,8 +168,10 @@ class TaskLaneRegistry:
             if status_task["lane"] in counts:
                 counts[status_task["lane"]] += 1
 
+        oldest_running = dict(tasks[0]) if tasks else None
         return {
             "active_count": len(tasks),
             "lane_counts": counts,
+            "oldest_running": oldest_running,
             "tasks": tasks,
         }

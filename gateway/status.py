@@ -247,6 +247,27 @@ def _normalize_live_task_actions(raw_actions: Any) -> list[str]:
 
 
 
+def _parse_status_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+
 def _infer_live_task_kind(task: dict[str, Any]) -> str:
     raw_kind = str(task.get("kind") or "").strip()
     if raw_kind:
@@ -276,6 +297,65 @@ def _normalize_live_task_control_mode(raw_mode: Any, *, kind: str, actions: list
 
 
 
+def _normalize_single_live_task(task: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(task, dict):
+        return None
+
+    task_payload = dict(task)
+    task_payload["lane"] = normalize_status_task_lane(task.get("lane"))
+    kind = _infer_live_task_kind(task_payload)
+    actions = _normalize_live_task_actions(task_payload.get("actions"))
+    if not actions and kind in {"background", "btw"}:
+        actions = ["cancel"]
+    task_payload["kind"] = kind
+    task_payload["control_mode"] = _normalize_live_task_control_mode(
+        task_payload.get("control_mode"),
+        kind=kind,
+        actions=actions,
+    )
+    task_payload["actions"] = actions
+    running_seconds = queued_task_wait_seconds(
+        task_payload.get("started_at"),
+        raw_wait_seconds=task_payload.get("running_seconds"),
+    )
+    running_age = queued_task_wait_age(
+        task_payload.get("started_at"),
+        raw_wait_seconds=running_seconds,
+        raw_wait_age=task_payload.get("running_age"),
+    )
+    if running_seconds is not None:
+        task_payload["running_seconds"] = running_seconds
+    else:
+        task_payload.pop("running_seconds", None)
+    if running_age is not None:
+        task_payload["running_age"] = running_age
+    else:
+        task_payload.pop("running_age", None)
+    return task_payload
+
+
+
+def _select_oldest_running_task(tasks: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    oldest_task: Optional[dict[str, Any]] = None
+    oldest_key: Optional[tuple[int, float, int]] = None
+
+    for index, task in enumerate(tasks):
+        started_at = _parse_status_datetime(task.get("started_at"))
+        running_seconds = task.get("running_seconds")
+        if started_at is not None:
+            sort_key = (0, started_at.timestamp(), index)
+        elif running_seconds is not None:
+            sort_key = (1, -float(_coerce_int(running_seconds, 0)), index)
+        else:
+            sort_key = (2, float(index), index)
+        if oldest_key is None or sort_key < oldest_key:
+            oldest_key = sort_key
+            oldest_task = task
+
+    return dict(oldest_task) if oldest_task is not None else None
+
+
+
 def normalize_live_tasks_payload(live_tasks: Any) -> dict[str, Any]:
     payload = live_tasks if isinstance(live_tasks, dict) else {}
     counts = _normalize_lane_counts(payload.get("lane_counts"))
@@ -284,39 +364,9 @@ def normalize_live_tasks_payload(live_tasks: Any) -> dict[str, Any]:
     raw_tasks = payload.get("tasks")
     if isinstance(raw_tasks, list):
         for task in raw_tasks:
-            if not isinstance(task, dict):
-                continue
-            task_payload = dict(task)
-            task_payload["lane"] = normalize_status_task_lane(task.get("lane"))
-            kind = _infer_live_task_kind(task_payload)
-            actions = _normalize_live_task_actions(task_payload.get("actions"))
-            if not actions and kind in {"background", "btw"}:
-                actions = ["cancel"]
-            task_payload["kind"] = kind
-            task_payload["control_mode"] = _normalize_live_task_control_mode(
-                task_payload.get("control_mode"),
-                kind=kind,
-                actions=actions,
-            )
-            task_payload["actions"] = actions
-            running_seconds = queued_task_wait_seconds(
-                task_payload.get("started_at"),
-                raw_wait_seconds=task_payload.get("running_seconds"),
-            )
-            running_age = queued_task_wait_age(
-                task_payload.get("started_at"),
-                raw_wait_seconds=running_seconds,
-                raw_wait_age=task_payload.get("running_age"),
-            )
-            if running_seconds is not None:
-                task_payload["running_seconds"] = running_seconds
-            else:
-                task_payload.pop("running_seconds", None)
-            if running_age is not None:
-                task_payload["running_age"] = running_age
-            else:
-                task_payload.pop("running_age", None)
-            tasks.append(task_payload)
+            task_payload = _normalize_single_live_task(task)
+            if task_payload is not None:
+                tasks.append(task_payload)
 
     if not any(counts.values()) and tasks:
         for task in tasks:
@@ -328,9 +378,14 @@ def normalize_live_tasks_payload(live_tasks: Any) -> dict[str, Any]:
     if active_count <= 0:
         active_count = sum(counts.values()) or len(tasks)
 
+    oldest_running = _normalize_single_live_task(payload.get("oldest_running"))
+    if oldest_running is None:
+        oldest_running = _select_oldest_running_task(tasks)
+
     return {
         "active_count": active_count,
         "lane_counts": counts,
+        "oldest_running": oldest_running,
         "tasks": tasks,
     }
 
@@ -789,6 +844,30 @@ def format_status_next_queued_task(task: Any) -> Optional[str]:
 
 
 
+def format_status_oldest_running_task(task: Any) -> Optional[str]:
+    normalized = _normalize_single_live_task(task)
+    if normalized is None:
+        return None
+    task_id = str(normalized.get("task_id") or "").strip()
+    if not task_id:
+        return None
+    lane = normalize_task_lane(normalized.get("lane"))
+    label = " ".join(str(normalized.get("label") or "").split()).strip()
+    if not label:
+        label = " ".join(str(normalized.get("kind") or "").replace("_", " ").split()).strip()
+    parts = [part for part in [task_id, lane, label or None] if part]
+    running_age = str(normalized.get("running_age") or "").strip()
+    started_at = str(normalized.get("started_at") or "").strip()
+    if running_age and started_at:
+        parts.append(f"running {running_age} since {started_at}")
+    elif running_age:
+        parts.append(f"running {running_age}")
+    elif started_at:
+        parts.append(f"started {started_at}")
+    return " · ".join(parts)
+
+
+
 def format_status_starving_bucket(summary: Any) -> Optional[str]:
     normalized = _normalize_starving_bucket_summary(summary)
     if normalized is None:
@@ -875,6 +954,9 @@ def render_status_activity_lines(status_payload: Any, *, style: str = "chat") ->
                 lines.append(f"**Starvation Alert:** `{starvation_alert}`")
         if any(live_tasks["lane_counts"].values()):
             lines.append(f"**Active Lanes:** {format_status_lane_counts(live_tasks['lane_counts'])}")
+            oldest_running = format_status_oldest_running_task(live_tasks.get("oldest_running"))
+            if oldest_running:
+                lines.append(f"**Longest Running:** `{oldest_running}`")
         if cron_status is not None:
             lines.extend([
                 f"**Cron Jobs:** {int(cron_status.get('active_jobs', 0) or 0)} active",
@@ -904,6 +986,9 @@ def render_status_activity_lines(status_payload: Any, *, style: str = "chat") ->
                 lines.append(f"  Alert:        {starvation_alert}")
         if any(live_tasks["lane_counts"].values()):
             lines.append(f"  Active lanes: {format_status_lane_counts(live_tasks['lane_counts'])}")
+            oldest_running = format_status_oldest_running_task(live_tasks.get("oldest_running"))
+            if oldest_running:
+                lines.append(f"  Longest run:  {oldest_running}")
         if cron_status is not None:
             lines.extend([
                 f"  Jobs:         {int(cron_status.get('active_jobs', 0) or 0)} active, {int(cron_status.get('total_jobs', 0) or 0)} total",

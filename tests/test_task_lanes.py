@@ -64,3 +64,17 @@ def test_registry_status_snapshot_uses_machine_readable_lanes():
             "housekeeping": 0,
         }
         assert snapshot["tasks"][0]["lane"] == "cron_scout"
+
+
+def test_registry_status_snapshot_includes_oldest_running_task():
+    from task_lanes import TaskLaneRegistry
+
+    registry = TaskLaneRegistry()
+
+    with registry.track(task_id="bg-1", lane="background", label="background task", source="gateway"):
+        with registry.track(task_id="turn-1", lane="interactive", label="message turn", source="gateway"):
+            snapshot = registry.status_snapshot()
+
+    assert snapshot["oldest_running"]["task_id"] == "bg-1"
+    assert snapshot["oldest_running"]["lane"] == "cron_scout"
+    assert snapshot["oldest_running"]["label"] == "background task"
