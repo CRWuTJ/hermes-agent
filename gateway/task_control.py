@@ -285,6 +285,52 @@ def build_gateway_tasks_payload(*, queued: Any = None, live: Any = None) -> Task
     }
 
 
+def _task_looks_queued(task_payload: Dict[str, Any]) -> bool:
+    state_text = str(task_payload.get("state") or "").strip().lower()
+    if state_text == "queued":
+        return True
+    control_mode = str(task_payload.get("control_mode") or "").strip().lower()
+    if control_mode == "queued":
+        return True
+    for key in ("priority", "priority_bucket", "queued_at", "reply_policy", "cancellation_policy"):
+        value = task_payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return True
+    actions = normalize_task_actions(task_payload.get("actions"))
+    return any(action in {"foreground", "reprioritize"} for action in actions)
+
+
+def _normalize_task_payload_for_state(state: Any, task: Dict[str, Any]) -> Dict[str, Any]:
+    task_payload = dict(task or {})
+    state_text = str(state or "").strip().lower()
+    treat_as_queued = state_text == "queued" or _task_looks_queued(task_payload)
+
+    try:
+        if treat_as_queued:
+            from gateway.status import normalize_queued_tasks_payload
+
+            normalized = normalize_queued_tasks_payload({"tasks": [task_payload]})
+        else:
+            from gateway.status import normalize_live_tasks_payload
+
+            normalized = normalize_live_tasks_payload({"tasks": [task_payload]})
+        tasks = normalized.get("tasks") if isinstance(normalized, dict) else None
+        if isinstance(tasks, list) and tasks:
+            normalized_task = tasks[0]
+            if isinstance(normalized_task, dict):
+                result = dict(normalized_task)
+                if isinstance(task_payload.get("starvation_alert"), dict) and not isinstance(result.get("starvation_alert"), dict):
+                    result["starvation_alert"] = dict(task_payload["starvation_alert"])
+                return result
+    except Exception:
+        pass
+
+    return task_payload
+
+
 def queued_task_starvation_alert(task_id: Any, queued_summary: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(queued_summary, dict):
         return None
@@ -464,7 +510,7 @@ def render_gateway_tasks_block(
 
 
 def build_task_detail_payload(*, task_id: str, state: str, task: Dict[str, Any]) -> TaskDetailPayload:
-    task_payload = dict(task or {})
+    task_payload = _normalize_task_payload_for_state(state, task)
     actions = normalize_task_actions(task_payload.get("actions"))
     task_payload["actions"] = actions
     state_text = str(state or "").strip().lower()
@@ -551,7 +597,9 @@ def build_task_action_payload(
     message: Optional[str] = None,
     target_bucket: Any = None,
 ) -> TaskActionPayload:
-    task_payload = dict(task or {})
+    raw_task_payload = dict(task or {})
+    task_state = "queued" if _task_looks_queued(raw_task_payload) else "active"
+    task_payload = _normalize_task_payload_for_state(task_state, raw_task_payload)
     actions = normalize_task_actions(task_payload.get("actions"))
     task_payload["actions"] = actions
     if task_payload.get("priority_bucket_options") is not None or "reprioritize" in actions:

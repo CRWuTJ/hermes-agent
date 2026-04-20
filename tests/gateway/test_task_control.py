@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from gateway.task_control import (
     build_task_action_error_payload,
     build_task_action_payload,
+    build_task_detail_payload,
     describe_task_action_error,
     describe_task_action_result,
     queued_task_priority_bucket,
@@ -63,10 +64,80 @@ def test_build_task_action_payload_normalizes_actions_and_uses_status_wording():
         "message": "Cancellation requested for active task bg-1.",
         "task": {
             "task_id": "bg-1",
+            "lane": "interactive",
             "kind": "background",
+            "control_mode": "managed_runtime",
             "actions": ["cancel"],
             "source": "gateway",
         },
+    }
+
+
+def test_build_task_detail_payload_normalizes_queued_lane_aliases_and_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.task_control._queued_task_now",
+        lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+    )
+
+    payload = build_task_detail_payload(
+        task_id="task-hi",
+        state="queued",
+        task={
+            "task_id": "task-hi",
+            "lane": "background",
+            "priority": 10,
+            "queued_at": "2026-04-19T12:00:00+00:00",
+            "actions": ["foreground", "reprioritize", "cancel", "foreground"],
+        },
+    )
+
+    assert payload["task"] == {
+        "task_id": "task-hi",
+        "state": "queued",
+        "lane": "cron_scout",
+        "priority": 10,
+        "priority_bucket": "now",
+        "queued_at": "2026-04-19T12:00:00+00:00",
+        "wait_seconds": 300,
+        "wait_age": "5m",
+        "kind": "queued_message",
+        "control_mode": "queued",
+        "actions": ["foreground", "reprioritize", "cancel"],
+        "priority_bucket_options": ["now", "next", "later"],
+    }
+
+
+def test_build_task_action_payload_normalizes_live_lane_aliases_and_runtime_defaults(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.task_control._queued_task_now",
+        lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+    )
+
+    payload = build_task_action_payload(
+        task_id="bg-1",
+        action="cancel",
+        status="cancellation_requested",
+        task={
+            "task_id": "bg-1",
+            "lane": "background",
+            "label": "background task",
+            "source": "gateway",
+            "started_at": "2026-04-19T12:00:00+00:00",
+            "actions": ["cancel", "cancel"],
+        },
+    )
+
+    assert payload["task"] == {
+        "task_id": "bg-1",
+        "lane": "cron_scout",
+        "label": "background task",
+        "source": "gateway",
+        "started_at": "2026-04-19T12:00:00+00:00",
+        "running_seconds": 300,
+        "running_age": "5m",
+        "kind": "background",
+        "control_mode": "managed_runtime",
+        "actions": ["cancel"],
     }
 
 
