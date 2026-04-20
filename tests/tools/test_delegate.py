@@ -25,6 +25,7 @@ from tools.delegate_tool import (
     delegate_task,
     _build_child_agent,
     _build_child_system_prompt,
+    _issue_delegate_child_api_key,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -392,6 +393,24 @@ class TestToolNamePreservation(unittest.TestCase):
         self.assertEqual(captured["saved"], expected_tools)
 
 
+class TestDelegationCredentialRouting(unittest.TestCase):
+    def test_base_url_and_provider_can_force_codex_responses(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-child-key",
+        }
+
+        result = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(result["provider"], "gpt-mainline-codex-local")
+        self.assertEqual(result["base_url"], "http://127.0.0.1:4311/v1")
+        self.assertEqual(result["api_key"], "sk-child-key")
+        self.assertEqual(result["api_mode"], "codex_responses")
+
+
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
@@ -741,6 +760,117 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], "sk-or-delegation-key")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
 
+    @patch("tools.delegate_tool.requests.post")
+    def test_issue_child_api_key_falls_back_when_internal_keys_endpoint_is_unsupported(self, mock_post):
+        parent = _make_mock_parent(depth=0)
+        creds = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "parent-key",
+            "api_mode": "codex_responses",
+        }
+        cfg = {
+            "child_api_keys": {
+                "enabled": True,
+                "admin_key": "sk-admin",
+            }
+        }
+
+        for status_code in (404, 405, 501):
+            with self.subTest(status_code=status_code):
+                mock_post.return_value.status_code = status_code
+                lease = _issue_delegate_child_api_key(
+                    cfg=cfg,
+                    creds=creds,
+                    task_index=0,
+                    goal="run scout",
+                    parent_agent=parent,
+                )
+                self.assertIsNone(lease)
+
+    @patch("tools.delegate_tool.requests.post")
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_delegate_task_falls_back_to_parent_key_when_internal_keys_endpoint_is_unsupported(self, mock_creds, mock_cfg, mock_post):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "***",
+            "child_api_keys": {
+                "enabled": True,
+                "admin_key": "sk-admin",
+            },
+        }
+        mock_creds.return_value = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "parent-key",
+            "api_mode": "codex_responses",
+        }
+        mock_post.return_value.status_code = 404
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Use fallback auth", parent_agent=parent))
+
+            self.assertEqual(result["results"][0]["status"], "completed")
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["api_key"], "parent-key")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_codex_delegation_mints_child_api_key_for_child_agent(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-parent-delegate",
+            "child_api_keys": {
+                "enabled": True,
+                "revoke_on_completion": True,
+            },
+        }
+        mock_creds.return_value = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-parent-delegate",
+            "api_mode": "codex_responses",
+        }
+        parent = _make_mock_parent(depth=0)
+        lease = {
+            "label": "delegate-session-0",
+            "api_key": "sk-minted-child",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "revoke_on_completion": True,
+        }
+
+        with patch("tools.delegate_tool._issue_delegate_child_api_key", return_value=lease, create=True) as mock_issue, \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Use a dedicated child key", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["api_key"], "sk-minted-child")
+            self.assertEqual(mock_child._delegate_child_api_key, lease)
+            mock_issue.assert_called_once()
+
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_cross_provider_delegation(self, mock_creds, mock_cfg):
@@ -898,6 +1028,79 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_codex_delegation_mints_distinct_child_keys(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-parent-delegate",
+            "child_api_keys": {"enabled": True},
+        }
+        mock_creds.return_value = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-parent-delegate",
+            "api_mode": "codex_responses",
+        }
+        leases = [
+            {"label": "delegate-0", "api_key": "sk-child-0", "base_url": "http://127.0.0.1:4311/v1"},
+            {"label": "delegate-1", "api_key": "sk-child-1", "base_url": "http://127.0.0.1:4311/v1"},
+        ]
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._issue_delegate_child_api_key", side_effect=leases, create=True), \
+             patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.side_effect = [MagicMock(), MagicMock()]
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
+            }
+
+            delegate_task(tasks=[{"goal": "Task A"}, {"goal": "Task B"}], parent_agent=parent)
+
+            self.assertEqual(mock_build.call_args_list[0].kwargs.get("override_api_key"), "sk-child-0")
+            self.assertEqual(mock_build.call_args_list[1].kwargs.get("override_api_key"), "sk-child-1")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_child_key_issue_failure_revokes_prepared_children(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-parent-delegate",
+            "child_api_keys": {"enabled": True},
+        }
+        mock_creds.return_value = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "sk-parent-delegate",
+            "api_mode": "codex_responses",
+        }
+        lease = {
+            "label": "delegate-0",
+            "api_key": "sk-child-0",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "revoke_on_completion": True,
+        }
+        prepared_child = MagicMock()
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._issue_delegate_child_api_key", side_effect=[lease, ValueError("mint failed")], create=True), \
+             patch("tools.delegate_tool._build_child_agent", return_value=prepared_child), \
+             patch("tools.delegate_tool._revoke_delegate_child_api_key", create=True) as mock_revoke:
+            result = json.loads(delegate_task(tasks=[{"goal": "Task A"}, {"goal": "Task B"}], parent_agent=parent))
+
+        self.assertIn("error", result)
+        mock_revoke.assert_called_once_with(lease)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_model_only_no_provider_inherits_parent_credentials(self, mock_creds, mock_cfg):
         """Setting only model (no provider) changes model but keeps parent credentials."""
         mock_cfg.return_value = {
@@ -1050,6 +1253,30 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+    def test_run_single_child_revokes_delegate_child_api_key_on_error(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.run_conversation.side_effect = RuntimeError("boom")
+        lease = {
+            "label": "delegate-error",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "admin_key": "sk-admin",
+            "revoke_on_completion": True,
+        }
+        child._delegate_child_api_key = lease
+
+        with patch("tools.delegate_tool._revoke_delegate_child_api_key", create=True) as mock_revoke:
+            result = _run_single_child(
+                task_index=0,
+                goal="Explode",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "error")
+        mock_revoke.assert_called_once_with(lease)
 
 
 if __name__ == "__main__":

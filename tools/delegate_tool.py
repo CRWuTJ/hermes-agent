@@ -20,9 +20,15 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import re
+import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+import requests
 
 
 # Tools that children must never have access to
@@ -38,11 +44,190 @@ MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+DEFAULT_CHILD_KEY_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_CODEX_KEYS_PATH = Path("/home/wutj/.hermes/codex_oauth_adapter_keys.json")
+UNSUPPORTED_CHILD_KEY_ENDPOINT_STATUS_CODES = frozenset({404, 405, 501})
 
 
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
     return True
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _child_api_key_settings(cfg: dict) -> Dict[str, Any]:
+    raw = cfg.get("child_api_keys", {})
+    if isinstance(raw, bool):
+        raw_cfg: Dict[str, Any] = {"enabled": raw}
+    elif isinstance(raw, dict):
+        raw_cfg = raw
+    else:
+        raw_cfg = {}
+
+    return {
+        "enabled": _as_bool(raw_cfg.get("enabled"), False),
+        "revoke_on_completion": _as_bool(raw_cfg.get("revoke_on_completion"), True),
+        "label_prefix": str(raw_cfg.get("label_prefix") or "delegate").strip() or "delegate",
+        "ttl_seconds": int(raw_cfg.get("ttl_seconds") or DEFAULT_CHILD_KEY_TTL_SECONDS),
+        "admin_key": str(raw_cfg.get("admin_key") or "").strip(),
+        "keys_path": str(raw_cfg.get("keys_path") or "").strip(),
+        "timeout_seconds": float(raw_cfg.get("timeout_seconds") or 5.0),
+        "allow_remote": _as_bool(raw_cfg.get("allow_remote"), False),
+    }
+
+
+def _safe_label_fragment(value: Any, fallback: str) -> str:
+    text = str(value or "").strip() or fallback
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-")
+    return (text or fallback)[:48]
+
+
+def _internal_keys_url(base_url: str) -> str:
+    base = str(base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/internal/keys"
+    return f"{base}/v1/internal/keys"
+
+
+def _is_local_adapter_url(base_url: str) -> bool:
+    lowered = str(base_url or "").lower()
+    return (
+        lowered.startswith("http://127.0.0.1:")
+        or lowered.startswith("http://localhost:")
+        or lowered.startswith("http://[::1]:")
+    )
+
+
+def _read_delegate_admin_key(settings: Dict[str, Any]) -> str:
+    configured = str(settings.get("admin_key") or "").strip()
+    if configured:
+        return configured
+    env_value = (
+        os.getenv("HERMES_CODEX_ADAPTER_ADMIN_KEY", "").strip()
+        or os.getenv("CODEX_ADAPTER_ADMIN_KEY", "").strip()
+    )
+    if env_value:
+        return env_value
+
+    keys_path = Path(
+        settings.get("keys_path")
+        or os.getenv("CODEX_ADAPTER_KEYS_PATH", "")
+        or DEFAULT_CODEX_KEYS_PATH
+    )
+    try:
+        payload = json.loads(keys_path.read_text())
+    except Exception as exc:
+        raise ValueError(
+            f"Child API key creation is enabled, but admin key file is unreadable: {keys_path}"
+        ) from exc
+    admin_key = str(payload.get("admin_key") or "").strip()
+    if not admin_key:
+        raise ValueError("Child API key creation is enabled, but no adapter admin key was found.")
+    return admin_key
+
+
+def _issue_delegate_child_api_key(
+    cfg: dict,
+    creds: dict,
+    task_index: int,
+    goal: str,
+    parent_agent,
+) -> Optional[Dict[str, Any]]:
+    settings = _child_api_key_settings(cfg)
+    if not settings["enabled"]:
+        return None
+
+    api_mode = str(creds.get("api_mode") or "")
+    base_url = str(creds.get("base_url") or "").strip()
+    if api_mode != "codex_responses" or not base_url:
+        return None
+    if not settings["allow_remote"] and not _is_local_adapter_url(base_url):
+        return None
+
+    admin_key = _read_delegate_admin_key(settings)
+    parent_session_id = getattr(parent_agent, "session_id", None)
+    session_part = _safe_label_fragment(parent_session_id, "session")
+    prefix = _safe_label_fragment(settings["label_prefix"], "delegate")
+    label = f"{prefix}-{session_part}-{task_index}-{secrets.token_hex(4)}"
+
+    ttl_seconds = int(settings.get("ttl_seconds") or 0)
+    payload: Dict[str, Any] = {
+        "label": label,
+        "created_by": "delegate_task",
+        "purpose": "child-agent",
+        "session_id": str(parent_session_id or ""),
+        "task_id": f"delegate-{task_index}",
+    }
+    if ttl_seconds > 0:
+        payload["expires_at"] = int(time.time()) + ttl_seconds
+
+    url = _internal_keys_url(base_url)
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {admin_key}"},
+            timeout=settings["timeout_seconds"],
+        )
+    except requests.RequestException as exc:
+        raise ValueError(f"Failed to create child API key through local codex adapter: {exc}") from exc
+
+    if response.status_code in UNSUPPORTED_CHILD_KEY_ENDPOINT_STATUS_CODES:
+        logger.warning(
+            "Child API key minting unavailable at %s (HTTP %s); falling back to parent credentials.",
+            url,
+            response.status_code,
+        )
+        return None
+    if response.status_code >= 400:
+        raise ValueError(f"Failed to create child API key: adapter returned HTTP {response.status_code}")
+    data = response.json()
+    api_key = str(data.get("api_key") or "").strip()
+    if not api_key:
+        raise ValueError("Failed to create child API key: adapter response did not include api_key")
+    return {
+        "label": str(data.get("label") or label),
+        "api_key": api_key,
+        "base_url": base_url,
+        "admin_key": admin_key,
+        "revoke_on_completion": bool(settings["revoke_on_completion"]),
+        "timeout_seconds": settings["timeout_seconds"],
+    }
+
+
+def _revoke_delegate_child_api_key(lease: Dict[str, Any]) -> None:
+    if not lease or not lease.get("revoke_on_completion"):
+        return
+    label = str(lease.get("label") or "").strip()
+    base_url = str(lease.get("base_url") or "").strip()
+    admin_key = str(lease.get("admin_key") or "").strip()
+    if not label or not base_url or not admin_key:
+        return
+    url = f"{_internal_keys_url(base_url)}/{quote(label, safe='')}"
+    try:
+        response = requests.delete(
+            url,
+            headers={"Authorization": f"Bearer {admin_key}"},
+            timeout=float(lease.get("timeout_seconds") or 5.0),
+        )
+        if response.status_code >= 400:
+            logger.debug("Child API key revoke returned HTTP %s for %s", response.status_code, label)
+    except requests.RequestException as exc:
+        logger.debug("Failed to revoke child API key %s: %s", label, exc)
+
+
+def _revoke_prepared_child_api_keys(children: List[tuple]) -> None:
+    for _i, _task, child in children:
+        lease = getattr(child, "_delegate_child_api_key", None)
+        if isinstance(lease, dict):
+            _revoke_delegate_child_api_key(lease)
 
 
 def _build_child_system_prompt(
@@ -479,6 +664,10 @@ def _run_single_child(
         }
 
     finally:
+        child_key_lease = getattr(child, "_delegate_child_api_key", None)
+        if isinstance(child_key_lease, dict):
+            _revoke_delegate_child_api_key(child_key_lease)
+
         if child_pool is not None and leased_cred_id is not None:
             try:
                 child_pool.release_lease(leased_cred_id)
@@ -589,16 +778,41 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
-            child = _build_child_agent(
-                task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
-                max_iterations=effective_max_iter, parent_agent=parent_agent,
-                override_provider=creds["provider"], override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command") or acp_command,
-                override_acp_args=t.get("acp_args") or acp_args,
-            )
+            child_key_lease = None
+            try:
+                child_key_lease = _issue_delegate_child_api_key(
+                    cfg=cfg,
+                    creds=creds,
+                    task_index=i,
+                    goal=t["goal"],
+                    parent_agent=parent_agent,
+                )
+                child_api_key = (
+                    child_key_lease["api_key"]
+                    if child_key_lease is not None
+                    else creds["api_key"]
+                )
+            except ValueError as exc:
+                _revoke_prepared_child_api_keys(children)
+                return tool_error(str(exc))
+
+            try:
+                child = _build_child_agent(
+                    task_index=i, goal=t["goal"], context=t.get("context"),
+                    toolsets=t.get("toolsets") or toolsets, model=creds["model"],
+                    max_iterations=effective_max_iter, parent_agent=parent_agent,
+                    override_provider=creds["provider"], override_base_url=creds["base_url"],
+                    override_api_key=child_api_key,
+                    override_api_mode=creds["api_mode"],
+                    override_acp_command=t.get("acp_command") or acp_command,
+                    override_acp_args=t.get("acp_args") or acp_args,
+                )
+            except Exception:
+                if child_key_lease is not None:
+                    _revoke_delegate_child_api_key(child_key_lease)
+                raise
+            if child_key_lease is not None:
+                child._delegate_child_api_key = child_key_lease
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
@@ -757,8 +971,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         base_lower = configured_base_url.lower()
         provider = "custom"
         api_mode = "chat_completions"
-        if "chatgpt.com/backend-api/codex" in base_lower:
-            provider = "openai-codex"
+        provider_lower = (configured_provider or "").lower()
+        if "chatgpt.com/backend-api/codex" in base_lower or "codex" in provider_lower:
+            provider = configured_provider or "openai-codex"
             api_mode = "codex_responses"
         elif "api.anthropic.com" in base_lower:
             provider = "anthropic"
