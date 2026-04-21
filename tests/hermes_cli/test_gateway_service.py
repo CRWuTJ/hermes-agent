@@ -786,6 +786,54 @@ class TestGatewaySystemServiceRouting:
         assert "systemd-run" in calls[0]
         assert "gateway restart --system" in calls[0][-1]
 
+    def test_schedule_detached_system_gateway_cli_falls_back_to_listed_wsl_distro_when_env_missing(self, monkeypatch, tmp_path):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("[Service]\nUser=wutj\nEnvironment=HERMES_HOME=/home/wutj/.hermes\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            gateway_cli,
+            "_resolve_systemd_service_target",
+            lambda system=False, user=False: {
+                "scope": "system",
+                "system": True,
+                "unit_name": "hermes-gateway",
+                "unit_path": str(unit_path),
+            },
+        )
+        monkeypatch.setattr(gateway_cli, "_system_service_identity", lambda run_as_user=None: ("wutj", "wutj", "/home/wutj"))
+        monkeypatch.setattr(gateway_cli, "get_hermes_cli_path", lambda: "/home/wutj/.local/bin/hermes")
+        monkeypatch.setattr(gateway_cli, "_is_wsl", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_find_wsl_executable", lambda: "/mnt/c/Windows/System32/wsl.exe")
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 1000)
+        monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+
+        calls = []
+
+        def fake_run(cmd, check=True, timeout=None, capture_output=False, text=False, **kwargs):
+            calls.append(cmd)
+            if cmd == ["/mnt/c/Windows/System32/wsl.exe", "-l", "-q"]:
+                return SimpleNamespace(returncode=0, stdout="U\x00b\x00u\x00n\x00t\x00u\x00\n\x00\n\x00", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        unit_name, log_path = gateway_cli._schedule_detached_system_gateway_cli(
+            "restart",
+            ["gateway", "restart", "--system"],
+        )
+
+        assert unit_name.startswith("hermes-gateway-restart-")
+        assert log_path.name.startswith("gateway-restart-")
+        assert calls[0] == ["/mnt/c/Windows/System32/wsl.exe", "-l", "-q"]
+        assert calls[1][:6] == [
+            "/mnt/c/Windows/System32/wsl.exe",
+            "-d",
+            "Ubuntu",
+            "-u",
+            "root",
+            "--",
+        ]
+
     def test_systemd_status_surfaces_repair_commands_for_drifted_system_unit(self, tmp_path, monkeypatch, capsys):
         unit_path = tmp_path / "hermes-gateway-17b8e69b.service"
         unit_path.write_text("[Unit]\n", encoding="utf-8")

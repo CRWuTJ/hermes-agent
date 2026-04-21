@@ -660,6 +660,34 @@ def _find_wsl_executable() -> str | None:
     return None
 
 
+def _resolve_wsl_distro_name(wsl_exe: str | None = None) -> str | None:
+    distro = str(os.getenv("WSL_DISTRO_NAME") or "").strip()
+    if distro:
+        return distro
+
+    exe = wsl_exe or _find_wsl_executable()
+    if not exe:
+        return None
+
+    try:
+        result = subprocess.run(
+            [exe, "-l", "-q"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return None
+
+    stdout = str(result.stdout or "").replace("\x00", "")
+    for line in stdout.splitlines():
+        candidate = line.strip()
+        if candidate:
+            return candidate
+    return None
+
+
 def _running_from_gateway_surface() -> bool:
     return bool(os.getenv("HERMES_GATEWAY_SESSION") or os.getenv("HERMES_SESSION_PLATFORM"))
 
@@ -735,7 +763,7 @@ def _schedule_detached_system_gateway_cli(action_name: str, hermes_args: list[st
                 f"System gateway {action_name} requires root. Re-run with sudo."
             )
         wsl_exe = _find_wsl_executable()
-        distro = os.getenv("WSL_DISTRO_NAME")
+        distro = _resolve_wsl_distro_name(wsl_exe)
         if not wsl_exe or not distro:
             raise PermissionError(
                 f"System gateway {action_name} requires root, and no WSL root bridge is available. Re-run with sudo."
