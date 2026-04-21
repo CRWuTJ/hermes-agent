@@ -82,13 +82,13 @@ def _normalize_aux_provider(provider: Optional[str], *, for_vision: bool = False
         suffix = normalized.split(":", 1)[1].strip()
         if not suffix:
             return "custom"
-        normalized = suffix if not for_vision else "custom"
+        normalized = f"custom:{suffix}" if for_vision else suffix
     if normalized == "codex":
         return "openai-codex"
     if normalized == "main":
         # Resolve to the user's actual main provider so named custom providers
         # and non-aggregator providers (DeepSeek, Alibaba, etc.) work correctly.
-        main_prov = _read_main_provider()
+        main_prov = _read_main_provider(for_vision=for_vision)
         if main_prov and main_prov not in ("auto", "main", ""):
             return main_prov
         return "custom"
@@ -133,11 +133,12 @@ _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
 # Codex fallback: uses the Responses API (the only endpoint the Codex
-# OAuth token can access) with a fast model for auxiliary tasks.
-# ChatGPT-backed Codex accounts currently reject gpt-5.3-codex for these
-# auxiliary flows, while gpt-5.2-codex remains broadly available and supports
-# vision via Responses.
-_CODEX_AUX_MODEL = "gpt-5.2-codex"
+# OAuth token can access) for auxiliary tasks.
+# Current ChatGPT-backed Team accounts expose gpt-5.4 / gpt-5.4-mini /
+# gpt-5.3-codex / gpt-5.2 via the Codex models API; the legacy
+# gpt-5.2-codex slug is no longer part of the active pool and caused stale
+# auxiliary failures in this environment.
+_CODEX_AUX_MODEL = "gpt-5.4"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
@@ -821,7 +822,7 @@ def _read_main_model() -> str:
     return ""
 
 
-def _read_main_provider() -> str:
+def _read_main_provider(*, for_vision: bool = False) -> str:
     """Read the user's configured main provider from config.yaml.
 
     Returns the lowercase provider id (e.g. "alibaba", "openrouter") or ""
@@ -834,7 +835,7 @@ def _read_main_provider() -> str:
         if isinstance(model_cfg, dict):
             provider = model_cfg.get("provider", "")
             if isinstance(provider, str) and provider.strip():
-                return _normalize_aux_provider(provider)
+                return _normalize_aux_provider(provider, for_vision=for_vision)
     except Exception:
         pass
     return ""
@@ -876,9 +877,38 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str]]:
     return custom_base, custom_key.strip()
 
 
+def _resolve_custom_runtime_api_mode() -> Optional[str]:
+    """Return the resolved API mode for the active custom/main runtime."""
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="custom")
+    except Exception as exc:
+        logger.debug("Auxiliary client: custom runtime api_mode resolution failed: %s", exc)
+        return None
+    api_mode = runtime.get("api_mode")
+    if not isinstance(api_mode, str):
+        return None
+    api_mode = api_mode.strip()
+    return api_mode or None
+
+
 def _current_custom_base_url() -> str:
     custom_base, _ = _resolve_custom_runtime()
     return custom_base or ""
+
+
+def _wrap_custom_aux_client(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    api_mode: Optional[str] = None,
+):
+    real_client = OpenAI(api_key=api_key, base_url=base_url)
+    if (api_mode or "").strip() == "codex_responses":
+        return CodexAuxiliaryClient(real_client, model)
+    return real_client
 
 
 def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -887,7 +917,12 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
         return None, None
     model = _read_main_model() or "gpt-4o-mini"
     logger.debug("Auxiliary client: custom endpoint (%s)", model)
-    return OpenAI(api_key=custom_key, base_url=custom_base), model
+    return _wrap_custom_aux_client(
+        api_key=custom_key,
+        base_url=custom_base,
+        model=model,
+        api_mode=_resolve_custom_runtime_api_mode(),
+    ), model
 
 
 def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
@@ -1277,7 +1312,12 @@ def resolve_provider_client(
                 )
                 return None, None
             final_model = model or _read_main_model() or "gpt-4o-mini"
-            client = OpenAI(api_key=custom_key, base_url=custom_base)
+            client = _wrap_custom_aux_client(
+                api_key=custom_key,
+                base_url=custom_base,
+                model=final_model,
+                api_mode=_resolve_custom_runtime_api_mode(),
+            )
             return (_to_async_client(client, final_model) if async_mode
                     else (client, final_model))
         # Try custom first, then codex, then API-key providers
@@ -1301,7 +1341,12 @@ def resolve_provider_client(
             custom_key = custom_entry.get("api_key", "").strip() or "no-key-required"
             if custom_base:
                 final_model = model or _read_main_model() or "gpt-4o-mini"
-                client = OpenAI(api_key=custom_key, base_url=custom_base)
+                client = _wrap_custom_aux_client(
+                    api_key=custom_key,
+                    base_url=custom_base,
+                    model=final_model,
+                    api_mode=str(custom_entry.get("api_mode") or "").strip() or None,
+                )
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s)",
                     provider, final_model)

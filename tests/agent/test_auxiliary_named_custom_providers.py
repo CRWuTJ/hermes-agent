@@ -58,6 +58,10 @@ class TestNormalizeVisionProvider:
         assert _normalize_vision_provider("beans") == "beans"
         assert _normalize_vision_provider("deepseek") == "deepseek"
 
+    def test_custom_prefix_is_preserved_for_named_vision_provider(self):
+        from agent.auxiliary_client import _normalize_vision_provider
+        assert _normalize_vision_provider("custom:beans") == "custom:beans"
+
     def test_codex_alias_still_works(self):
         from agent.auxiliary_client import _normalize_vision_provider
         assert _normalize_vision_provider("codex") == "openai-codex"

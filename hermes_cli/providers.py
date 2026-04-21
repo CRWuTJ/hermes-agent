@@ -446,6 +446,50 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     )
 
 
+def resolve_custom_provider(name: str) -> Optional[ProviderDef]:
+    """Resolve a provider from config.yaml ``custom_providers`` entries."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return None
+
+    custom_providers = cfg.get("custom_providers") or []
+    if not isinstance(custom_providers, list):
+        return None
+
+    wanted = name.strip().lower()
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        provider_name = str(entry.get("name") or "").strip()
+        if provider_name.lower() != wanted:
+            continue
+
+        base_url = str(entry.get("base_url") or entry.get("api") or entry.get("url") or "")
+        api_key = str(entry.get("api_key") or "")
+        transport = str(entry.get("transport") or "openai_chat")
+        api_mode = str(entry.get("api_mode") or "")
+        if api_mode == "anthropic_messages":
+            transport = "anthropic_messages"
+        elif api_mode == "codex_responses":
+            transport = "codex_responses"
+
+        return ProviderDef(
+            id=provider_name,
+            name=provider_name,
+            transport=transport,
+            api_key_env_vars=tuple(),
+            base_url=base_url,
+            is_aggregator=False,
+            auth_type="api_key",
+            source="user-config",
+        )
+
+    return None
+
+
 def resolve_provider_full(
     name: str,
     user_providers: Optional[Dict[str, Any]] = None,
@@ -479,7 +523,15 @@ def resolve_provider_full(
         if user_pdef is not None:
             return user_pdef
 
-    # 3. Try models.dev directly (for providers not in our ALIASES)
+    # 3. Named custom providers from config.yaml
+    custom_pdef = resolve_custom_provider(canonical)
+    if custom_pdef is not None:
+        return custom_pdef
+    custom_pdef = resolve_custom_provider(name)
+    if custom_pdef is not None:
+        return custom_pdef
+
+    # 4. Try models.dev directly (for providers not in our ALIASES)
     try:
         from agent.models_dev import get_provider_info as _mdev_provider
         mdev_info = _mdev_provider(canonical)

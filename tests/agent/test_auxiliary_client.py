@@ -586,7 +586,7 @@ class TestGetTextAuxiliaryClient:
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = get_text_auxiliary_client()
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.4"
         # Returns a CodexAuxiliaryClient wrapper, not a raw OpenAI client
         from agent.auxiliary_client import CodexAuxiliaryClient
         assert isinstance(client, CodexAuxiliaryClient)
@@ -615,7 +615,7 @@ class TestGetTextAuxiliaryClient:
         from agent.auxiliary_client import CodexAuxiliaryClient
 
         assert isinstance(client, CodexAuxiliaryClient)
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.4"
 
     def test_returns_none_when_nothing_available(self, monkeypatch):
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -875,7 +875,7 @@ class TestAuxiliaryPoolAwareness:
             client, model = get_vision_auxiliary_client()
         from agent.auxiliary_client import CodexAuxiliaryClient
         assert isinstance(client, CodexAuxiliaryClient)
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.4"
 
 
 class TestGetAuxiliaryProvider:
@@ -1007,7 +1007,7 @@ class TestResolveForcedProvider:
             client, model = _resolve_forced_provider("main")
         from agent.auxiliary_client import CodexAuxiliaryClient
         assert isinstance(client, CodexAuxiliaryClient)
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.4"
 
     def test_forced_codex(self, codex_auth_dir, monkeypatch):
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
@@ -1015,7 +1015,7 @@ class TestResolveForcedProvider:
             client, model = _resolve_forced_provider("codex")
         from agent.auxiliary_client import CodexAuxiliaryClient
         assert isinstance(client, CodexAuxiliaryClient)
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.4"
 
     def test_forced_codex_no_token(self, monkeypatch):
         with patch("agent.auxiliary_client._read_codex_access_token", return_value=None):
@@ -1104,6 +1104,52 @@ class TestTaskSpecificOverrides:
             client, model = get_text_auxiliary_client("compression")
         assert model == "glm-4.7"
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+    def test_codex_responses_custom_runtime_uses_codex_auxiliary_client(self, monkeypatch):
+        config = {
+            "model": {
+                "provider": "gpt-mainline-codex-local",
+                "base_url": "http://127.0.0.1:4311/v1",
+                "default": "gpt-5.4",
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_custom_runtime",
+            lambda: ("http://127.0.0.1:4311/v1", "local-key"),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_custom_runtime_api_mode",
+            lambda: "codex_responses",
+            raising=False,
+        )
+
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = get_text_auxiliary_client("compression")
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        assert isinstance(client, CodexAuxiliaryClient)
+        assert model == "gpt-5.4"
+
+    def test_named_codex_responses_provider_uses_codex_auxiliary_client(self, monkeypatch):
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value={
+                "base_url": "http://127.0.0.1:4311/v1",
+                "api_key": "local-key",
+                "api_mode": "codex_responses",
+            },
+        ), patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("gpt-mainline-codex-local", model="gpt-5.4")
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        assert isinstance(client, CodexAuxiliaryClient)
+        assert model == "gpt-5.4"
 
 
 class TestAuxiliaryMaxTokensParam:
@@ -1223,11 +1269,11 @@ class TestTryPaymentFallback:
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_nous", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
-             patch("agent.auxiliary_client._try_codex", return_value=(mock_codex, "gpt-5.2-codex")), \
+             patch("agent.auxiliary_client._try_codex", return_value=(mock_codex, "gpt-5.4")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
             client, model, label = _try_payment_fallback("openrouter")
         assert client is mock_codex
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.4"
         assert label == "openai-codex"
 
 
@@ -1255,7 +1301,7 @@ class TestCallLlmPaymentFallback:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                     return_value=("openrouter", "google/gemini-3-flash-preview", None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
-                    return_value=(fallback_client, "gpt-5.2-codex", "openai-codex")) as mock_fb:
+                    return_value=(fallback_client, "gpt-5.4", "openai-codex")) as mock_fb:
             result = call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "hello"}],
@@ -1265,7 +1311,7 @@ class TestCallLlmPaymentFallback:
         mock_fb.assert_called_once_with("openrouter", "compression")
         # Fallback call should use the fallback model
         fb_kwargs = fallback_client.chat.completions.create.call_args.kwargs
-        assert fb_kwargs["model"] == "gpt-5.2-codex"
+        assert fb_kwargs["model"] == "gpt-5.4"
 
     def test_non_payment_error_not_caught(self, monkeypatch):
         """Non-payment errors (500, connection, etc.) should NOT trigger fallback."""

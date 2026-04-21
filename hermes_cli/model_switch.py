@@ -816,7 +816,45 @@ def list_authenticated_providers(
         })
         seen_slugs.add(pid)
 
-    # --- 3. User-defined endpoints from config ---
+    # --- 3. Named custom providers from config.yaml ---
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        custom_providers = cfg.get("custom_providers") or []
+    except Exception:
+        custom_providers = []
+
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("name") or "").strip()
+            if not slug or slug in seen_slugs:
+                continue
+
+            model_cfg = entry.get("models")
+            if isinstance(model_cfg, dict):
+                model_ids = [str(model_id) for model_id in model_cfg.keys()]
+            elif isinstance(model_cfg, list):
+                model_ids = [str(model_id) for model_id in model_cfg]
+            else:
+                configured_model = str(entry.get("model") or "").strip()
+                model_ids = [configured_model] if configured_model else []
+
+            top = model_ids[:max_models] if max_models else []
+            results.append({
+                "slug": slug,
+                "name": slug,
+                "is_current": slug == current_provider,
+                "is_user_defined": True,
+                "models": top,
+                "total_models": len(model_ids),
+                "source": "custom_providers",
+            })
+            seen_slugs.add(slug)
+
+    # --- 4. User-defined endpoints from config ---
     if user_providers and isinstance(user_providers, dict):
         for ep_name, ep_cfg in user_providers.items():
             if not isinstance(ep_cfg, dict):

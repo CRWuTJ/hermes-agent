@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
+from hermes_cli import config as config_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
 from hermes_cli.auth import (
     AuthError,
@@ -23,8 +24,17 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import load_config
 from hermes_constants import OPENROUTER_BASE_URL
+
+
+def load_config() -> Dict[str, Any]:
+    """Return config.yaml via the live hermes_cli.config loader.
+
+    Keep this shim so callers and tests can patch either
+    ``hermes_cli.config.load_config`` or ``hermes_cli.runtime_provider.load_config``
+    without depending on import order.
+    """
+    return config_mod.load_config()
 
 
 def _normalize_custom_provider_name(value: str) -> str:
