@@ -1,8 +1,10 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
-import pytest
 from pathlib import Path
+
+import pytest
+from cron.jobs import trigger_job
 
 from tools.cronjob_tools import (
     _scan_cron_prompt,
@@ -175,6 +177,39 @@ class TestScheduleCronjob:
         assert job["provider"] == "custom"
         assert job["base_url"] == "http://127.0.0.1:4000/v1"
 
+    def test_schedule_persists_lane(self):
+        result = json.loads(schedule_cronjob(
+            prompt="Flush stale summaries",
+            schedule="every 1h",
+            lane="housekeeping",
+        ))
+        assert result["success"] is True
+        assert result["job"]["lane"] == "housekeeping"
+
+        listing = json.loads(list_cronjobs())
+        job = listing["jobs"][0]
+        assert job["lane"] == "housekeeping"
+
+    def test_schedule_and_list_expose_lane_metadata(self):
+        result = json.loads(schedule_cronjob(
+            prompt="Notify the user",
+            schedule="every 1h",
+            deliver="origin",
+        ))
+        assert result["success"] is True
+        assert result["lane"] is None
+        assert result["effective_lane"] == "interactive"
+        assert result["lane_source"] == "default"
+        assert result["job"]["lane"] is None
+        assert result["job"]["effective_lane"] == "interactive"
+        assert result["job"]["lane_source"] == "default"
+
+        listing = json.loads(list_cronjobs())
+        job = listing["jobs"][0]
+        assert job["lane"] is None
+        assert job["effective_lane"] == "interactive"
+        assert job["lane_source"] == "default"
+
     def test_thread_id_captured_in_origin(self, monkeypatch):
         monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
         monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "123456")
@@ -241,6 +276,33 @@ class TestListCronjobs:
         assert "schedule" in job
         assert "next_run_at" in job
         assert "enabled" in job
+
+    def test_list_includes_lane_summary_with_due_counts(self):
+        interactive = json.loads(
+            schedule_cronjob(prompt="Notify the user", schedule="every 1h", deliver="origin")
+        )
+        schedule_cronjob(prompt="Scout backlog", schedule="every 1h")
+        schedule_cronjob(prompt="Flush stale state", schedule="every 1h", lane="housekeeping")
+        trigger_job(interactive["job_id"])
+
+        result = json.loads(list_cronjobs())
+
+        assert result["lane_summary"] == {
+            "active": {"interactive": 1, "cron_scout": 1, "housekeeping": 1},
+            "due": {"interactive": 1, "cron_scout": 0, "housekeeping": 0},
+        }
+
+    def test_list_includes_human_lane_description(self):
+        schedule_cronjob(prompt="Notify the user", schedule="every 1h", deliver="origin")
+        schedule_cronjob(prompt="Scout backlog", schedule="every 1h")
+        schedule_cronjob(prompt="Flush stale state", schedule="every 1h", lane="housekeeping")
+
+        result = json.loads(list_cronjobs())
+        by_name = {job["name"]: job for job in result["jobs"]}
+
+        assert by_name["Notify the user"]["lane_description"] == "interactive (default)"
+        assert by_name["Scout backlog"]["lane_description"] == "cron/scout (default)"
+        assert by_name["Flush stale state"]["lane_description"] == "housekeeping (explicit)"
 
 
 # =========================================================================

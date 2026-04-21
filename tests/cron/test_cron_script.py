@@ -263,6 +263,25 @@ class TestCronjobToolScript:
         assert update_result["success"] is True
         assert update_result["job"]["script"] == "new_script.py"
 
+    def test_update_lane(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        create_result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+        ))
+        job_id = create_result["job_id"]
+
+        update_result = json.loads(cronjob(
+            action="update",
+            job_id=job_id,
+            lane="housekeeping",
+        ))
+        assert update_result["success"] is True
+        assert update_result["job"]["lane"] == "housekeeping"
+
     def test_clear_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob

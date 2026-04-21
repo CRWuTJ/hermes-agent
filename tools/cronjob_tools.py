@@ -17,12 +17,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     create_job,
+    describe_job_lane,
+    get_due_jobs,
     get_job,
+    job_with_lane_metadata,
     list_jobs,
     parse_schedule,
     pause_job,
     remove_job,
     resume_job,
+    summarize_job_lanes,
     trigger_job,
     update_job,
 )
@@ -180,6 +184,7 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = job.get("prompt", "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
+    lane_metadata = job_with_lane_metadata(job)
     result = {
         "job_id": job["id"],
         "name": job["name"],
@@ -192,6 +197,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "schedule": job.get("schedule_display"),
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
+        "lane": lane_metadata.get("lane"),
+        "effective_lane": lane_metadata.get("effective_lane"),
+        "lane_source": lane_metadata.get("lane_source"),
+        "lane_description": describe_job_lane(job),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
@@ -222,6 +231,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    lane: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -259,7 +269,9 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                lane=_normalize_optional_job_value(lane),
             )
+            formatted_job = _format_job(job)
             return json.dumps(
                 {
                     "success": True,
@@ -270,16 +282,29 @@ def cronjob(
                     "schedule": job["schedule_display"],
                     "repeat": _repeat_display(job),
                     "deliver": job.get("deliver", "local"),
+                    "lane": formatted_job.get("lane"),
+                    "effective_lane": formatted_job.get("effective_lane"),
+                    "lane_source": formatted_job.get("lane_source"),
                     "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
+                    "job": formatted_job,
                     "message": f"Cron job '{job['name']}' created.",
                 },
                 indent=2,
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
-            return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+            raw_jobs = list_jobs(include_disabled=include_disabled)
+            jobs = [_format_job(job) for job in raw_jobs]
+            lane_summary = summarize_job_lanes(raw_jobs, due_jobs=get_due_jobs())
+            return json.dumps(
+                {
+                    "success": True,
+                    "count": len(jobs),
+                    "jobs": jobs,
+                    "lane_summary": lane_summary,
+                },
+                indent=2,
+            )
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
@@ -348,6 +373,8 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if lane is not None:
+                updates["lane"] = _normalize_optional_job_value(lane)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -385,6 +412,7 @@ def schedule_cronjob(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    lane: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     return cronjob(
@@ -397,6 +425,7 @@ def schedule_cronjob(
         model=model,
         provider=provider,
         base_url=base_url,
+        lane=lane,
         task_id=task_id,
     )
 
@@ -456,6 +485,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "deliver": {
                 "type": "string",
                 "description": "Delivery target: origin, local, telegram, discord, slack, whatsapp, signal, matrix, mattermost, homeassistant, dingtalk, feishu, wecom, email, sms, or platform:chat_id or platform:chat_id:thread_id for Telegram topics. Examples: 'origin', 'local', 'telegram', 'telegram:-1001234567890:17585', 'discord:#engineering'"
+            },
+            "lane": {
+                "type": "string",
+                "description": "Optional scheduler lane: interactive, cron_scout, or housekeeping. Leave unset to use defaults (deliver!=local -> interactive, otherwise cron_scout)."
             },
             "skills": {
                 "type": "array",
@@ -517,6 +550,7 @@ registry.register(
         name=args.get("name"),
         repeat=args.get("repeat"),
         deliver=args.get("deliver"),
+        lane=args.get("lane"),
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
