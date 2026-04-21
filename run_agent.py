@@ -3337,7 +3337,10 @@ class AIAgent:
         if not isinstance(output, list) or not output:
             # The Codex backend can return empty output when the answer was
             # delivered entirely via stream events. Check output_text as a
-            # last-resort fallback before raising.
+            # last-resort fallback before raising. A reasoning-only terminal
+            # turn is also valid: synthesize an empty assistant message so the
+            # main loop can preserve the reasoning turn and retry for visible
+            # text without leaking placeholder content into history.
             out_text = getattr(response, "output_text", None)
             if isinstance(out_text, str) and out_text.strip():
                 logger.debug(
@@ -3347,6 +3350,20 @@ class AIAgent:
                 output = [SimpleNamespace(
                     type="message", role="assistant", status="completed",
                     content=[SimpleNamespace(type="output_text", text=out_text.strip())],
+                )]
+                response.output = output
+            elif (
+                getattr(response, "reasoning", None)
+                or getattr(response, "reasoning_content", None)
+                or getattr(response, "reasoning_details", None)
+            ):
+                logger.debug(
+                    "Codex response has empty output but reasoning is present; "
+                    "synthesizing empty assistant message for silent terminal turn."
+                )
+                output = [SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[],
                 )]
                 response.output = output
             else:
@@ -4481,6 +4498,9 @@ class AIAgent:
 
             # Build mock response matching non-streaming shape
             full_content = "".join(content_parts) or None
+            has_visible_content = bool(full_content and full_content.strip())
+            if not has_visible_content:
+                full_content = None
             mock_tool_calls = None
             if tool_calls_acc:
                 mock_tool_calls = []
@@ -4497,6 +4517,13 @@ class AIAgent:
                     ))
 
             full_reasoning = "".join(reasoning_parts) or None
+            if full_content is None and mock_tool_calls is None and full_reasoning is None:
+                logger.debug(
+                    "Streaming chat.completions returned no visible content, tool calls, "
+                    "or reasoning; falling back to non-streaming request. %s",
+                    self._client_log_context(),
+                )
+                return self._interruptible_api_call(api_kwargs)
             mock_message = SimpleNamespace(
                 role=role,
                 content=full_content,
@@ -7393,15 +7420,26 @@ class AIAgent:
                         elif not output_items:
                             # Stream backfill may have failed, but
                             # _normalize_codex_response can still recover
-                            # from response.output_text. Only mark invalid
-                            # when that fallback is also absent.
+                            # from response.output_text or a reasoning-only
+                            # terminal response. Only mark invalid when neither
+                            # fallback is present.
                             _out_text = getattr(response, "output_text", None)
                             _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
+                            _has_reasoning = bool(
+                                getattr(response, "reasoning", None)
+                                or getattr(response, "reasoning_content", None)
+                                or getattr(response, "reasoning_details", None)
+                            )
                             if _out_text_stripped:
                                 logger.debug(
                                     "Codex response.output is empty but output_text is present "
                                     "(%d chars); deferring to normalization.",
                                     len(_out_text_stripped),
+                                )
+                            elif _has_reasoning:
+                                logger.debug(
+                                    "Codex response.output is empty but reasoning is present; "
+                                    "treating as reasoning-only terminal response."
                                 )
                             else:
                                 _resp_status = getattr(response, "status", None)
@@ -8931,10 +8969,13 @@ class AIAgent:
                             continue
 
                         # Exhausted prefill attempts or no structured
-                        # reasoning — fall through to "(empty)" terminal.
+                        # reasoning. Empty final answers are not useful on
+                        # gateway platforms: they become "(No response
+                        # generated)" placeholders. Ask the model once more
+                        # for visible text before giving up.
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
-                        assistant_msg["content"] = "(empty)"
+                        assistant_msg["content"] = ""
                         messages.append(assistant_msg)
 
                         if reasoning_text:
@@ -8943,7 +8984,25 @@ class AIAgent:
                         else:
                             self._vprint(f"{self.log_prefix}ℹ️  Empty response (no content or reasoning).")
 
-                        final_response = "(empty)"
+                        if self._empty_content_retries < 2:
+                            self._empty_content_retries += 1
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "Your previous response had no visible text. "
+                                    "Answer the user's last request with visible text only. "
+                                    "Do not return an empty response."
+                                ),
+                            })
+                            self._session_messages = messages
+                            self._save_session_log(messages)
+                            continue
+
+                        final_response = (
+                            "I couldn't generate a visible response after retrying. "
+                            "Please send the request again."
+                        )
+                        messages.append({"role": "assistant", "content": final_response})
                         break
                     
                     # Reset retry counter/signature on successful content

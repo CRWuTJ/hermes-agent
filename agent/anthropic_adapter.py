@@ -974,7 +974,11 @@ def convert_messages_to_anthropic(
 
         if role == "assistant":
             blocks = _extract_preserved_thinking_blocks(m)
-            if content:
+            is_empty_placeholder = (
+                isinstance(content, str)
+                and content.strip().lower() == "(empty)"
+            )
+            if content and not is_empty_placeholder:
                 if isinstance(content, list):
                     converted_content = _convert_content_to_anthropic(content)
                     if isinstance(converted_content, list):
@@ -996,11 +1000,12 @@ def convert_messages_to_anthropic(
                     "name": fn.get("name", ""),
                     "input": parsed_args,
                 })
-            # Anthropic rejects empty assistant content
-            effective = blocks or content
-            if not effective or effective == "":
-                effective = [{"type": "text", "text": "(empty)"}]
-            result.append({"role": "assistant", "content": effective})
+            # Anthropic rejects empty assistant content. Empty historical
+            # placeholders carry no semantic value, so skip them instead of
+            # teaching the next model turn to answer with "(empty)".
+            if not blocks:
+                continue
+            result.append({"role": "assistant", "content": blocks})
             continue
 
         if role == "tool":

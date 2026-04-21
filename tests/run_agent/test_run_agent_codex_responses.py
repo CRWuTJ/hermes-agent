@@ -436,6 +436,35 @@ def test_run_conversation_codex_empty_output_no_output_text_retries(monkeypatch)
     assert result["final_response"] == "Recovered"
 
 
+def test_run_conversation_codex_reasoning_only_terminal_recovers_visible_answer(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"api": 0}
+
+    response = SimpleNamespace(
+        output=[],
+        output_text=None,
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3, total_tokens=8),
+        status="completed",
+        model="gpt-5-codex",
+        reasoning_details=[{"summary": "internal reasoning only"}],
+    )
+
+    def _fake_api_call(api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            return response
+        return _codex_message_response("Recovered visible answer")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("Think but say nothing")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered visible answer"
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == "Recovered visible answer"
+
+
 def test_run_conversation_codex_refreshes_after_401_and_retries(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"api": 0, "refresh": 0}

@@ -379,6 +379,113 @@ class TestStreamingFallback:
     @patch("run_agent.AIAgent._interruptible_api_call")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_empty_stream_without_visible_content_falls_back(
+        self, mock_close, mock_create, mock_non_stream
+    ):
+        """Empty stream chunks with no text/tool/reasoning should fall back.
+
+        Regression for the gpt-mainline-local -> LiteLLM -> codex adapter path:
+        the streaming surface can return only empty deltas plus DONE, while the
+        non-streaming request returns valid assistant text.
+        """
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(finish_reason="stop", model="test-model"),
+            _make_stream_chunk(),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        fallback_response = SimpleNamespace(
+            id="fallback",
+            model="test-model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="fallback visible text",
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        mock_non_stream.return_value = fallback_response
+
+        agent = AIAgent(
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "fallback visible text"
+        mock_non_stream.assert_called_once()
+
+    @patch("run_agent.AIAgent._interruptible_api_call")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_whitespace_only_stream_without_visible_content_falls_back(
+        self, mock_close, mock_create, mock_non_stream
+    ):
+        """Whitespace-only stream chunks should still fall back for visible text.
+
+        Some local adapters emit blank padding tokens before DONE. Treat those as
+        non-visible output so the runtime retries with a non-streaming request.
+        """
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="   ", model="test-model"),
+            _make_stream_chunk(finish_reason="stop", model="test-model"),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        fallback_response = SimpleNamespace(
+            id="fallback",
+            model="test-model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="fallback visible text",
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        mock_non_stream.return_value = fallback_response
+
+        agent = AIAgent(
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "fallback visible text"
+        mock_non_stream.assert_called_once()
+
+    @patch("run_agent.AIAgent._interruptible_api_call")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_stream_error_falls_back(self, mock_close, mock_create, mock_non_stream):
         """'not supported' error triggers fallback to non-streaming."""
         from run_agent import AIAgent

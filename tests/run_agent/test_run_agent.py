@@ -1524,13 +1524,14 @@ class TestRunConversation:
         assert result["api_calls"] == 2
 
     def test_inline_think_blocks_reasoning_only_accepted(self, agent):
-        """Inline <think> reasoning-only responses accepted with (empty) content, no retries."""
+        """Inline <think> reasoning-only responses retry for visible content."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content="<think>internal reasoning</think>",
             finish_reason="stop",
         )
-        agent.client.chat.completions.create.side_effect = [empty_resp]
+        recovered = _mock_response(content="Recovered visible answer.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp, recovered]
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1538,8 +1539,8 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 1  # no retries
+        assert result["final_response"] == "Recovered visible answer."
+        assert result["api_calls"] == 2
         # Reasoning should be preserved in the assistant message
         assistant_msgs = [m for m in result["messages"] if m.get("role") == "assistant"]
         assert any(m.get("reasoning") for m in assistant_msgs)
@@ -1559,9 +1560,10 @@ class TestRunConversation:
             {"role": "assistant", "content": "old answer"},
         ]
 
-        # 3 responses: original + 2 prefill continuations (structured reasoning triggers prefill)
+        recovered = _mock_response(content="Recovered visible answer.", finish_reason="stop")
+        # 3 responses: original + one prefill continuation + visible answer
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp, empty_resp, empty_resp]),
+            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp, empty_resp, recovered]),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1571,19 +1573,20 @@ class TestRunConversation:
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
+        assert result["final_response"] == "Recovered visible answer."
         assert result["api_calls"] == 3  # 1 original + 2 prefill continuations
 
     def test_reasoning_only_response_prefill_then_empty(self, agent):
-        """Structured reasoning-only triggers prefill continuation (up to 2), then falls through to (empty)."""
+        """Structured reasoning-only triggers prefill and visible-answer retry."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content=None,
             finish_reason="stop",
             reasoning_content="structured reasoning answer",
         )
-        # 3 responses: original + 2 prefill continuations, all reasoning-only
-        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp, empty_resp]
+        recovered = _mock_response(content="Recovered visible answer.", finish_reason="stop")
+        # original + 2 prefill continuations + visible-answer retry
+        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp, empty_resp, recovered]
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1591,8 +1594,8 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 3  # 1 original + 2 prefill continuations
+        assert result["final_response"] == "Recovered visible answer."
+        assert result["api_calls"] == 4
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
         """When prefill continuation produces content, it becomes the final response."""
@@ -1622,12 +1625,13 @@ class TestRunConversation:
             if roles[i] == "assistant" and roles[i + 1] == "assistant":
                 raise AssertionError("Consecutive assistant messages found in history")
 
-    def test_truly_empty_response_accepted_without_retry(self, agent):
-        """Truly empty response (no content, no reasoning) should still complete with (empty)."""
+    def test_truly_empty_response_retries_for_visible_answer(self, agent):
+        """Truly empty response should retry instead of completing silently."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         empty_resp = _mock_response(content=None, finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [empty_resp]
+        recovered = _mock_response(content="Recovered visible answer.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp, recovered]
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1635,8 +1639,13 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 1  # no retries
+        assert result["final_response"] == "Recovered visible answer."
+        assert result["api_calls"] == 2
+        assert any(
+            message.get("role") == "user"
+            and "visible text" in message.get("content", "")
+            for message in result["messages"]
+        )
 
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
@@ -2997,14 +3006,31 @@ class TestStreamingApiCall:
         assert resp.choices[0].message.content == "I'll search"
         assert len(resp.choices[0].message.tool_calls) == 1
 
-    def test_empty_content_returns_none(self, agent):
+    def test_empty_content_falls_back_to_non_streaming_visible_text(self, agent):
         chunks = [_make_chunk(finish_reason="stop")]
         agent.client.chat.completions.create.return_value = iter(chunks)
+        fallback = SimpleNamespace(
+            id="fallback",
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="fallback visible text",
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
 
-        resp = agent._interruptible_streaming_api_call({"messages": []})
+        with patch.object(agent, "_interruptible_api_call", return_value=fallback) as mock_non_stream:
+            resp = agent._interruptible_streaming_api_call({"messages": []})
 
-        assert resp.choices[0].message.content is None
+        assert resp.choices[0].message.content == "fallback visible text"
         assert resp.choices[0].message.tool_calls is None
+        mock_non_stream.assert_called_once_with({"messages": []})
 
     def test_callback_exception_swallowed(self, agent):
         chunks = [

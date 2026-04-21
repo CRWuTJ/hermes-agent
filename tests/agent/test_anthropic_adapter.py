@@ -613,6 +613,22 @@ class TestConvertMessages:
         assert user_msg["content"][0]["type"] == "tool_result"
         assert user_msg["content"][0]["tool_use_id"] == "tc_1"
 
+    def test_skips_empty_assistant_history_without_tool_calls(self):
+        messages = [
+            {"role": "user", "content": "Why are replies empty?"},
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "(empty)"},
+            {"role": "user", "content": "Please answer normally."},
+        ]
+
+        _, result = convert_messages_to_anthropic(messages)
+
+        assert all(message["role"] == "user" for message in result)
+        rendered = "\n".join(str(message["content"]) for message in result)
+        assert "Why are replies empty?" in rendered
+        assert "Please answer normally." in rendered
+        assert "(empty)" not in rendered
+
     def test_merges_consecutive_tool_results(self):
         messages = [
             {
