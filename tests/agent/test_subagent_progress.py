@@ -16,7 +16,11 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from agent.display import KawaiiSpinner
-from tools.delegate_tool import _build_child_progress_callback
+from tools.delegate_tool import (
+    _build_child_progress_callback,
+    _relay_child_activity_to_parent,
+    _run_single_child_with_activity_monitor,
+)
 
 
 # =========================================================================
@@ -211,6 +215,83 @@ class TestBuildChildProgressCallback:
         
         output = buf.getvalue()
         assert "[" not in output
+
+
+# =========================================================================
+# Parent activity relay tests
+# =========================================================================
+
+class TestParentActivityRelay:
+    """delegate_task should keep parent activity aligned with child progress."""
+
+    def test_relays_fresh_child_activity_once(self):
+        parent = MagicMock()
+        child = MagicMock()
+        child.get_activity_summary.return_value = {
+            "last_activity_ts": 123.0,
+            "last_activity_desc": "api_call_streaming",
+            "current_tool": "delegate_task",
+        }
+        seen = {}
+
+        _relay_child_activity_to_parent(parent, child, 1, seen)
+        _relay_child_activity_to_parent(parent, child, 1, seen)
+
+        parent._touch_activity.assert_called_once_with(
+            "delegate child[2] api_call_streaming [delegate_task]"
+        )
+        assert seen[1] == 123.0
+
+    def test_ignores_missing_or_stale_child_activity(self):
+        parent = MagicMock()
+        child = MagicMock()
+        child.get_activity_summary.return_value = {
+            "last_activity_ts": 100.0,
+            "last_activity_desc": "tool completed: read_file (0.5s)",
+            "current_tool": None,
+        }
+        seen = {0: 100.0}
+
+        _relay_child_activity_to_parent(parent, child, 0, seen)
+
+        parent._touch_activity.assert_not_called()
+
+    def test_single_child_monitor_touches_parent_while_waiting(self):
+        parent = MagicMock()
+        child = MagicMock()
+        state = {"ts": 100.0}
+
+        def activity_summary():
+            state["ts"] += 1.0
+            return {
+                "last_activity_ts": state["ts"],
+                "last_activity_desc": "executing tool: web_search",
+                "current_tool": "web_search",
+            }
+
+        child.get_activity_summary.side_effect = activity_summary
+
+        def fake_run_single_child(*args, **kwargs):
+            time.sleep(0.12)
+            return {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.12,
+            }
+
+        with patch("tools.delegate_tool._run_single_child", side_effect=fake_run_single_child):
+            result = _run_single_child_with_activity_monitor(
+                0,
+                "goal",
+                child,
+                parent,
+                poll_interval=0.05,
+            )
+
+        assert result["status"] == "completed"
+        assert parent._touch_activity.called
 
 
 # =========================================================================

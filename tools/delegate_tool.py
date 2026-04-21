@@ -23,7 +23,7 @@ import os
 import re
 import secrets
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -46,6 +46,7 @@ DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 DEFAULT_CHILD_KEY_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_CODEX_KEYS_PATH = Path("/home/wutj/.hermes/codex_oauth_adapter_keys.json")
+DELEGATE_ACTIVITY_POLL_INTERVAL = 1.0
 UNSUPPORTED_CHILD_KEY_ENDPOINT_STATUS_CODES = frozenset({404, 405, 501})
 UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS: set[str] = set()
 
@@ -704,6 +705,78 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
+
+def _relay_child_activity_to_parent(
+    parent_agent,
+    child,
+    task_index: int,
+    seen_activity_ts: Dict[int, float],
+) -> None:
+    """Mirror fresh child activity into the parent activity tracker.
+
+    Cron inactivity monitoring only polls the parent agent. While delegate_task
+    waits on child futures, the parent can look idle even though children are
+    actively streaming, thinking, or calling tools. We mirror only *new* child
+    activity timestamps so genuinely hung children still time out upstream.
+    """
+    touch_activity = getattr(parent_agent, "_touch_activity", None)
+    if not callable(touch_activity) or not hasattr(child, "get_activity_summary"):
+        return
+
+    try:
+        activity = child.get_activity_summary() or {}
+    except Exception:
+        return
+
+    raw_ts = activity.get("last_activity_ts")
+    try:
+        last_ts = float(raw_ts)
+    except (TypeError, ValueError):
+        try:
+            last_ts = time.time() - float(activity.get("seconds_since_activity", 0.0))
+        except (TypeError, ValueError):
+            return
+
+    previous_ts = float(seen_activity_ts.get(task_index, 0.0) or 0.0)
+    if last_ts <= previous_ts:
+        return
+
+    seen_activity_ts[task_index] = last_ts
+    desc = str(activity.get("last_activity_desc") or "active").strip() or "active"
+    current_tool = str(activity.get("current_tool") or "").strip()
+    if current_tool and current_tool not in desc:
+        desc = f"{desc} [{current_tool}]"
+    try:
+        touch_activity(f"delegate child[{task_index + 1}] {desc}")
+    except Exception:
+        pass
+
+
+
+def _run_single_child_with_activity_monitor(
+    task_index: int,
+    goal: str,
+    child,
+    parent_agent,
+    poll_interval: float = DELEGATE_ACTIVITY_POLL_INTERVAL,
+) -> Dict[str, Any]:
+    """Run one child in a worker thread while mirroring its activity upstream."""
+    seen_activity_ts: Dict[int, float] = {}
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            _run_single_child,
+            task_index=task_index,
+            goal=goal,
+            child=child,
+            parent_agent=parent_agent,
+        )
+        while True:
+            done, _ = wait({future}, timeout=poll_interval)
+            _relay_child_activity_to_parent(parent_agent, child, task_index, seen_activity_ts)
+            if done:
+                return future.result()
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -829,14 +902,18 @@ def delegate_task(
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
+        # Single task -- still poll child activity so cron/origin watchdog sees progress.
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child_with_activity_monitor(0, _t["goal"], child, parent_agent)
         results.append(result)
     else:
-        # Batch -- run in parallel with per-task progress lines
+        # Batch -- run in parallel with per-task progress lines and mirror active
+        # child timestamps into the parent so cron inactivity tracking reflects
+        # real subagent work instead of treating delegate_task as idle.
         completed_count = 0
         spinner_ref = getattr(parent_agent, '_delegate_spinner', None)
+        child_by_index = {i: child for i, _t, child in children}
+        seen_activity_ts: Dict[int, float] = {}
 
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
             futures = {}
@@ -850,44 +927,61 @@ def delegate_task(
                 )
                 futures[future] = i
 
-            for future in as_completed(futures):
-                try:
-                    entry = future.result()
-                except Exception as exc:
+            pending = set(futures)
+            while pending:
+                done, pending = wait(
+                    pending,
+                    timeout=DELEGATE_ACTIVITY_POLL_INTERVAL,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                for future in list(pending):
                     idx = futures[future]
-                    entry = {
-                        "task_index": idx,
-                        "status": "error",
-                        "summary": None,
-                        "error": str(exc),
-                        "api_calls": 0,
-                        "duration_seconds": 0,
-                    }
-                results.append(entry)
-                completed_count += 1
+                    child = child_by_index.get(idx)
+                    if child is not None:
+                        _relay_child_activity_to_parent(parent_agent, child, idx, seen_activity_ts)
 
-                # Print per-task completion line above the spinner
-                idx = entry["task_index"]
-                label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
-                dur = entry.get("duration_seconds", 0)
-                status = entry.get("status", "?")
-                icon = "✓" if status == "completed" else "✗"
-                remaining = n_tasks - completed_count
-                completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
-                if spinner_ref:
+                if not done:
+                    continue
+
+                for future in done:
                     try:
-                        spinner_ref.print_above(completion_line)
-                    except Exception:
+                        entry = future.result()
+                    except Exception as exc:
+                        idx = futures[future]
+                        entry = {
+                            "task_index": idx,
+                            "status": "error",
+                            "summary": None,
+                            "error": str(exc),
+                            "api_calls": 0,
+                            "duration_seconds": 0,
+                        }
+                    results.append(entry)
+                    completed_count += 1
+
+                    # Print per-task completion line above the spinner
+                    idx = entry["task_index"]
+                    label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
+                    dur = entry.get("duration_seconds", 0)
+                    status = entry.get("status", "?")
+                    icon = "✓" if status == "completed" else "✗"
+                    remaining = n_tasks - completed_count
+                    completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                    if spinner_ref:
+                        try:
+                            spinner_ref.print_above(completion_line)
+                        except Exception:
+                            print(f"  {completion_line}")
+                    else:
                         print(f"  {completion_line}")
-                else:
-                    print(f"  {completion_line}")
 
-                # Update spinner text to show remaining count
-                if spinner_ref and remaining > 0:
-                    try:
-                        spinner_ref.update_text(f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining")
-                    except Exception as e:
-                        logger.debug("Spinner update_text failed: %s", e)
+                    # Update spinner text to show remaining count
+                    if spinner_ref and remaining > 0:
+                        try:
+                            spinner_ref.update_text(f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining")
+                        except Exception as e:
+                            logger.debug("Spinner update_text failed: %s", e)
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
