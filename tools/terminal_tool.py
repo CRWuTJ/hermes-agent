@@ -153,6 +153,15 @@ def _check_all_guards(command: str, env_type: str) -> dict:
 # plus, at, equals, and comma.  Everything else is rejected.
 _WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/_\-.~ +@=,]+$')
 
+# Raw live-gateway service control from a messaging/origin session can sever the
+# very conversation that launched it. Allow dedicated gateway surfaces to handle
+# detached restart/stop/install flows instead of letting terminal commands cut
+# the active session out from under themselves.
+_LIVE_GATEWAY_SERVICE_CONTROL_PATTERNS = (
+    re.compile(r'\b(systemctl|service)\s+(?:--user\s+|--system\s+)?(?:start|stop|restart)\s+hermes-gateway(?:\.service)?\b', re.IGNORECASE),
+    re.compile(r'\b(?:python\s+-m\s+hermes_cli\.main|hermes)\s+gateway\s+(?:start|stop|restart|install|uninstall|repair)\b', re.IGNORECASE),
+)
+
 
 def _validate_workdir(workdir: str) -> str | None:
     """Reject workdir values that don't look like a filesystem path.
@@ -173,6 +182,35 @@ def _validate_workdir(workdir: str) -> str | None:
                     "Use a simple filesystem path without shell metacharacters."
                 )
         return "Blocked: workdir contains disallowed characters."
+    return None
+
+
+def _block_live_gateway_service_control(command: str) -> str | None:
+    """Block raw live gateway service-control commands from messaging/origin runs.
+
+    Dedicated gateway command surfaces already know how to schedule detached
+    restart/stop/install flows safely. Raw terminal service control from a live
+    chat or origin-delivered cron run can interrupt the current conversation.
+    """
+    if not command:
+        return None
+
+    has_live_messaging_context = bool(os.getenv("HERMES_SESSION_PLATFORM", "").strip())
+    has_origin_delivery_context = bool(
+        os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip()
+        and os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+    )
+    if not (has_live_messaging_context or has_origin_delivery_context):
+        return None
+
+    normalized = str(command).strip()
+    for pattern in _LIVE_GATEWAY_SERVICE_CONTROL_PATTERNS:
+        if pattern.search(normalized):
+            return (
+                "Blocked: live Hermes gateway service control is disabled in messaging/origin runs "
+                "because it can cut the current conversation mid-turn. "
+                "Leave the code ready and report pending live reload, or use a detached admin path instead."
+            )
     return None
 
 
@@ -1036,6 +1074,15 @@ def terminal_tool(
         # Note: force parameter is internal only, not exposed to model API
     """
     try:
+        live_gateway_block = _block_live_gateway_service_control(command)
+        if live_gateway_block:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": live_gateway_block,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
