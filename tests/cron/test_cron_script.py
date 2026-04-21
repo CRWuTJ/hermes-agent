@@ -13,6 +13,7 @@ import stat
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -110,6 +111,26 @@ class TestRunJobScript:
         success, output = _run_job_script("relative.py")
         assert success is True
         assert output == "relative works"
+
+    def test_script_shebang_interpreter_takes_precedence(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "venv_script.py"
+        script.write_text('#!/custom/venv/bin/python\nprint("hello from venv")\n')
+
+        calls = []
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=None, cwd=None, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="hello from venv\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        assert output == "hello from venv"
+        assert calls == [["/custom/venv/bin/python", str(script)]]
 
     def test_script_not_found(self, cron_env):
         from cron.scheduler import _run_job_script

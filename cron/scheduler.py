@@ -13,6 +13,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 
@@ -412,6 +413,31 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _SCRIPT_TIMEOUT = 120  # seconds
 
 
+def _script_command(path: Path) -> list[str]:
+    """Resolve how a cron pre-run script should be executed.
+
+    Prefer the script's shebang so dedicated virtualenvs work. Fall back to the
+    current interpreter when no shebang is present.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            first_line = handle.readline().lstrip("\ufeff").strip()
+    except OSError:
+        first_line = ""
+
+    if first_line.startswith("#!"):
+        shebang = first_line[2:].strip()
+        if shebang:
+            try:
+                parts = shlex.split(shebang)
+            except ValueError:
+                parts = [shebang]
+            if parts:
+                return [*parts, str(path)]
+
+    return [sys.executable, str(path)]
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -458,7 +484,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     try:
         result = subprocess.run(
-            [sys.executable, str(path)],
+            _script_command(path),
             capture_output=True,
             text=True,
             timeout=_SCRIPT_TIMEOUT,
