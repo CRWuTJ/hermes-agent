@@ -143,8 +143,14 @@ def parse_task_command_args(raw_args: str) -> tuple[Optional[str], Optional[str]
 
 
 def task_command_usage_text() -> str:
+    try:
+        from hermes_cli.commands import command_usage_line
+
+        usage_line = command_usage_line("task")
+    except Exception:
+        usage_line = None
     return (
-        "Usage: /task <task_id> [foreground|cancel|recover|now|next|later|reprioritize <bucket>]\n"
+        f"{usage_line or 'Usage: /task <task_id> [foreground|cancel|recover|now|next|later|reprioritize <bucket>]'}\n"
         "Examples: /task bg_123abc · /task bg_123abc foreground · /task bg_123abc later · "
         "/task bg_123abc reprioritize later · /task bg_123abc recover · /task bg_123abc cancel"
     )

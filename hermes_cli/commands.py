@@ -75,6 +75,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("status", "Show session info", "Session",
                gateway_only=True),
+    CommandDef("tasks", "List queued and active gateway tasks", "Session",
+               gateway_only=True),
+    CommandDef(
+        "task",
+        "Show details for one queued or active gateway task",
+        "Session",
+        gateway_only=True,
+        args_hint="<task_id> [foreground|cancel|recover|now|next|later|reprioritize <bucket>]",
+        subcommands=("foreground", "cancel", "recover", "now", "next", "later", "reprioritize"),
+    ),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
@@ -222,10 +232,21 @@ def rebuild_lookups() -> None:
     )
 
 
+def command_usage_line(name: str) -> str | None:
+    """Return a shared ``Usage: /command ...`` synopsis for a command."""
+    cmd = resolve_command(name)
+    if cmd is None:
+        return None
+    args = f" {cmd.args_hint}" if cmd.args_hint else ""
+    return f"Usage: /{cmd.name}{args}"
+
+
 def _build_description(cmd: CommandDef) -> str:
     """Build a CLI-facing description string including usage hint."""
     if cmd.args_hint:
-        return f"{cmd.description} (usage: /{cmd.name} {cmd.args_hint})"
+        usage_line = command_usage_line(cmd.name)
+        if usage_line:
+            return f"{cmd.description} ({usage_line.lower()})"
     return cmd.description
 
 

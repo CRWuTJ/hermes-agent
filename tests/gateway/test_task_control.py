@@ -11,6 +11,7 @@ from gateway.task_control import (
     queued_task_wait_age,
     queued_task_wait_seconds,
     render_gateway_task_detail_block,
+    task_command_usage_text,
 )
 
 
@@ -47,6 +48,15 @@ def test_parse_task_command_args_preserves_explicit_reprioritize_without_bucket(
         "reprioritize",
         None,
     )
+
+
+def test_task_command_usage_text_reuses_shared_command_usage_line():
+    from hermes_cli.commands import command_usage_line
+
+    usage = task_command_usage_text()
+
+    assert usage.startswith(command_usage_line("task") + "\n")
+    assert "/task bg_123abc reprioritize later" in usage
 
 
 def test_describe_task_action_result_formats_foreground_for_chat():

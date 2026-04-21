@@ -17,6 +17,7 @@ from hermes_cli.commands import (
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
+    command_usage_line,
     discord_skill_commands,
     gateway_help_lines,
     resolve_command,
@@ -187,6 +188,12 @@ class TestGatewayHelpLines:
         bg_line = [l for l in lines if "/background" in l]
         assert len(bg_line) == 1
         assert "/bg" in bg_line[0]
+
+    def test_task_help_line_includes_longform_reprioritize_usage(self):
+        lines = gateway_help_lines()
+        task_line = [l for l in lines if l.startswith("`/task ")]
+        assert len(task_line) == 1
+        assert "reprioritize <bucket>" in task_line[0]
 
 
 class TestTelegramBotCommands:
@@ -444,6 +451,22 @@ class TestSubcommands:
         assert "/cron" in SUBCOMMANDS
         assert "list" in SUBCOMMANDS["/cron"]
         assert "add" in SUBCOMMANDS["/cron"]
+
+    def test_task_has_shared_runtime_control_subcommands(self):
+        assert SUBCOMMANDS["/task"] == [
+            "foreground",
+            "cancel",
+            "recover",
+            "now",
+            "next",
+            "later",
+            "reprioritize",
+        ]
+
+    def test_command_usage_line_builds_task_synopsis(self):
+        assert command_usage_line("task") == (
+            "Usage: /task <task_id> [foreground|cancel|recover|now|next|later|reprioritize <bucket>]"
+        )
 
     def test_commands_without_subcommands_not_in_dict(self):
         """Plain commands should not appear in SUBCOMMANDS."""
