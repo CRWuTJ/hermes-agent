@@ -47,6 +47,7 @@ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 DEFAULT_CHILD_KEY_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_CODEX_KEYS_PATH = Path("/home/wutj/.hermes/codex_oauth_adapter_keys.json")
 UNSUPPORTED_CHILD_KEY_ENDPOINT_STATUS_CODES = frozenset({404, 405, 501})
+UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS: set[str] = set()
 
 
 def check_delegate_requirements() -> bool:
@@ -169,6 +170,12 @@ def _issue_delegate_child_api_key(
         payload["expires_at"] = int(time.time()) + ttl_seconds
 
     url = _internal_keys_url(base_url)
+    if url in UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS:
+        logger.debug(
+            "Skipping child API key mint at %s because this endpoint was previously marked unsupported.",
+            url,
+        )
+        return None
     try:
         response = requests.post(
             url,
@@ -180,6 +187,7 @@ def _issue_delegate_child_api_key(
         raise ValueError(f"Failed to create child API key through local codex adapter: {exc}") from exc
 
     if response.status_code in UNSUPPORTED_CHILD_KEY_ENDPOINT_STATUS_CODES:
+        UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS.add(url)
         logger.warning(
             "Child API key minting unavailable at %s (HTTP %s); falling back to parent credentials.",
             url,

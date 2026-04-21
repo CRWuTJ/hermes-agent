@@ -16,6 +16,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+import tools.delegate_tool as delegate_tool_module
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -762,6 +764,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool.requests.post")
     def test_issue_child_api_key_falls_back_when_internal_keys_endpoint_is_unsupported(self, mock_post):
+        delegate_tool_module.UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS.clear()
         parent = _make_mock_parent(depth=0)
         creds = {
             "model": "gpt-5.4",
@@ -790,9 +793,48 @@ class TestDelegationProviderIntegration(unittest.TestCase):
                 self.assertIsNone(lease)
 
     @patch("tools.delegate_tool.requests.post")
+    def test_issue_child_api_key_skips_repeated_calls_after_unsupported_endpoint_detected(self, mock_post):
+        delegate_tool_module.UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS.clear()
+        parent = _make_mock_parent(depth=0)
+        creds = {
+            "model": "gpt-5.4",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:4311/v1",
+            "api_key": "***",
+            "api_mode": "codex_responses",
+        }
+        cfg = {
+            "child_api_keys": {
+                "enabled": True,
+                "admin_key": "sk-admin",
+            }
+        }
+        mock_post.return_value.status_code = 404
+
+        first = _issue_delegate_child_api_key(
+            cfg=cfg,
+            creds=creds,
+            task_index=0,
+            goal="run scout",
+            parent_agent=parent,
+        )
+        second = _issue_delegate_child_api_key(
+            cfg=cfg,
+            creds=creds,
+            task_index=1,
+            goal="run verifier",
+            parent_agent=parent,
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(mock_post.call_count, 1)
+
+    @patch("tools.delegate_tool.requests.post")
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_delegate_task_falls_back_to_parent_key_when_internal_keys_endpoint_is_unsupported(self, mock_creds, mock_cfg, mock_post):
+        delegate_tool_module.UNSUPPORTED_CHILD_KEY_ENDPOINT_URLS.clear()
         mock_cfg.return_value = {
             "max_iterations": 45,
             "model": "gpt-5.4",
