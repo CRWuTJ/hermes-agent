@@ -7739,23 +7739,33 @@ class GatewayRunner:
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
 
-            # Background review delivery — send "💾 Memory updated" etc. to user
-            def _bg_review_send(message: str) -> None:
-                if not _status_adapter:
-                    return
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            message,
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                    )
-                except Exception as _e:
-                    logger.debug("background_review_callback error: %s", _e)
+            # Background review delivery — optional gateway summary like
+            # "💾 Memory updated" after a turn. Default off in messaging UIs.
+            _bg_review_enabled_raw = user_config.get("display", {}).get("background_review_notifications", False)
+            if isinstance(_bg_review_enabled_raw, str):
+                _bg_review_enabled = _bg_review_enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                _bg_review_enabled = bool(_bg_review_enabled_raw)
 
-            agent.background_review_callback = _bg_review_send
+            if _bg_review_enabled:
+                def _bg_review_send(message: str) -> None:
+                    if not _status_adapter:
+                        return
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _status_adapter.send(
+                                _status_chat_id,
+                                message,
+                                metadata=_status_thread_metadata,
+                            ),
+                            _loop_for_step,
+                        )
+                    except Exception as _e:
+                        logger.debug("background_review_callback error: %s", _e)
+
+                agent.background_review_callback = _bg_review_send
+            else:
+                agent.background_review_callback = None
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
