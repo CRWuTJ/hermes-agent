@@ -6,6 +6,29 @@ This ledger is the boundary for splitting the current dirty workspace into separ
 
 ## Latest Completion Evidence
 
+Recorded on 2026-04-25 after the split stack was activated on the live Telegram gateway.
+
+Completed slice:
+
+- Safe live activation rechecked the quiet window and moved the gateway from PID `2876419` to PID `2939282`.
+- Post-activation probe reports `code_stale=false`, `unit_definition_current=true`, `service_definition_stale=false`, and no active or queued tasks.
+- The user confirmed Telegram private-chat send/receive worked after activation.
+- Verified the configured main model with a real `gpt-5.5` request through `auto -> gpt-mainline-codex-local -> CodexAuxiliaryClient`; the response was `hermes-live-5.5-ok`.
+- Verified detached conversation worker behavior with the runtime smoke: the gateway conversation worker and nested background unit both ran under `hermes-worker.slice`, wrote a result artifact, and completed successfully.
+- Confirmed the pending live reload watcher now exits cleanly when the gateway is already fresh.
+
+Verification evidence:
+
+- `pytest tests/agent/test_auxiliary_client.py tests/hermes_cli/test_codex_models.py tests/test_codex_oauth_adapter.py tests/test_litellm_control_config.py -q -o addopts=` passed with `138 passed`.
+- `pytest tests/gateway/test_conversation_worker.py tests/tools/test_detached_runtime.py tests/tools/test_browser_detached_runtime.py tests/tools/test_rl_training_detached_runtime.py -q -o addopts=` passed with `34 passed`.
+- `pytest tests/test_gateway_pending_live_reload.py tests/gateway/test_live_activation.py tests/hermes_cli/test_gateway_runtime_health.py tests/hermes_cli/test_gateway_service.py -q -o addopts=` passed with `85 passed`.
+- `scripts/gateway_pending_live_reload.py` reported `gateway already fresh; nothing to do` after activation.
+- `hermes-gateway.service` remained running as PID `2939282`, started at `Sat 2026-04-25 02:28:04 CST`.
+
+Commit boundaries for this slice:
+
+- Documentation evidence only. No behavior code changed in this ledger update.
+
 Recorded on 2026-04-24 after the safe live-activation pass.
 
 Completed slice:
