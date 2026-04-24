@@ -54,6 +54,7 @@ from gateway.task_control import (
     queued_task_iso as shared_queued_task_iso,
     queued_task_payload as shared_queued_task_payload,
     queued_task_recovery_plan,
+    record_harness_task_action,
     queued_task_source_label as shared_queued_task_source_label,
 )
 
@@ -440,7 +441,7 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server", include_default_mcp_servers=False))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -1988,6 +1989,28 @@ class APIServerAdapter(BasePlatformAdapter):
     def _queued_task_payload(self, envelope: Any, *, actions: Optional[List[str]] = None) -> Dict[str, Any]:
         return shared_queued_task_payload(envelope, actions=actions)
 
+    def _harness_task_snapshot(self, task_id: str) -> Optional[Dict[str, Any]]:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            return None
+        try:
+            from agent.harness import get_harness_manager
+
+            manager = get_harness_manager()
+            if not getattr(manager, "enabled", False):
+                return None
+            snapshot = manager.task_snapshot(task_id)
+            return dict(snapshot) if isinstance(snapshot, dict) else None
+        except Exception:
+            return None
+
+    def _attach_harness_task(self, task_payload: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(task_payload or {})
+        snapshot = self._harness_task_snapshot(payload.get("task_id"))
+        if snapshot is not None:
+            payload["harness"] = snapshot
+        return payload
+
     def _normalize_queued_task_payload(self, task_payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             from gateway.status import normalize_queued_tasks_payload
@@ -1995,7 +2018,7 @@ class APIServerAdapter(BasePlatformAdapter):
             normalized = normalize_queued_tasks_payload({"tasks": [task_payload]})
             tasks = normalized.get("tasks") if isinstance(normalized, dict) else None
             if isinstance(tasks, list) and tasks:
-                return dict(tasks[0])
+                return self._attach_harness_task(dict(tasks[0]))
         except Exception:
             pass
 
@@ -2007,9 +2030,9 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback["state"] = "queued"
             fallback["control_mode"] = "queued"
             fallback["actions"] = list(fallback.get("actions") or [])
-            return fallback
+            return self._attach_harness_task(fallback)
         except Exception:
-            return dict(task_payload)
+            return self._attach_harness_task(dict(task_payload))
 
     def _control_adapters(self) -> List[Any]:
         runner = getattr(self, "gateway_runner", None)
@@ -2038,7 +2061,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         for task in tasks:
             if isinstance(task, dict) and str(task.get("task_id") or "") == task_id:
-                return dict(task)
+                return self._attach_harness_task(dict(task))
         return None
 
     @staticmethod
@@ -2092,10 +2115,19 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from gateway.status import normalize_queued_tasks_payload
 
-            return normalize_queued_tasks_payload({"tasks": raw_tasks})
+            normalized = normalize_queued_tasks_payload({"tasks": raw_tasks})
+            tasks = normalized.get("tasks") if isinstance(normalized.get("tasks"), list) else []
+            normalized["tasks"] = [self._attach_harness_task(task) for task in tasks if isinstance(task, dict)]
+            next_task = normalized.get("next_task")
+            if isinstance(next_task, dict):
+                normalized["next_task"] = self._attach_harness_task(next_task)
+            oldest_waiting = normalized.get("oldest_waiting")
+            if isinstance(oldest_waiting, dict):
+                normalized["oldest_waiting"] = self._attach_harness_task(oldest_waiting)
+            return normalized
         except Exception:
             payload = self._empty_queued_tasks_payload()
-            payload["tasks"] = raw_tasks
+            payload["tasks"] = [self._attach_harness_task(task) for task in raw_tasks if isinstance(task, dict)]
             payload["queued_count"] = len(raw_tasks)
             if raw_tasks:
                 payload["next_task"] = self._normalize_queued_task_payload(raw_tasks[0])
@@ -2120,9 +2152,16 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from gateway.status import normalize_live_tasks_payload
 
-            return normalize_live_tasks_payload(live_tasks)
+            normalized = normalize_live_tasks_payload(live_tasks)
         except Exception:
-            return self._empty_live_tasks_payload()
+            normalized = self._empty_live_tasks_payload()
+
+        tasks = normalized.get("tasks") if isinstance(normalized.get("tasks"), list) else []
+        normalized["tasks"] = [self._attach_harness_task(task) for task in tasks if isinstance(task, dict)]
+        oldest_running = normalized.get("oldest_running")
+        if isinstance(oldest_running, dict):
+            normalized["oldest_running"] = self._attach_harness_task(oldest_running)
+        return normalized
 
     def _tasks_payload(self, runtime_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return build_gateway_tasks_payload(
@@ -2285,6 +2324,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 task_payload = self._normalize_queued_task_payload(
                     self._queued_task_payload(envelope, actions=self._queued_task_actions(candidate))
                 )
+                record_harness_task_action(
+                    task_id=task_id,
+                    action="foreground",
+                    status=status,
+                    surface="api",
+                    session_key=str(getattr(queued_task, "session_key", "") or ""),
+                    task_context=envelope,
+                )
                 return web.json_response(
                     self._task_action_payload(
                         task_id=task_id,
@@ -2350,6 +2397,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 task_payload = self._normalize_queued_task_payload(
                     self._queued_task_payload(updated, actions=self._queued_task_actions(candidate))
+                )
+                record_harness_task_action(
+                    task_id=task_id,
+                    action="reprioritize",
+                    status="reprioritized",
+                    surface="api",
+                    session_key=str(getattr(queued_task, "session_key", "") or ""),
+                    target_bucket=bucket,
+                    task_context=updated,
                 )
                 return web.json_response(
                     self._task_action_payload(
@@ -2429,6 +2485,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     task_payload = self._normalize_queued_task_payload(
                         self._queued_task_payload(updated, actions=self._queued_task_actions(candidate))
                     )
+                    record_harness_task_action(
+                        task_id=task_id,
+                        action="recover",
+                        status="recovered",
+                        surface="api",
+                        session_key=str(getattr(queued_task, "session_key", "") or ""),
+                        target_bucket=target_bucket,
+                        task_context=updated,
+                        metadata={"recovery_action": "reprioritize"},
+                    )
                     return web.json_response(
                         self._task_action_payload(
                             task_id=task_id,
@@ -2462,11 +2528,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 task_payload = self._normalize_queued_task_payload(
                     self._queued_task_payload(envelope, actions=self._queued_task_actions(candidate))
                 )
+                action_status = disposition if disposition in {"started", "queued_next"} else "started"
+                record_harness_task_action(
+                    task_id=task_id,
+                    action="recover",
+                    status=action_status,
+                    surface="api",
+                    session_key=str(getattr(queued_task, "session_key", "") or ""),
+                    task_context=envelope,
+                    metadata={"recovery_action": "foreground"},
+                )
                 return web.json_response(
                     self._task_action_payload(
                         task_id=task_id,
                         action="recover",
-                        status=(disposition if disposition in {"started", "queued_next"} else "started"),
+                        status=action_status,
                         task=task_payload,
                     )
                 )
@@ -2525,6 +2601,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 task_payload = self._normalize_queued_task_payload(
                     self._queued_task_payload(removed, actions=self._queued_task_actions(candidate))
+                )
+                record_harness_task_action(
+                    task_id=task_id,
+                    action="cancel",
+                    status="cancelled",
+                    surface="api",
+                    session_key=str(getattr(queued_task, "session_key", "") or ""),
+                    task_context=removed,
                 )
                 return web.json_response(
                     self._task_action_payload(

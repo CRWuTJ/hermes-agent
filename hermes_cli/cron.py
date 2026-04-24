@@ -13,7 +13,16 @@ from typing import Iterable, List, Optional
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from gateway import status as gateway_status
 from hermes_cli.colors import Colors, color
+
+
+
+def _describe_job_lane(job: dict) -> str:
+    from cron.jobs import describe_job_lane
+
+    return describe_job_lane(job)
+
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
@@ -40,9 +49,10 @@ def _cron_api(**kwargs):
 
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
-    from cron.jobs import list_jobs
+    from cron.jobs import get_due_jobs, list_jobs, summarize_job_lanes
 
     jobs = list_jobs(include_disabled=show_all)
+    lane_summary = summarize_job_lanes(jobs, due_jobs=get_due_jobs())
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -53,6 +63,9 @@ def cron_list(show_all: bool = False):
     print(color("┌─────────────────────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│                         Scheduled Jobs                                  │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
+    print()
+    print(f"  Active lanes: {gateway_status.format_status_lane_counts(lane_summary['active'])}")
+    print(f"  Due now:      {gateway_status.format_status_lane_counts(lane_summary['due'])}")
     print()
 
     for job in jobs:
@@ -88,6 +101,7 @@ def cron_list(show_all: bool = False):
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+        print(f"    Lane:      {_describe_job_lane(job)}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
@@ -126,7 +140,7 @@ def cron_tick():
 
 def cron_status():
     """Show cron execution status."""
-    from cron.jobs import list_jobs
+    from cron.jobs import get_due_jobs, list_jobs, summarize_job_lanes
     from hermes_cli.gateway import find_gateway_pids
 
     print()
@@ -148,7 +162,10 @@ def cron_status():
     jobs = list_jobs(include_disabled=False)
     if jobs:
         next_runs = [j.get("next_run_at") for j in jobs if j.get("next_run_at")]
+        lane_summary = summarize_job_lanes(jobs, due_jobs=get_due_jobs())
         print(f"  {len(jobs)} active job(s)")
+        print(f"  Active lanes: {gateway_status.format_status_lane_counts(lane_summary['active'])}")
+        print(f"  Due now:      {gateway_status.format_status_lane_counts(lane_summary['due'])}")
         if next_runs:
             print(f"  Next run: {min(next_runs)}")
     else:
@@ -167,6 +184,7 @@ def cron_create(args):
         repeat=getattr(args, "repeat", None),
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
+        lane=getattr(args, "lane", None),
         script=getattr(args, "script", None),
     )
     if not result.get("success"):
@@ -178,6 +196,7 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     job_data = result.get("job", {})
+    print(f"  Lane: {_describe_job_lane(job_data)}")
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
     print(f"  Next run: {result['next_run_at']}")
@@ -208,6 +227,10 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    lane_update = getattr(args, "lane", None)
+    if getattr(args, "clear_lane", False):
+        lane_update = ""
+
     result = _cron_api(
         action="update",
         job_id=args.job_id,
@@ -217,6 +240,7 @@ def cron_edit(args):
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
+        lane=lane_update,
         script=getattr(args, "script", None),
     )
     if not result.get("success"):
@@ -227,6 +251,7 @@ def cron_edit(args):
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))
     print(f"  Name: {updated['name']}")
     print(f"  Schedule: {updated['schedule']}")
+    print(f"  Lane: {_describe_job_lane(updated)}")
     if updated.get("skills"):
         print(f"  Skills: {', '.join(updated['skills'])}")
     else:

@@ -35,6 +35,28 @@ SAMPLE_JOB = {
 }
 
 VALID_JOB_ID = "aabbccddeeff"
+EXPECTED_LANE_CAPABILITIES = {
+    "lane_values": ["interactive", "cron_scout", "housekeeping"],
+    "lane_labels": {
+        "interactive": "interactive",
+        "cron_scout": "cron/scout",
+        "housekeeping": "housekeeping",
+    },
+    "default_lane_by_deliver": {
+        "local": "cron_scout",
+        "non_local": "interactive",
+    },
+    "clear_lane_values": [None, ""],
+}
+
+
+def _expected_job(job: dict) -> dict:
+    payload = dict(job)
+    explicit_lane = payload.get("lane")
+    payload["lane"] = explicit_lane
+    payload["effective_lane"] = explicit_lane or ("interactive" if payload.get("deliver") != "local" else "cron_scout")
+    payload["lane_source"] = "explicit" if explicit_lane else "default"
+    return payload
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -87,12 +109,28 @@ class TestListJobs:
                 APIServerAdapter, "_CRON_AVAILABLE", True
             ), patch.object(
                 APIServerAdapter, "_cron_list", return_value=[SAMPLE_JOB]
+            ), patch.object(
+                APIServerAdapter, "_cron_get_due", return_value=[]
+            ), patch.object(
+                APIServerAdapter,
+                "_cron_summarize_lanes",
+                return_value={
+                    "active": {"interactive": 0, "cron_scout": 1, "housekeeping": 0},
+                    "due": {"interactive": 0, "cron_scout": 0, "housekeeping": 0},
+                },
             ):
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 200
                 data = await resp.json()
                 assert "jobs" in data
-                assert data["jobs"] == [SAMPLE_JOB]
+                assert data["jobs"] == [_expected_job(SAMPLE_JOB)]
+                assert data["summary"] == {
+                    "active_jobs": 1,
+                    "total_jobs": 1,
+                    "lane_counts": {"interactive": 0, "cron_scout": 1, "housekeeping": 0},
+                    "due_now": {"interactive": 0, "cron_scout": 0, "housekeeping": 0},
+                }
+                assert data["capabilities"] == EXPECTED_LANE_CAPABILITIES
 
     # -------------------------------------------------------------------
     # 2. test_list_jobs_include_disabled
@@ -108,6 +146,15 @@ class TestListJobs:
                 APIServerAdapter, "_CRON_AVAILABLE", True
             ), patch.object(
                 APIServerAdapter, "_cron_list", mock_list
+            ), patch.object(
+                APIServerAdapter, "_cron_get_due", return_value=[]
+            ), patch.object(
+                APIServerAdapter,
+                "_cron_summarize_lanes",
+                return_value={
+                    "active": {"interactive": 0, "cron_scout": 1, "housekeeping": 0},
+                    "due": {"interactive": 0, "cron_scout": 0, "housekeeping": 0},
+                },
             ):
                 resp = await cli.get("/api/jobs?include_disabled=true")
                 assert resp.status == 200
@@ -123,10 +170,73 @@ class TestListJobs:
                 APIServerAdapter, "_CRON_AVAILABLE", True
             ), patch.object(
                 APIServerAdapter, "_cron_list", mock_list
+            ), patch.object(
+                APIServerAdapter, "_cron_get_due", return_value=[]
+            ), patch.object(
+                APIServerAdapter,
+                "_cron_summarize_lanes",
+                return_value={
+                    "active": {"interactive": 0, "cron_scout": 0, "housekeeping": 0},
+                    "due": {"interactive": 0, "cron_scout": 0, "housekeeping": 0},
+                },
             ):
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 200
                 mock_list.assert_called_once_with(include_disabled=False)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_reports_explicit_lane_metadata(self, adapter):
+        """Explicit lane should survive in the per-job payload without client-side inference."""
+        app = _create_app(adapter)
+        explicit_job = {**SAMPLE_JOB, "lane": "housekeeping"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True), patch.object(
+                APIServerAdapter, "_cron_list", return_value=[explicit_job]
+            ), patch.object(
+                APIServerAdapter, "_cron_get_due", return_value=[explicit_job]
+            ), patch.object(
+                APIServerAdapter,
+                "_cron_summarize_lanes",
+                return_value={
+                    "active": {"interactive": 0, "cron_scout": 0, "housekeeping": 1},
+                    "due": {"interactive": 0, "cron_scout": 0, "housekeeping": 1},
+                },
+            ):
+                resp = await cli.get("/api/jobs")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["jobs"] == [_expected_job(explicit_job)]
+                assert data["jobs"][0]["effective_lane"] == "housekeeping"
+                assert data["jobs"][0]["lane_source"] == "explicit"
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_uses_shared_job_presenter(self, adapter):
+        """GET /api/jobs should delegate per-job lane metadata to the shared presenter."""
+        app = _create_app(adapter)
+        presented_job = {
+            **SAMPLE_JOB,
+            "effective_lane": "shared-lane",
+            "lane_source": "shared-source",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True), patch.object(
+                APIServerAdapter, "_cron_list", return_value=[SAMPLE_JOB]
+            ), patch.object(
+                APIServerAdapter, "_cron_get_due", return_value=[]
+            ), patch.object(
+                APIServerAdapter,
+                "_cron_summarize_lanes",
+                return_value={
+                    "active": {"interactive": 0, "cron_scout": 1, "housekeeping": 0},
+                    "due": {"interactive": 0, "cron_scout": 0, "housekeeping": 0},
+                },
+            ), patch.object(
+                APIServerAdapter, "_cron_present_job", return_value=presented_job
+            ):
+                resp = await cli.get("/api/jobs")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["jobs"] == [presented_job]
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +262,51 @@ class TestCreateJob:
                 })
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == SAMPLE_JOB
+                assert data["job"] == _expected_job(SAMPLE_JOB)
                 mock_create.assert_called_once()
                 call_kwargs = mock_create.call_args[1]
                 assert call_kwargs["name"] == "test-job"
                 assert call_kwargs["schedule"] == "*/5 * * * *"
                 assert call_kwargs["prompt"] == "do something"
+
+    @pytest.mark.asyncio
+    async def test_create_job_accepts_explicit_lane(self, adapter):
+        """POST /api/jobs should pass lane through and expose explicit lane metadata."""
+        app = _create_app(adapter)
+        created_job = {**SAMPLE_JOB, "lane": "housekeeping"}
+        mock_create = MagicMock(return_value=created_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                APIServerAdapter, "_CRON_AVAILABLE", True
+            ), patch.object(
+                APIServerAdapter, "_cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "lane": "housekeeping",
+                })
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["job"] == _expected_job(created_job)
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["lane"] == "housekeeping"
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_invalid_lane(self, adapter):
+        """POST /api/jobs with an invalid lane returns 400 instead of bubbling a server error."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "lane": "fastlane",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "lane" in data["error"].lower()
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
@@ -250,7 +399,7 @@ class TestGetJob:
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == SAMPLE_JOB
+                assert data["job"] == _expected_job(SAMPLE_JOB)
                 mock_get.assert_called_once_with(VALID_JOB_ID)
 
     @pytest.mark.asyncio
@@ -302,13 +451,49 @@ class TestUpdateJob:
                 )
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == updated_job
+                assert data["job"] == _expected_job(updated_job)
                 mock_update.assert_called_once()
                 call_args = mock_update.call_args
                 assert call_args[0][0] == VALID_JOB_ID
                 sanitized = call_args[0][1]
                 assert "name" in sanitized
                 assert "schedule" in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_job_accepts_explicit_lane(self, adapter):
+        """PATCH /api/jobs/{id} should whitelist lane and return explicit lane metadata."""
+        app = _create_app(adapter)
+        updated_job = {**SAMPLE_JOB, "lane": "interactive"}
+        mock_update = MagicMock(return_value=updated_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                APIServerAdapter, "_CRON_AVAILABLE", True
+            ), patch.object(
+                APIServerAdapter, "_cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"lane": "interactive"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["job"] == _expected_job(updated_job)
+                sanitized = mock_update.call_args[0][1]
+                assert sanitized["lane"] == "interactive"
+
+    @pytest.mark.asyncio
+    async def test_update_job_rejects_invalid_lane(self, adapter):
+        """PATCH /api/jobs/{id} with an invalid lane returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"lane": "fastlane"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "lane" in data["error"].lower()
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
@@ -409,7 +594,7 @@ class TestPauseJob:
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == paused_job
+                assert data["job"] == _expected_job(paused_job)
                 assert data["job"]["enabled"] is False
                 mock_pause.assert_called_once_with(VALID_JOB_ID)
 
@@ -434,7 +619,7 @@ class TestResumeJob:
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/resume")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == resumed_job
+                assert data["job"] == _expected_job(resumed_job)
                 assert data["job"]["enabled"] is True
                 mock_resume.assert_called_once_with(VALID_JOB_ID)
 
@@ -459,7 +644,7 @@ class TestRunJob:
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == triggered_job
+                assert data["job"] == _expected_job(triggered_job)
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
 
 
@@ -530,6 +715,18 @@ class TestAuthRequired:
 
 class TestCronUnavailable:
     @pytest.mark.asyncio
+    async def test_list_internal_error_returns_json_500(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(APIServerAdapter, "_CRON_AVAILABLE", True), patch.object(
+                APIServerAdapter, "_cron_list", staticmethod(lambda include_disabled=False: (_ for _ in ()).throw(RuntimeError("list exploded")))
+            ):
+                resp = await cli.get("/api/jobs")
+                assert resp.status == 500
+                data = await resp.json()
+                assert data == {"error": "list exploded"}
+
+    @pytest.mark.asyncio
     async def test_cron_unavailable_list(self, adapter):
         """GET /api/jobs returns 501 when _CRON_AVAILABLE is False."""
         app = _create_app(adapter)
@@ -557,7 +754,7 @@ class TestCronUnavailable:
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == SAMPLE_JOB
+                assert data["job"] == _expected_job(SAMPLE_JOB)
                 assert captured["job_id"] == VALID_JOB_ID
 
     @pytest.mark.asyncio
@@ -577,7 +774,7 @@ class TestCronUnavailable:
                 resp = await cli.get("/api/jobs?include_disabled=true")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["jobs"] == [SAMPLE_JOB]
+                assert data["jobs"] == [_expected_job(SAMPLE_JOB)]
                 assert captured["include_disabled"] is True
 
     @pytest.mark.asyncio
@@ -602,7 +799,7 @@ class TestCronUnavailable:
                 )
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == updated_job
+                assert data["job"] == _expected_job(updated_job)
                 assert captured["job_id"] == VALID_JOB_ID
                 assert captured["updates"] == {"name": "updated-name"}
 
@@ -616,6 +813,8 @@ class TestCronUnavailable:
                     "name": "test", "schedule": "* * * * *",
                 })
                 assert resp.status == 501
+                data = await resp.json()
+                assert data == {"error": "Cron module not available"}
 
     @pytest.mark.asyncio
     async def test_cron_unavailable_get(self, adapter):

@@ -1378,6 +1378,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                 ts_key for ts_key in sorted(new_enabled)
                 if (TOOL_CATEGORIES.get(ts_key) or TOOLSET_ENV_REQUIREMENTS.get(ts_key))
                 and ts_key not in auto_configured
+                and _toolset_needs_configuration_prompt(ts_key, config)
             ]
 
             if to_configure:

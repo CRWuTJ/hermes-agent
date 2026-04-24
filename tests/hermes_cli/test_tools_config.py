@@ -72,6 +72,24 @@ def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_sele
     assert "web-search-prime" in enabled
 
 
+
+
+def test_get_platform_tools_excludes_default_mcp_servers_when_requested():
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory"]},
+        "mcp_servers": {
+            "exa": {"url": "https://mcp.exa.ai/mcp"},
+            "web-search-prime": {"url": "https://api.z.ai/api/mcp/web_search_prime/mcp"},
+        },
+    }
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert "web" in enabled
+    assert "memory" in enabled
+    assert "exa" not in enabled
+    assert "web-search-prime" not in enabled
+
 def test_get_platform_tools_no_mcp_sentinel_excludes_all_mcp_servers():
     """The 'no_mcp' sentinel in platform_toolsets excludes all MCP servers."""
     config = {

@@ -593,6 +593,16 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_get_cron_enabled_toolsets_excludes_interactive_only_toolsets(self):
+        from cron.scheduler import _get_cron_enabled_toolsets
+
+        enabled = set(_get_cron_enabled_toolsets())
+
+        assert "web" in enabled
+        assert "terminal" in enabled
+        assert "cronjob" not in enabled
+        assert "clarify" not in enabled
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -616,7 +626,12 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent.run_conversation.return_value = {
+                "final_response": "ok",
+                "task_id": "cron-task-1",
+                "harness_state": "needs_acceptance",
+                "harness_plan_mode": "plan_required",
+            }
             mock_agent_cls.return_value = mock_agent
 
             success, output, final_response, error = run_job(job)
@@ -625,10 +640,17 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "ok"
         assert "ok" in output
+        assert "**Harness Task:** cron-task-1" in output
+        assert "**Harness State:** needs_acceptance" in output
+        assert "**Plan Mode:** plan_required" in output
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
+        assert kwargs["enabled_toolsets"] is not None
+        assert "web" in set(kwargs["enabled_toolsets"])
+        assert "cronjob" not in set(kwargs["enabled_toolsets"])
+        assert "clarify" not in set(kwargs["enabled_toolsets"])
         assert kwargs["session_id"].startswith("cron_test-job_")
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
@@ -878,7 +900,10 @@ class TestRunJobSkillBacked:
         assert final_response == "ok"
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert "cronjob" in (kwargs["disabled_toolsets"] or [])
+        enabled_toolsets = set(kwargs["enabled_toolsets"])
+        assert "web" in enabled_toolsets
+        assert "cronjob" not in enabled_toolsets
+        assert "clarify" not in enabled_toolsets
 
         prompt_arg = mock_agent.run_conversation.call_args.args[0]
         assert "blogwatcher" in prompt_arg

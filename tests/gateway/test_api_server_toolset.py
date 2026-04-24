@@ -86,7 +86,13 @@ class TestApiServerAdapterToolset:
                                         "command": None, "args": []}
             mock_model.return_value = "test/model"
             # No platform_toolsets override — should fall back to hermes-api-server default
-            mock_config.return_value = {}
+            # without auto-injecting enabled MCP server names.
+            mock_config.return_value = {
+                "mcp_servers": {
+                    "websearch": {"enabled": True},
+                    "exa": {"enabled": True},
+                }
+            }
             mock_agent_cls.return_value = MagicMock()
 
             adapter._create_agent()
@@ -96,6 +102,9 @@ class TestApiServerAdapterToolset:
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
+            assert "web" in toolsets
+            assert "websearch" not in toolsets
+            assert "exa" not in toolsets
             assert call_kwargs.kwargs.get("platform") == "api_server"
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
@@ -115,9 +124,14 @@ class TestApiServerAdapterToolset:
                                         "provider": None, "api_mode": None,
                                         "command": None, "args": []}
             mock_model.return_value = "test/model"
-            # User overrides with just web and terminal
+            # User overrides with just web and terminal; enabled MCP servers
+            # should still stay out unless explicitly listed for api_server.
             mock_config.return_value = {
-                "platform_toolsets": {"api_server": ["web", "terminal"]}
+                "platform_toolsets": {"api_server": ["web", "terminal"]},
+                "mcp_servers": {
+                    "websearch": {"enabled": True},
+                    "exa": {"enabled": True},
+                },
             }
             mock_agent_cls.return_value = MagicMock()
 

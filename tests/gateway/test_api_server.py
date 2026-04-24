@@ -1976,6 +1976,68 @@ class TestControlPlaneStatusEndpoint:
             "housekeeping": 1,
         }
 
+    @pytest.mark.asyncio
+    async def test_api_status_includes_harness_control_snapshots_when_available(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "bg-1",
+                        "lane": "cron_scout",
+                        "label": "background task",
+                        "kind": "background",
+                        "control_mode": "managed_runtime",
+                        "actions": ["cancel"],
+                        "source": "gateway",
+                        "started_at": "2026-04-19T12:00:01+00:00",
+                    }
+                ]
+            ),
+        )
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        fake_harness.task_snapshot.side_effect = lambda task_id: {
+            "task_id": task_id,
+            "state": "queued" if task_id == "task-hi" else "active",
+            "control": {
+                "latest_action": {
+                    "action": "reprioritize" if task_id == "task-hi" else "cancel",
+                    "status": "reprioritized" if task_id == "task-hi" else "cancellation_requested",
+                    "surface": "api",
+                    "target_bucket": "later" if task_id == "task-hi" else None,
+                    "created_at": "2026-04-21T18:20:00+00:00",
+                }
+            },
+        } if task_id in {"task-hi", "bg-1"} else None
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/status")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["queued_tasks"]["next_task"]["harness"]["control"]["latest_action"]["action"] == "reprioritize"
+        assert data["queued_tasks"]["tasks"][0]["harness"]["control"]["latest_action"]["target_bucket"] == "later"
+        assert data["live_tasks"]["oldest_running"]["harness"]["control"]["latest_action"]["action"] == "cancel"
+        assert data["live_tasks"]["tasks"][0]["harness"]["control"]["latest_action"]["status"] == "cancellation_requested"
+
 
 class TestTasksEndpoint:
     @pytest.mark.asyncio
@@ -2025,6 +2087,7 @@ class TestTasksEndpoint:
         assert queued["wait_age"] == "5m"
         assert queued["actions"] == ["foreground", "reprioritize", "cancel"]
         assert queued["source"] == "telegram"
+        assert "harness" not in queued
         live = data["live"]["tasks"][0]
         assert live["task_id"] == "turn-1"
         assert live["control_mode"] == "read_only"
@@ -2058,6 +2121,83 @@ class TestTasksEndpoint:
         assert data["task"]["wait_seconds"] == 300
         assert data["task"]["wait_age"] == "5m"
         assert data["task"]["actions"] == ["foreground", "reprioritize", "cancel"]
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_attach_harness_snapshot_when_available(self, adapter, monkeypatch):
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        fake_harness.task_snapshot.side_effect = lambda task_id: {
+            "task_id": task_id,
+            "state": "planning",
+            "surface": "gateway",
+        } if task_id == "task-hi" else None
+
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/tasks")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["queued"]["tasks"][0]["harness"] == {
+            "task_id": "task-hi",
+            "state": "planning",
+            "surface": "gateway",
+        }
+
+
+    @pytest.mark.asyncio
+    async def test_api_task_detail_includes_harness_control_summary_when_available(self, adapter, monkeypatch):
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        fake_harness.task_snapshot.side_effect = lambda task_id: {
+            "task_id": task_id,
+            "state": "queued",
+            "control": {
+                "latest_action": {
+                    "action": "reprioritize",
+                    "status": "reprioritized",
+                    "surface": "chat",
+                    "target_bucket": "later",
+                    "session_key": "telegram:user:123",
+                    "created_at": "2026-04-21T18:00:00+00:00",
+                }
+            },
+        } if task_id == "task-hi" else None
+
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/tasks/task-hi")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["task"]["harness"]["control"]["latest_action"]["action"] == "reprioritize"
+        assert data["task"]["harness"]["control"]["latest_action"]["target_bucket"] == "later"
 
     @pytest.mark.asyncio
     async def test_api_task_detail_returns_active_task(self, adapter, monkeypatch):
@@ -2128,6 +2268,37 @@ class TestTasksEndpoint:
         assert data["status"] == "started"
         assert data["message"] == "Foregrounded queued task task-hi — starting now."
         assert data["task"]["actions"] == ["foreground", "reprioritize", "cancel"]
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_foreground_records_harness_task_action(self, adapter, monkeypatch):
+        queued_task = _make_queued_task()
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock(return_value=("started", queued_task))
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-hi/foreground")
+            await resp.json()
+
+        assert resp.status == 200
+        call = fake_harness.record_task_action.call_args
+        assert call is not None
+        assert call.kwargs["task_id"] == "task-hi"
+        assert call.kwargs["action"] == "foreground"
+        assert call.kwargs["status"] == "started"
+        assert call.kwargs["surface"] == "api"
+        assert call.kwargs["session_key"] == "telegram:user:123"
 
     @pytest.mark.asyncio
     async def test_api_tasks_foreground_rejects_active_task(self, adapter, monkeypatch):
@@ -2268,6 +2439,44 @@ class TestTasksEndpoint:
         control_adapter.reprioritize_pending_task.assert_called_once_with("telegram:user:123", "task-stale", "next")
         assert data["task"]["priority"] == 50
         assert data["task"]["priority_bucket"] == "next"
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_recover_records_harness_task_action(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.task_control._queued_task_now",
+            lambda: datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc),
+        )
+        queued_task = _make_queued_task(task_id="task-stale", priority=80, lane="housekeeping")
+        queued_task.queued_at = datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc)
+        recovered_task = _make_queued_task(task_id="task-stale", priority=50, lane="housekeeping")
+        recovered_task.queued_at = queued_task.queued_at
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock(return_value=recovered_task)
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/tasks/task-stale/recover")
+            await resp.json()
+
+        assert resp.status == 200
+        call = fake_harness.record_task_action.call_args
+        assert call is not None
+        assert call.kwargs["task_id"] == "task-stale"
+        assert call.kwargs["action"] == "recover"
+        assert call.kwargs["status"] == "recovered"
+        assert call.kwargs["surface"] == "api"
+        assert call.kwargs["target_bucket"] == "next"
 
     @pytest.mark.asyncio
     async def test_api_tasks_recover_rejects_non_starving_queued_task(self, adapter, monkeypatch):

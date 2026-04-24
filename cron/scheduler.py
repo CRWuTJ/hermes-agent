@@ -62,6 +62,21 @@ _hermes_home = get_hermes_home()
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 
+_CRON_EXCLUDED_TOOLSETS = frozenset({"cronjob", "messaging", "clarify"})
+
+
+def _get_cron_enabled_toolsets() -> list[str]:
+    """Return the explicit cron tool view without all-tools semantics."""
+    from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_plugin_toolset_keys
+
+    enabled = {
+        ts_key
+        for ts_key, _, _ in CONFIGURABLE_TOOLSETS
+        if ts_key not in _CRON_EXCLUDED_TOOLSETS
+    }
+    enabled.update(ts for ts in _get_plugin_toolset_keys() if ts not in _CRON_EXCLUDED_TOOLSETS)
+    return sorted(enabled)
+
 
 def _resolve_tick_lock_path() -> Path:
     """Return the tick lock file, honoring test/runtime overrides."""
@@ -750,7 +765,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
-            disabled_toolsets=["cronjob", "messaging", "clarify"],
+            enabled_toolsets=_get_cron_enabled_toolsets(),
             quiet_mode=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
@@ -832,15 +847,26 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
 
         final_response = result.get("final_response", "") or ""
+        harness_task_id = str(result.get("task_id") or "").strip()
+        harness_state = str(result.get("harness_state") or "").strip()
+        harness_plan_mode = str(result.get("harness_plan_mode") or "").strip()
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+        harness_lines = []
+        if harness_task_id:
+            harness_lines.append(f"**Harness Task:** {harness_task_id}")
+        if harness_state:
+            harness_lines.append(f"**Harness State:** {harness_state}")
+        if harness_plan_mode:
+            harness_lines.append(f"**Plan Mode:** {harness_plan_mode}")
+        harness_block = ("\n" + "\n".join(harness_lines)) if harness_lines else ""
         
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
+**Schedule:** {job.get('schedule_display', 'N/A')}{harness_block}
 
 ## Prompt
 

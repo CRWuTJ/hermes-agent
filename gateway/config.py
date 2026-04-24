@@ -464,6 +464,21 @@ def load_gateway_config() -> GatewayConfig:
                         type(qc).__name__,
                     )
 
+            display_cfg = yaml_cfg.get("display")
+            if isinstance(display_cfg, dict):
+                _busy_input_mode = display_cfg.get("busy_input_mode")
+                if (
+                    _busy_input_mode is not None
+                    and "HERMES_BUSY_INPUT_MODE" not in os.environ
+                    and "HERMES_GATEWAY_BUSY_INPUT_MODE" not in os.environ
+                ):
+                    normalized = (
+                        "queue"
+                        if str(_busy_input_mode).strip().lower() == "queue"
+                        else "interrupt"
+                    )
+                    os.environ["HERMES_BUSY_INPUT_MODE"] = normalized
+
             stt_cfg = yaml_cfg.get("stt")
             if isinstance(stt_cfg, dict):
                 gw_data["stt"] = stt_cfg
