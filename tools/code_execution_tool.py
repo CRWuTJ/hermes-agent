@@ -32,7 +32,10 @@ import base64
 import json
 import logging
 import os
+from pathlib import Path
 import platform
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -859,6 +862,288 @@ def _execute_remote(
     return json.dumps(result, ensure_ascii=False)
 
 
+def _build_local_child_env(sock_path: str) -> Dict[str, str]:
+    """Build the sanitized child environment for local execute_code runs."""
+    _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
+                          "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
+                          "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
+    _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
+                          "PASSWD", "AUTH")
+    try:
+        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+    except Exception:
+        _is_passthrough = lambda _: False  # noqa: E731
+
+    child_env: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if _is_passthrough(k):
+            child_env[k] = v
+            continue
+        if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
+            continue
+        if any(k.startswith(p) for p in _SAFE_ENV_PREFIXES):
+            child_env[k] = v
+
+    child_env["HERMES_RPC_SOCKET"] = sock_path
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _existing_pp = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = _hermes_root + (os.pathsep + _existing_pp if _existing_pp else "")
+    _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
+    if _tz_name:
+        child_env["TZ"] = _tz_name
+    return child_env
+
+
+def _systemctl_show_properties(unit_name: str, *properties: str) -> Dict[str, str]:
+    from tools.detached_runtime import systemctl_show_properties as _shared_show_properties
+    return _shared_show_properties(unit_name, *properties)
+
+
+def _signal_detached_execute_code_unit(unit_name: str, signal_name: str) -> None:
+    from tools.detached_runtime import signal_unit as _shared_signal_unit
+    _shared_signal_unit(unit_name, signal_name)
+
+
+def _read_int_file(path_str: str) -> Optional[int]:
+    if not path_str:
+        return None
+    try:
+        raw = Path(path_str).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if raw and raw.lstrip("-").isdigit():
+        return int(raw)
+    return None
+
+
+def _read_text_file(path_str: str, *, max_chars: Optional[int] = None) -> str:
+    if not path_str:
+        return ""
+    try:
+        text = Path(path_str).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
+def _truncate_stdout_text(stdout_text: str) -> str:
+    if len(stdout_text) <= MAX_STDOUT_BYTES:
+        return stdout_text
+    head_bytes = int(MAX_STDOUT_BYTES * 0.4)
+    tail_bytes = MAX_STDOUT_BYTES - head_bytes
+    head = stdout_text[:head_bytes]
+    tail = stdout_text[-tail_bytes:]
+    omitted = len(stdout_text) - len(head) - len(tail)
+    return (
+        head
+        + f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted out of {len(stdout_text):,} total] ...\n\n"
+        + tail
+    )
+
+
+def _launch_detached_local_execute_code_process(*, tmpdir: str, child_env: Dict[str, str]) -> Dict[str, str]:
+    from tools.detached_runtime import launch_transient_unit
+
+    stdout_path = str(Path(tmpdir) / "stdout.log")
+    stderr_path = str(Path(tmpdir) / "stderr.log")
+    exit_code_path = str(Path(tmpdir) / "exit.code")
+
+    exports = " ".join(
+        f"export {key}={shlex.quote(value)};"
+        for key, value in child_env.items()
+        if value is not None
+    )
+    shell_script = (
+        "set -uo pipefail; "
+        f"cd {shlex.quote(tmpdir)}; "
+        f"{exports} "
+        f"{shlex.quote(sys.executable)} script.py > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "
+        f"status=$?; printf '%s' \"$status\" > {shlex.quote(exit_code_path)}; exit \"$status\""
+    )
+    unit_name = launch_transient_unit(
+        unit_prefix="hermes-exec",
+        cwd=tmpdir,
+        shell_script=shell_script,
+    )
+    return {
+        "unit_name": unit_name,
+        "stdout_path": stdout_path,
+        "stderr_path": stderr_path,
+        "exit_code_path": exit_code_path,
+    }
+
+
+def _execute_local_detached(
+    code: str,
+    task_id: Optional[str],
+    enabled_tools: Optional[List[str]],
+) -> str:
+    """Run local execute_code in a detached transient unit for live chats/origin."""
+    from tools.terminal_tool import _interrupt_event
+
+    _cfg = _load_config()
+    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
+    max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+
+    session_tools = set(enabled_tools) if enabled_tools else set()
+    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
+    if not sandbox_tools:
+        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+
+    tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
+    _sock_tmpdir = "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+    sock_path = os.path.join(_sock_tmpdir, f"hermes_rpc_{uuid.uuid4().hex}.sock")
+
+    tool_call_log: list = []
+    tool_call_counter = [0]
+    exec_start = time.monotonic()
+    server_sock = None
+    rpc_thread = None
+    launch_meta: Dict[str, str] = {}
+
+    try:
+        tools_src = generate_hermes_tools_module(list(sandbox_tools))
+        with open(os.path.join(tmpdir, "hermes_tools.py"), "w") as f:
+            f.write(tools_src)
+        with open(os.path.join(tmpdir, "script.py"), "w") as f:
+            f.write(code)
+
+        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_sock.bind(sock_path)
+        server_sock.listen(1)
+
+        rpc_thread = threading.Thread(
+            target=_rpc_server_loop,
+            args=(
+                server_sock, task_id, tool_call_log,
+                tool_call_counter, max_tool_calls, sandbox_tools,
+            ),
+            daemon=True,
+        )
+        rpc_thread.start()
+
+        child_env = _build_local_child_env(sock_path)
+        launch_meta = _launch_detached_local_execute_code_process(tmpdir=tmpdir, child_env=child_env)
+        unit_name = launch_meta["unit_name"]
+
+        status = "success"
+        deadline = time.monotonic() + timeout
+        while True:
+            if _interrupt_event.is_set():
+                _signal_detached_execute_code_unit(unit_name, "SIGTERM")
+                status = "interrupted"
+                break
+            if time.monotonic() > deadline:
+                _signal_detached_execute_code_unit(unit_name, "SIGKILL")
+                status = "timeout"
+                break
+
+            props = _systemctl_show_properties(unit_name, "ActiveState", "SubState")
+            if not props and Path(launch_meta["exit_code_path"]).exists():
+                break
+            active_state = (props.get("ActiveState") or "").strip()
+            sub_state = (props.get("SubState") or "").strip()
+            if sub_state in {"exited", "failed", "dead"} or active_state in {"inactive", "failed"}:
+                break
+            time.sleep(0.2)
+
+        if status in {"timeout", "interrupted"}:
+            settle_deadline = time.monotonic() + 3
+            while time.monotonic() < settle_deadline:
+                if Path(launch_meta["exit_code_path"]).exists():
+                    break
+                time.sleep(0.1)
+
+        stdout_text = _truncate_stdout_text(_read_text_file(launch_meta["stdout_path"]))
+        stderr_text = _read_text_file(launch_meta["stderr_path"], max_chars=MAX_STDERR_BYTES)
+        exit_code = _read_int_file(launch_meta["exit_code_path"])
+        if exit_code is None:
+            props = _systemctl_show_properties(unit_name, "ExecMainStatus")
+            raw_status = (props.get("ExecMainStatus") or "").strip()
+            if raw_status.lstrip("-").isdigit():
+                exit_code = int(raw_status)
+        if exit_code is None and status == "timeout":
+            exit_code = 124
+        elif exit_code is None and status == "interrupted":
+            exit_code = 130
+
+        duration = round(time.monotonic() - exec_start, 2)
+
+        if server_sock is not None:
+            server_sock.close()
+            server_sock = None
+        if rpc_thread is not None:
+            rpc_thread.join(timeout=3)
+            rpc_thread = None
+
+        from tools.ansi_strip import strip_ansi
+        stdout_text = strip_ansi(stdout_text)
+        stderr_text = strip_ansi(stderr_text)
+
+        from agent.redact import redact_sensitive_text
+        stdout_text = redact_sensitive_text(stdout_text)
+        stderr_text = redact_sensitive_text(stderr_text)
+
+        result: Dict[str, Any] = {
+            "status": status,
+            "output": stdout_text,
+            "tool_calls_made": tool_call_counter[0],
+            "duration_seconds": duration,
+            "detached": True,
+            "execution_mode": "detached_local_unit",
+            "unit_name": unit_name,
+        }
+
+        if status == "timeout":
+            result["error"] = f"Script timed out after {timeout}s and was killed."
+        elif status == "interrupted":
+            result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+        elif exit_code not in (None, 0):
+            result["status"] = "error"
+            result["error"] = stderr_text or f"Script exited with code {exit_code}"
+            if stderr_text:
+                result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
+
+        return json.dumps(result, ensure_ascii=False)
+
+    except Exception as exc:
+        duration = round(time.monotonic() - exec_start, 2)
+        logger.error(
+            "detached execute_code failed after %ss with %d tool calls: %s: %s",
+            duration,
+            tool_call_counter[0],
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return json.dumps({
+            "status": "error",
+            "error": str(exc),
+            "tool_calls_made": tool_call_counter[0],
+            "duration_seconds": duration,
+            "detached": True,
+            "execution_mode": "detached_local_unit",
+            "unit_name": launch_meta.get("unit_name", ""),
+        }, ensure_ascii=False)
+
+    finally:
+        if server_sock is not None:
+            try:
+                server_sock.close()
+            except OSError:
+                pass
+        if rpc_thread is not None:
+            rpc_thread.join(timeout=1)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -893,10 +1178,12 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config
+    from tools.terminal_tool import _get_env_config, _has_live_or_origin_messaging_context
     env_type = _get_env_config()["env_type"]
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
+    if _has_live_or_origin_messaging_context():
+        return _execute_local_detached(code, task_id, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -967,34 +1254,7 @@ def execute_code(
                               "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
         _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
                               "PASSWD", "AUTH")
-        try:
-            from tools.env_passthrough import is_env_passthrough as _is_passthrough
-        except Exception:
-            _is_passthrough = lambda _: False  # noqa: E731
-        child_env = {}
-        for k, v in os.environ.items():
-            # Passthrough vars (skill-declared or user-configured) always pass.
-            if _is_passthrough(k):
-                child_env[k] = v
-                continue
-            # Block vars with secret-like names.
-            if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
-                continue
-            # Allow vars with known safe prefixes.
-            if any(k.startswith(p) for p in _SAFE_ENV_PREFIXES):
-                child_env[k] = v
-        child_env["HERMES_RPC_SOCKET"] = sock_path
-        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        # Ensure the hermes-agent root is importable in the sandbox so
-        # repo-root modules are available to child scripts.
-        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _existing_pp = child_env.get("PYTHONPATH", "")
-        child_env["PYTHONPATH"] = _hermes_root + (os.pathsep + _existing_pp if _existing_pp else "")
-        # Inject user's configured timezone so datetime.now() in sandboxed
-        # code reflects the correct wall-clock time.
-        _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
-        if _tz_name:
-            child_env["TZ"] = _tz_name
+        child_env = _build_local_child_env(sock_path)
 
         proc = subprocess.Popen(
             [sys.executable, "script.py"],

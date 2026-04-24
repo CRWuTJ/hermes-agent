@@ -489,6 +489,30 @@ class TestKillProcess:
             registry._running.pop(s.id, None)
 
 
+class TestDetachedHostRegistration:
+    def test_register_detached_host_process_tracks_pid_and_paths(self, registry):
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.register_detached_host_process(
+                command="pytest tests/gateway/test_status.py -q",
+                pid=9876,
+                cwd="/tmp",
+                task_id="task-heavy-1",
+                session_key="chat-1",
+                log_path="/tmp/hermes-detached.log",
+                exit_code_path="/tmp/hermes-detached.exit",
+                unit_name="hermes-bg-123",
+            )
+
+        assert session.id.startswith("proc_")
+        assert session.pid == 9876
+        assert session.detached is True
+        assert session.pid_scope == "host"
+        assert session.log_path == "/tmp/hermes-detached.log"
+        assert session.exit_code_path == "/tmp/hermes-detached.exit"
+        assert session.unit_name == "hermes-bg-123"
+        assert registry.get(session.id) is session
+
+
 # =========================================================================
 # Tool handler
 # =========================================================================

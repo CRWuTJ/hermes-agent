@@ -771,6 +771,73 @@ class TestInterruptHandling(unittest.TestCase):
             t.join(timeout=3)
 
 
+class TestLiveDetachedExecuteCode(unittest.TestCase):
+    def test_live_local_execute_code_routes_to_detached_helper(self):
+        expected = {
+            "status": "success",
+            "output": "detached path",
+            "tool_calls_made": 0,
+            "duration_seconds": 0.01,
+            "detached": True,
+            "execution_mode": "detached_local_unit",
+            "unit_name": "hermes-exec-test",
+        }
+
+        with patch("tools.code_execution_tool._execute_local_detached", create=True, return_value=json.dumps(expected)) as mock_detached, \
+             patch("tools.code_execution_tool.subprocess.Popen", side_effect=AssertionError("inline Popen should not be used for live local execute_code")):
+            with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+                with patch("tools.terminal_tool._get_env_config", return_value={"env_type": "local"}):
+                    with patch.dict(os.environ, {"HERMES_SESSION_PLATFORM": "telegram"}, clear=False):
+                        result = json.loads(execute_code(
+                            code='print("hello detached")',
+                            task_id="test-task",
+                            enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                        ))
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["detached"])
+        self.assertEqual(result["execution_mode"], "detached_local_unit")
+        self.assertEqual(result["unit_name"], "hermes-exec-test")
+        mock_detached.assert_called_once()
+
+
+class TestDetachedExecuteCodeHelper(unittest.TestCase):
+    def test_detached_helper_treats_collected_unit_with_exit_file_as_finished(self):
+        import tempfile
+        import tools.code_execution_tool as code_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout_path = os.path.join(tmpdir, "stdout.log")
+            stderr_path = os.path.join(tmpdir, "stderr.log")
+            exit_path = os.path.join(tmpdir, "exit.code")
+            with open(stdout_path, "w", encoding="utf-8") as f:
+                f.write("collected unit ok\n")
+            with open(exit_path, "w", encoding="utf-8") as f:
+                f.write("0")
+
+            fake_socket = MagicMock()
+            fake_thread = MagicMock()
+            fake_interrupt = MagicMock()
+            fake_interrupt.is_set.return_value = False
+
+            with patch.object(code_mod, "_load_config", return_value={"timeout": 1, "max_tool_calls": 10}),                  patch.object(code_mod.tempfile, "mkdtemp", return_value=tmpdir),                  patch.object(code_mod, "generate_hermes_tools_module", return_value=""),                  patch.object(code_mod.socket, "socket", return_value=fake_socket),                  patch.object(code_mod.threading, "Thread", return_value=fake_thread),                  patch.object(code_mod, "_build_local_child_env", return_value={"PATH": "/usr/bin"}),                  patch.object(code_mod, "_launch_detached_local_execute_code_process", return_value={
+                     "unit_name": "hermes-exec-test",
+                     "stdout_path": stdout_path,
+                     "stderr_path": stderr_path,
+                     "exit_code_path": exit_path,
+                 }),                  patch.object(code_mod, "_systemctl_show_properties", return_value={}),                  patch.object(code_mod.time, "monotonic", side_effect=[0, 0, 0.1, 2, 2]),                  patch.object(code_mod.time, "sleep", return_value=None),                  patch("tools.terminal_tool._interrupt_event", fake_interrupt):
+                result = json.loads(code_mod._execute_local_detached(
+                    code='print("hello")',
+                    task_id="test-task",
+                    enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                ))
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["detached"])
+        self.assertEqual(result["unit_name"], "hermes-exec-test")
+        self.assertIn("collected unit ok", result["output"])
+
+
 class TestHeadTailTruncation(unittest.TestCase):
     """Tests for head+tail truncation of large stdout in execute_code."""
 

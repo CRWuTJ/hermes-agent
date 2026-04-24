@@ -278,16 +278,26 @@ class CopilotACPClient:
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
+        self._active_unit_name: str | None = None
         self._active_process_lock = threading.Lock()
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
+        unit_name: str | None
         with self._active_process_lock:
             proc = self._active_process
+            unit_name = self._active_unit_name
             self._active_process = None
+            self._active_unit_name = None
         self.is_closed = True
         if proc is None:
             return
+        if unit_name:
+            try:
+                from tools.detached_runtime import signal_unit
+                signal_unit(unit_name, 'TERM')
+            except Exception:
+                pass
         try:
             proc.terminate()
             proc.wait(timeout=2)
@@ -296,6 +306,44 @@ class CopilotACPClient:
                 proc.kill()
             except Exception:
                 pass
+
+    def _should_use_attached_worker_unit(self) -> bool:
+        try:
+            from tools.detached_runtime import transient_unit_launcher_available
+            from tools.terminal_tool import _has_live_or_origin_messaging_context
+        except Exception:
+            return False
+        if not _has_live_or_origin_messaging_context():
+            return False
+        return transient_unit_launcher_available()
+
+    def _spawn_prompt_process(self) -> tuple[subprocess.Popen[str], str | None]:
+        if self._should_use_attached_worker_unit():
+            from tools.detached_runtime import popen_transient_unit
+
+            proc, unit_name = popen_transient_unit(
+                unit_prefix='hermes-acp',
+                cwd=self._acp_cwd,
+                argv=[self._acp_command, *self._acp_args],
+            )
+            return proc, unit_name
+
+        try:
+            proc = subprocess.Popen(
+                [self._acp_command] + self._acp_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=self._acp_cwd,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start Copilot ACP command '{self._acp_command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+            ) from exc
+        return proc, None
 
     def _create_chat_completion(
         self,
@@ -342,21 +390,7 @@ class CopilotACPClient:
         )
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
-        try:
-            proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=self._acp_cwd,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
-            ) from exc
+        proc, unit_name = self._spawn_prompt_process()
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
@@ -365,6 +399,7 @@ class CopilotACPClient:
         self.is_closed = False
         with self._active_process_lock:
             self._active_process = proc
+            self._active_unit_name = unit_name
 
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)

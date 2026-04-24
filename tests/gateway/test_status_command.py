@@ -327,6 +327,120 @@ async def test_status_command_includes_global_queued_backlog_summary_when_availa
 
 
 @pytest.mark.asyncio
+async def test_status_command_surfaces_next_queued_recent_control_summary(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_task_count.return_value = 1
+    adapter.peek_pending_task.return_value = MessageTaskEnvelope(
+        task_id="task-now",
+        session_key=session_entry.session_key,
+        message_event=_make_event("now"),
+        priority=10,
+        lane="interactive",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+        queued_at=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    adapter.all_pending_tasks_snapshot.return_value = [adapter.peek_pending_task.return_value]
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.task_snapshot.side_effect = lambda task_id: {
+        "task_id": task_id,
+        "state": "queued",
+        "control": {
+            "latest_action": {
+                "action": "reprioritize",
+                "status": "reprioritized",
+                "surface": "chat",
+                "target_bucket": "later",
+                "created_at": "2026-04-21T18:00:00+00:00",
+            },
+            "latest_recovery": {
+                "action": "recover",
+                "status": "recovered",
+                "surface": "api",
+                "target_bucket": "next",
+                "created_at": "2026-04-21T17:55:00+00:00",
+            },
+        },
+    } if task_id == "task-now" else None
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch("gateway.task_control._queued_task_now", return_value=datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc)):
+        result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Next Queued Recent:** `reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00 ; recovery: recover · recovered · via api · next · 2026-04-21T17:55:00+00:00`" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_surfaces_longest_running_recent_control_summary(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.task_snapshot.side_effect = lambda task_id: {
+        "task_id": task_id,
+        "state": "active",
+        "control": {
+            "latest_action": {
+                "action": "cancel",
+                "status": "cancellation_requested",
+                "surface": "chat",
+                "created_at": "2026-04-21T18:10:00+00:00",
+            }
+        },
+    } if task_id == "bg-1" else None
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+    monkeypatch.setattr(
+        "gateway.run._current_live_task_status_payload",
+        lambda: {
+            "active_count": 1,
+            "lane_counts": {"interactive": 0, "cron_scout": 1, "housekeeping": 0},
+            "tasks": [
+                {
+                    "task_id": "bg-1",
+                    "lane": "cron_scout",
+                    "label": "background task",
+                    "source": "gateway",
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+            ],
+            "oldest_running": {
+                "task_id": "bg-1",
+                "lane": "cron_scout",
+                "label": "background task",
+                "source": "gateway",
+                "started_at": "2026-01-01T00:00:00+00:00",
+            },
+        },
+    )
+
+    with patch("gateway.task_control._queued_task_now", return_value=datetime(2026, 1, 1, 0, 5, 0, tzinfo=timezone.utc)):
+        result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Longest Running Recent:** `cancel · cancellation_requested · via chat · 2026-04-21T18:10:00+00:00`" in result
+
+
+@pytest.mark.asyncio
 async def test_status_command_uses_shared_status_activity_block_renderer():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
@@ -483,6 +597,240 @@ async def test_tasks_command_reports_session_queue_and_live_runtime_tasks():
     assert "**Active runtime tasks:** 1" in result
     assert "`bg-1` · cron/scout · background task · source=gateway" in result
     assert "↳ /task bg-1 · /task bg-1 cancel" in result
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_surfaces_recent_harness_control_summary(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_tasks_snapshot.return_value = [
+        MessageTaskEnvelope(
+            task_id="task-hi",
+            session_key=session_entry.session_key,
+            message_event=_make_event("high priority queued follow-up"),
+            priority=10,
+            lane="interactive",
+            reply_policy="status_only",
+            cancellation_policy="preserve",
+        ),
+    ]
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.task_snapshot.side_effect = lambda task_id: {
+        "task_id": task_id,
+        "state": "queued",
+        "control": {
+            "latest_action": {
+                "action": "reprioritize",
+                "status": "reprioritized",
+                "surface": "chat",
+                "target_bucket": "later",
+                "created_at": "2026-04-21T18:00:00+00:00",
+            },
+            "latest_recovery": {
+                "action": "recover",
+                "status": "recovered",
+                "surface": "api",
+                "target_bucket": "next",
+                "created_at": "2026-04-21T17:55:00+00:00",
+            },
+        },
+    } if task_id == "task-hi" else None
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch(
+        "gateway.run.task_lane_registry.status_snapshot",
+        return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []},
+    ):
+        result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "↳ recent: reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00" in result
+    assert "recover · recovered · via api · next · 2026-04-21T17:55:00+00:00" in result
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_appends_harness_visibility_digest(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_tasks_snapshot.return_value = []
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.visibility_digest.return_value = (
+        "Completed: model_chain: gpt 5.5 链路\n"
+        "Blocked: tool_limits: usage limit reached\n"
+        "Next: workspace_hygiene: 拆分脏工作区"
+    )
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch(
+        "gateway.run.task_lane_registry.status_snapshot",
+        return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []},
+    ):
+        result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Harness digest:**" in result
+    assert "Completed: model_chain: gpt 5.5 链路" in result
+    assert "Blocked: tool_limits: usage limit reached" in result
+    assert "Next: workspace_hygiene: 拆分脏工作区" in result
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_appends_harness_resume_digest(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_tasks_snapshot.return_value = []
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.visibility_digest.return_value = ""
+    fake_harness.budget_resume_digest.return_value = (
+        "Ready to resume: due-task · gpt-5.5 · usage limit reached"
+    )
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch(
+        "gateway.run.task_lane_registry.status_snapshot",
+        return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []},
+    ):
+        result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Harness resumes:**" in result
+    assert "Ready to resume: due-task · gpt-5.5" in result
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_appends_pending_live_activation_digest(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_tasks_snapshot.return_value = []
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.visibility_digest.return_value = ""
+    fake_harness.budget_resume_digest.return_value = ""
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+    monkeypatch.setattr(
+        "gateway.live_activation.render_live_activation_digest",
+        lambda: "Pending live activation: Hermes self-retrofit\nNo live restart has been performed.",
+    )
+
+    with patch(
+        "gateway.run.task_lane_registry.status_snapshot",
+        return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []},
+    ):
+        result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Live activation:**" in result
+    assert "Pending live activation: Hermes self-retrofit" in result
+    assert "No live restart has been performed." in result
+
+
+def test_gateway_budget_resume_once_records_due_harness_tasks(monkeypatch):
+    runner = SimpleNamespace()
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.list_budget_paused_tasks.return_value = [
+        {"task_id": "due-task", "model": "gpt-5.5", "reason": "usage limit reached"}
+    ]
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    from gateway.run import GatewayRunner
+
+    resumed = GatewayRunner._resume_due_budget_pauses_once(runner)
+
+    assert resumed == 1
+    fake_harness.list_budget_paused_tasks.assert_called_once_with(due_only=True, limit=20)
+    fake_harness.record_budget_resume.assert_called_once_with(
+        task_id="due-task",
+        status="queued",
+        metadata={"source": "gateway_budget_resume"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_budget_resume_once_dispatches_due_task_to_background_adapter(monkeypatch):
+    import asyncio
+
+    session_key = build_session_key(_make_source())
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="due-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=_make_source(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.session_store._entries = {session_key: session_entry}
+    runner.session_store._ensure_loaded = MagicMock()
+    runner.adapters[Platform.TELEGRAM].handle_message = AsyncMock()
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.list_budget_paused_tasks.return_value = [
+        {
+            "task_id": "due-session",
+            "session_id": "due-session",
+            "platform": "telegram",
+            "goal": "继续 Hermes 改造",
+            "model": "gpt-5.5",
+            "reason": "usage limit reached",
+        }
+    ]
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    from gateway.run import GatewayRunner
+
+    resumed = GatewayRunner._resume_due_budget_pauses_once(runner)
+    await asyncio.sleep(0.01)
+
+    assert resumed == 1
+    runner.adapters[Platform.TELEGRAM].handle_message.assert_awaited_once()
+    dispatched_event = runner.adapters[Platform.TELEGRAM].handle_message.await_args.args[0]
+    assert dispatched_event.source == session_entry.origin
+    assert dispatched_event.message_id == "harness-resume:due-session"
+    assert "Continue the paused task" in dispatched_event.text
+    assert "继续 Hermes 改造" in dispatched_event.text
 
 
 @pytest.mark.asyncio
@@ -701,6 +1049,64 @@ async def test_task_command_reports_queued_task_detail():
     assert "/task task-hi foreground" in result
     assert "/task task-hi cancel" in result
     assert "**Actions:** foreground, reprioritize, cancel" in result
+
+
+@pytest.mark.asyncio
+async def test_task_command_reports_harness_control_summary(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    queued_task = MessageTaskEnvelope(
+        task_id="task-hi",
+        session_key=session_entry.session_key,
+        message_event=_make_event("high priority queued follow-up"),
+        priority=10,
+        lane="background",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+        queued_at=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    adapter.pending_tasks_snapshot.return_value = [queued_task]
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.task_snapshot.side_effect = lambda task_id: {
+        "task_id": task_id,
+        "state": "queued",
+        "control": {
+            "latest_action": {
+                "action": "reprioritize",
+                "status": "reprioritized",
+                "surface": "chat",
+                "target_bucket": "later",
+                "session_key": "telegram:user:123",
+                "created_at": "2026-04-21T18:00:00+00:00",
+            },
+            "latest_recovery": {
+                "action": "recover",
+                "status": "recovered",
+                "surface": "api",
+                "target_bucket": "next",
+                "session_key": "telegram:user:123",
+                "created_at": "2026-04-21T17:55:00+00:00",
+            },
+        },
+    } if task_id == "task-hi" else None
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch("gateway.task_control._queued_task_now", return_value=datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc)), patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/task task-hi"))
+
+    assert "**Latest Control Action:** reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00" in result
+    assert "**Latest Recovery:** recover · recovered · via api · next · 2026-04-21T17:55:00+00:00" in result
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1423,60 @@ async def test_task_command_can_reprioritize_queued_task_to_later_bucket():
 
 
 @pytest.mark.asyncio
+async def test_task_command_reprioritize_records_harness_task_action(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    queued_task = MessageTaskEnvelope(
+        task_id="task-hi",
+        session_key=session_entry.session_key,
+        message_event=_make_event("high priority queued follow-up"),
+        priority=10,
+        lane="background",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+    )
+    reprioritized_task = MessageTaskEnvelope(
+        task_id="task-hi",
+        session_key=session_entry.session_key,
+        message_event=queued_task.message_event,
+        priority=80,
+        lane="background",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+    )
+    adapter.pending_tasks_snapshot.return_value = [queued_task]
+    adapter.reprioritize_pending_task.return_value = reprioritized_task
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    monkeypatch.setattr(
+        "agent.harness.get_harness_manager",
+        lambda *args, **kwargs: fake_harness,
+    )
+
+    with patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/task task-hi later"))
+
+    assert "Moved queued task `task-hi` to later priority." in result
+    call = fake_harness.record_task_action.call_args
+    assert call is not None
+    assert call.kwargs["task_id"] == "task-hi"
+    assert call.kwargs["action"] == "reprioritize"
+    assert call.kwargs["status"] == "reprioritized"
+    assert call.kwargs["surface"] == "chat"
+    assert call.kwargs["target_bucket"] == "later"
+
+
+@pytest.mark.asyncio
 async def test_task_command_accepts_longform_reprioritize_action():
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
@@ -1131,6 +1591,62 @@ async def test_task_command_can_recover_starving_queued_task_via_shortcut():
     adapter.reprioritize_pending_task.assert_called_once_with(session_entry.session_key, "task-stale", "next")
     assert "Recovered queued task `task-stale`" in result
     assert "moved it to next priority" in result
+
+
+@pytest.mark.asyncio
+async def test_task_command_recover_records_harness_task_action(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    queued_task = MessageTaskEnvelope(
+        task_id="task-stale",
+        session_key=session_entry.session_key,
+        message_event=_make_event("stale queued follow-up"),
+        priority=80,
+        lane="housekeeping",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+        queued_at=datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    recovered_task = MessageTaskEnvelope(
+        task_id="task-stale",
+        session_key=session_entry.session_key,
+        message_event=queued_task.message_event,
+        priority=50,
+        lane="housekeeping",
+        reply_policy="status_only",
+        cancellation_policy="preserve",
+        queued_at=queued_task.queued_at,
+    )
+    adapter.pending_tasks_snapshot.return_value = [queued_task]
+    adapter.reprioritize_pending_task.return_value = recovered_task
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    monkeypatch.setattr(
+        "agent.harness.get_harness_manager",
+        lambda *args, **kwargs: fake_harness,
+    )
+
+    with patch("gateway.task_control._queued_task_now", return_value=datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc)), patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/task task-stale recover"))
+
+    assert "Recovered queued task `task-stale`" in result
+    call = fake_harness.record_task_action.call_args
+    assert call is not None
+    assert call.kwargs["task_id"] == "task-stale"
+    assert call.kwargs["action"] == "recover"
+    assert call.kwargs["status"] == "recovered"
+    assert call.kwargs["surface"] == "chat"
+    assert call.kwargs["target_bucket"] == "next"
 
 
 @pytest.mark.asyncio

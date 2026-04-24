@@ -40,7 +40,9 @@ import time
 import threading
 import atexit
 import shutil
+import shlex
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -162,6 +164,85 @@ _LIVE_GATEWAY_SERVICE_CONTROL_PATTERNS = (
     re.compile(r'\b(?:python\s+-m\s+hermes_cli\.main|hermes)\s+gateway\s+(?:start|stop|restart|install|uninstall|repair)\b', re.IGNORECASE),
 )
 
+_HEAVY_BACKGROUND_COMMAND_PATTERNS = (
+    re.compile(r'(^|[;&(|\s])(?:pytest|python3?\s+-m\s+pytest|uv\s+run\s+pytest)\b', re.IGNORECASE),
+    re.compile(r'@zhafron/mcp-web-search|(^|[;&(|\s])mcp-web-search\b', re.IGNORECASE),
+)
+
+
+def _has_live_or_origin_messaging_context() -> bool:
+    return bool(os.getenv("HERMES_SESSION_PLATFORM", "").strip()) or bool(
+        os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip()
+        and os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+    )
+
+
+def _is_heavy_background_command(command: str, *, background: bool, env_type: str) -> bool:
+    if not background or env_type != "local" or not command:
+        return False
+    if not _has_live_or_origin_messaging_context():
+        return False
+    normalized = str(command).strip()
+    return any(pattern.search(normalized) for pattern in _HEAVY_BACKGROUND_COMMAND_PATTERNS)
+
+
+def _launch_detached_heavy_background_process(
+    *,
+    command: str,
+    cwd: str,
+    task_id: str,
+    session_key: str,
+    notify_on_complete: bool,
+    check_interval: Optional[int],
+) -> Any:
+    from tools.process_registry import process_registry
+
+    from tools.detached_runtime import launch_transient_unit, wait_for_main_pid
+
+    hermes_home = os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
+    logs_dir = Path(hermes_home) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex[:12]
+    unit_name = f"hermes-bg-{token}"
+    log_path = logs_dir / f"background-{token}.log"
+    exit_code_path = logs_dir / f"background-{token}.exit"
+    effective_cwd = cwd or os.getcwd()
+    shell_script = (
+        "set -euo pipefail; "
+        f"mkdir -p {shlex.quote(str(logs_dir))}; "
+        f"cd {shlex.quote(effective_cwd)}; "
+        f"bash -lc {shlex.quote(command)} > {shlex.quote(str(log_path))} 2>&1; "
+        f"status=$?; printf '%s' \"$status\" > {shlex.quote(str(exit_code_path))}; exit \"$status\""
+    )
+    unit_name = launch_transient_unit(
+        unit_prefix="hermes-bg",
+        cwd=effective_cwd,
+        shell_script=shell_script,
+        extra_env={"HERMES_HOME": hermes_home},
+    )
+
+    pid = wait_for_main_pid(unit_name)
+    if not pid:
+        raise RuntimeError(f"Failed to resolve PID for detached heavy background unit {unit_name}")
+
+    proc_session = process_registry.register_detached_host_process(
+        command=command,
+        pid=pid,
+        cwd=effective_cwd,
+        task_id=task_id,
+        session_key=session_key,
+        log_path=str(log_path),
+        exit_code_path=str(exit_code_path),
+        unit_name=unit_name,
+    )
+    proc_session.notify_on_complete = bool(notify_on_complete)
+    proc_session.watcher_platform = os.getenv("HERMES_SESSION_PLATFORM", "")
+    proc_session.watcher_chat_id = os.getenv("HERMES_SESSION_CHAT_ID", "")
+    proc_session.watcher_thread_id = os.getenv("HERMES_SESSION_THREAD_ID", "")
+    proc_session.watcher_interval = int(check_interval or 0)
+    process_registry._write_checkpoint()
+    return proc_session
+
 
 def _validate_workdir(workdir: str) -> str | None:
     """Reject workdir values that don't look like a filesystem path.
@@ -195,12 +276,7 @@ def _block_live_gateway_service_control(command: str) -> str | None:
     if not command:
         return None
 
-    has_live_messaging_context = bool(os.getenv("HERMES_SESSION_PLATFORM", "").strip())
-    has_origin_delivery_context = bool(
-        os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip()
-        and os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
-    )
-    if not (has_live_messaging_context or has_origin_delivery_context):
+    if not _has_live_or_origin_messaging_context():
         return None
 
     normalized = str(command).strip()
@@ -1270,7 +1346,16 @@ def terminal_tool(
             session_key = get_current_session_key(default="")
             effective_cwd = workdir or cwd
             try:
-                if env_type == "local":
+                if _is_heavy_background_command(command, background=background, env_type=env_type):
+                    proc_session = _launch_detached_heavy_background_process(
+                        command=command,
+                        cwd=effective_cwd,
+                        task_id=effective_task_id,
+                        session_key=session_key,
+                        notify_on_complete=notify_on_complete,
+                        check_interval=check_interval,
+                    )
+                elif env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
@@ -1288,6 +1373,36 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
+                proc_session_detached = getattr(proc_session, "detached", False)
+                if not isinstance(proc_session_detached, bool):
+                    proc_session_detached = False
+                proc_session_unit_name = getattr(proc_session, "unit_name", "")
+                if not isinstance(proc_session_unit_name, str):
+                    proc_session_unit_name = ""
+
+                try:
+                    from agent.harness import get_harness_manager
+
+                    _harness = get_harness_manager()
+                    if getattr(_harness, "enabled", False):
+                        _harness.record_process_spawned(
+                            task_id=effective_task_id,
+                            process_session_id=proc_session.id,
+                            command=command,
+                            pid=proc_session.pid,
+                            session_key=session_key,
+                            metadata={
+                                "cwd": effective_cwd or "",
+                                "notify_on_complete": bool(notify_on_complete),
+                                "check_interval": int(check_interval or 0),
+                                "pty": bool(pty),
+                                "detached": proc_session_detached,
+                                "launcher": "systemd_transient" if proc_session_unit_name else "process_registry",
+                            },
+                        )
+                except Exception:
+                    pass
+
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,
@@ -1295,6 +1410,11 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                if proc_session_detached:
+                    result_data["detached"] = True
+                if proc_session_unit_name:
+                    result_data["launcher"] = "systemd_transient"
+                    result_data["unit_name"] = proc_session_unit_name
                 if approval_note:
                     result_data["approval"] = approval_note
 

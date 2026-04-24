@@ -57,6 +57,7 @@ import re
 import signal
 import subprocess
 import shutil
+import shlex
 import sys
 import tempfile
 import threading
@@ -823,6 +824,98 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _should_detach_local_browser_session(session_info: Dict[str, Any]) -> bool:
+    if not isinstance(session_info, dict) or session_info.get("cdp_url"):
+        return False
+    try:
+        from tools.detached_runtime import transient_unit_launcher_available
+        from tools.terminal_tool import _has_live_or_origin_messaging_context
+    except Exception:
+        return False
+    return _has_live_or_origin_messaging_context() and transient_unit_launcher_available()
+
+
+def _build_detached_browser_env(browser_env: Dict[str, str], task_socket_dir: str) -> Dict[str, str]:
+    allowed_exact = {
+        "PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR", "TMP",
+        "TEMP", "SHELL", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
+    }
+    allowed_prefixes = (
+        "LC_", "XDG_", "PLAYWRIGHT_", "NODE_", "NPM_", "PNPM_", "YARN_",
+        "HTTP_", "HTTPS_", "NO_", "SSL_",
+    )
+    child_env: Dict[str, str] = {}
+    for key, value in browser_env.items():
+        if not isinstance(value, str):
+            continue
+        if key in allowed_exact or any(key.startswith(prefix) for prefix in allowed_prefixes):
+            child_env[key] = value
+    child_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+    return child_env
+
+
+def _run_detached_local_browser_command(
+    *,
+    cmd_parts: List[str],
+    browser_env: Dict[str, str],
+    task_socket_dir: str,
+    stdout_path: str,
+    stderr_path: str,
+    timeout: int,
+) -> Dict[str, Any]:
+    from tools.detached_runtime import launch_transient_unit, signal_unit, systemctl_show_properties
+    from tools.interrupt import is_interrupted
+
+    import uuid
+
+    exit_path = os.path.join(task_socket_dir, f"_exit_detached_{uuid.uuid4().hex}")
+    quoted_cmd = " ".join(shlex.quote(part) for part in cmd_parts)
+    script = (
+        f"{quoted_cmd} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "
+        f"rc=$?; echo -n \"$rc\" > {shlex.quote(exit_path)}"
+    )
+    unit_name = launch_transient_unit(
+        unit_prefix="hermes-browser",
+        cwd=os.getcwd(),
+        shell_script=script,
+        extra_env=_build_detached_browser_env(browser_env, task_socket_dir),
+        extra_properties=["ExitType=cgroup"],
+    )
+
+    deadline = time.time() + max(int(timeout or 0), 1)
+    while time.time() < deadline:
+        if is_interrupted():
+            signal_unit(unit_name, "TERM")
+            time.sleep(0.2)
+            signal_unit(unit_name, "KILL")
+            return {"success": False, "error": "Interrupted", "unit_name": unit_name}
+        if os.path.exists(exit_path):
+            break
+        time.sleep(0.1)
+    else:
+        signal_unit(unit_name, "TERM")
+        time.sleep(0.2)
+        signal_unit(unit_name, "KILL")
+        return {
+            "success": False,
+            "error": f"Command timed out after {timeout} seconds",
+            "unit_name": unit_name,
+        }
+
+    exit_code_text = ""
+    try:
+        exit_code_text = Path(exit_path).read_text().strip()
+    except OSError:
+        pass
+    if not exit_code_text:
+        exit_code_text = (systemctl_show_properties(unit_name, "ExecMainStatus").get("ExecMainStatus") or "").strip()
+    try:
+        exit_code = int(exit_code_text)
+    except (TypeError, ValueError):
+        exit_code = 1
+    return {"success": True, "returncode": exit_code, "unit_name": unit_name}
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -930,31 +1023,44 @@ def _run_browser_command(
         stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            proc = subprocess.Popen(
-                cmd_parts,
-                stdout=stdout_fd,
-                stderr=stderr_fd,
-                stdin=subprocess.DEVNULL,
-                env=browser_env,
-            )
+            if _should_detach_local_browser_session(session_info):
+                run_meta = _run_detached_local_browser_command(
+                    cmd_parts=cmd_parts,
+                    browser_env=browser_env,
+                    task_socket_dir=task_socket_dir,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout=timeout,
+                )
+                if not run_meta.get("success"):
+                    logger.warning("browser '%s' detached run failed: %s", command, run_meta.get("error", "unknown error"))
+                    return {"success": False, "error": str(run_meta.get("error", "Detached browser command failed"))}
+                returncode = int(run_meta.get("returncode", 1))
+            else:
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=stdout_fd,
+                    stderr=stderr_fd,
+                    stdin=subprocess.DEVNULL,
+                    env=browser_env,
+                )
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
+                                   command, timeout, task_id, task_socket_dir)
+                    return {"success": False, "error": f"Command timed out after {timeout} seconds"}
+                returncode = proc.returncode
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
-
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
-                           command, timeout, task_id, task_socket_dir)
-            return {"success": False, "error": f"Command timed out after {timeout} seconds"}
 
         with open(stdout_path, "r") as f:
             stdout = f.read()
         with open(stderr_path, "r") as f:
             stderr = f.read()
-        returncode = proc.returncode
 
         # Clean up temp files (best-effort)
         for p in (stdout_path, stderr_path):

@@ -33,6 +33,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -137,6 +138,13 @@ class RunState:
     api_process: Optional[subprocess.Popen] = None
     trainer_process: Optional[subprocess.Popen] = None
     env_process: Optional[subprocess.Popen] = None
+    # Detached transient-unit bookkeeping for live/origin messaging contexts
+    api_unit_name: str = ""
+    trainer_unit_name: str = ""
+    env_unit_name: str = ""
+    api_exit_path: str = ""
+    trainer_exit_path: str = ""
+    env_exit_path: str = ""
 
 
 # Global state
@@ -307,6 +315,104 @@ def _initialize_environments():
         _environments = _scan_environments()
 
 
+def _should_detach_rl_subprocesses() -> bool:
+    try:
+        from tools.detached_runtime import transient_unit_launcher_available
+        from tools.terminal_tool import _has_live_or_origin_messaging_context
+    except Exception:
+        return False
+    return _has_live_or_origin_messaging_context() and transient_unit_launcher_available()
+
+
+def _build_detached_rl_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    child_env = {key: value for key, value in os.environ.items() if isinstance(value, str)}
+    for key, value in (extra_env or {}).items():
+        if value is None:
+            continue
+        child_env[key] = value
+    return child_env
+
+
+def _launch_detached_training_component(
+    *,
+    run_state: RunState,
+    component_name: str,
+    argv: List[str],
+    cwd: Path,
+    log_path: Path,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> tuple[str, str]:
+    from tools.detached_runtime import launch_transient_unit
+
+    exit_path = str(LOGS_DIR / f"{component_name}_{run_state.run_id}.exit")
+    quoted_cmd = " ".join(shlex.quote(str(part)) for part in argv)
+    script = (
+        f"{quoted_cmd} >> {shlex.quote(str(log_path))} 2>&1; "
+        f"rc=$?; echo -n \"$rc\" > {shlex.quote(exit_path)}"
+    )
+    unit_name = launch_transient_unit(
+        unit_prefix=f"hermes-rl-{component_name}",
+        cwd=str(cwd),
+        shell_script=script,
+        extra_env=_build_detached_rl_env(extra_env),
+    )
+    return unit_name, exit_path
+
+
+def _detached_component_returncode(unit_name: str, exit_path: str) -> Optional[int]:
+    if exit_path and Path(exit_path).exists():
+        try:
+            return int(Path(exit_path).read_text().strip())
+        except (OSError, ValueError, TypeError):
+            return 1
+    if not unit_name:
+        return None
+    try:
+        from tools.detached_runtime import systemctl_show_properties
+    except Exception:
+        return None
+    props = systemctl_show_properties(unit_name, "MainPID", "ExecMainStatus")
+    main_pid = (props.get("MainPID") or "").strip()
+    if main_pid.isdigit() and int(main_pid) > 0:
+        return None
+    status_text = (props.get("ExecMainStatus") or "").strip()
+    if status_text:
+        try:
+            return int(status_text)
+        except ValueError:
+            return 1
+    return None
+
+
+def _get_run_component_returncode(run_state: RunState, component_name: str) -> Optional[int]:
+    proc = getattr(run_state, f"{component_name}_process", None)
+    if proc is not None:
+        return proc.poll()
+    unit_name = getattr(run_state, f"{component_name}_unit_name", "")
+    exit_path = getattr(run_state, f"{component_name}_exit_path", "")
+    return _detached_component_returncode(unit_name, exit_path)
+
+
+def _stop_detached_component(run_state: RunState, component_name: str, label: str) -> None:
+    unit_name = getattr(run_state, f"{component_name}_unit_name", "")
+    exit_path = getattr(run_state, f"{component_name}_exit_path", "")
+    if not unit_name or _detached_component_returncode(unit_name, exit_path) is not None:
+        return
+    try:
+        from tools.detached_runtime import signal_unit
+    except Exception:
+        return
+
+    logger.info("[%s] Stopping %s unit...", run_state.run_id, label)
+    signal_unit(unit_name, "TERM")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if _detached_component_returncode(unit_name, exit_path) is not None:
+            return
+        time.sleep(0.2)
+    signal_unit(unit_name, "KILL")
+
+
 # ============================================================================
 # Subprocess Management
 # ============================================================================
@@ -319,109 +425,142 @@ async def _spawn_training_run(run_state: RunState, config_path: Path):
     3. environment.py serve (the Atropos environment)
     """
     run_id = run_state.run_id
-    
+    use_detached = _should_detach_rl_subprocesses()
+
     _ensure_logs_dir()
 
     # Log file paths
     api_log = LOGS_DIR / f"api_{run_id}.log"
     trainer_log = LOGS_DIR / f"trainer_{run_id}.log"
     env_log = LOGS_DIR / f"env_{run_id}.log"
-    
+
     try:
         # Step 1: Start the Atropos API server (run-api)
         logger.info("[%s] Starting Atropos API server (run-api)...", run_id)
-        
-        # File must stay open while the subprocess runs; we store the handle
-        # on run_state so _stop_training_run() can close it when done.
-        api_log_file = open(api_log, "w")  # closed by _stop_training_run
-        run_state.api_log_file = api_log_file
-        run_state.api_process = subprocess.Popen(
-            ["run-api"],
-            stdout=api_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=str(TINKER_ATROPOS_ROOT),
-        )
-        
+
+        if use_detached:
+            run_state.api_unit_name, run_state.api_exit_path = _launch_detached_training_component(
+                run_state=run_state,
+                component_name="api",
+                argv=["run-api"],
+                cwd=TINKER_ATROPOS_ROOT,
+                log_path=api_log,
+            )
+        else:
+            # File must stay open while the subprocess runs; we store the handle
+            # on run_state so _stop_training_run() can close it when done.
+            api_log_file = open(api_log, "w")  # closed by _stop_training_run
+            run_state.api_log_file = api_log_file
+            run_state.api_process = subprocess.Popen(
+                ["run-api"],
+                stdout=api_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=str(TINKER_ATROPOS_ROOT),
+            )
+
         # Wait for API to start
         await asyncio.sleep(5)
-        
-        if run_state.api_process.poll() is not None:
+
+        api_exit_code = _get_run_component_returncode(run_state, "api")
+        if api_exit_code is not None:
             run_state.status = "failed"
-            run_state.error_message = f"API server exited with code {run_state.api_process.returncode}. Check {api_log}"
+            run_state.error_message = f"API server exited with code {api_exit_code}. Check {api_log}"
             _stop_training_run(run_state)
             return
-        
+
         logger.info("[%s] Atropos API server started", run_id)
-        
+
         # Step 2: Start the Tinker trainer
         logger.info("[%s] Starting Tinker trainer: launch_training.py --config %s", run_id, config_path)
-        
-        trainer_log_file = open(trainer_log, "w")  # closed by _stop_training_run
-        run_state.trainer_log_file = trainer_log_file
-        run_state.trainer_process = subprocess.Popen(
-            [sys.executable, "launch_training.py", "--config", str(config_path)],
-            stdout=trainer_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=str(TINKER_ATROPOS_ROOT),
-            env={**os.environ, "TINKER_API_KEY": os.getenv("TINKER_API_KEY", "")},
-        )
-        
+
+        trainer_env = {"TINKER_API_KEY": os.getenv("TINKER_API_KEY", "")}
+        if use_detached:
+            run_state.trainer_unit_name, run_state.trainer_exit_path = _launch_detached_training_component(
+                run_state=run_state,
+                component_name="trainer",
+                argv=[sys.executable, "launch_training.py", "--config", str(config_path)],
+                cwd=TINKER_ATROPOS_ROOT,
+                log_path=trainer_log,
+                extra_env=trainer_env,
+            )
+        else:
+            trainer_log_file = open(trainer_log, "w")  # closed by _stop_training_run
+            run_state.trainer_log_file = trainer_log_file
+            run_state.trainer_process = subprocess.Popen(
+                [sys.executable, "launch_training.py", "--config", str(config_path)],
+                stdout=trainer_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=str(TINKER_ATROPOS_ROOT),
+                env={**os.environ, **trainer_env},
+            )
+
         # Wait for trainer to initialize (it starts FastAPI inference server on 8001)
         logger.info("[%s] Waiting 30 seconds for trainer to initialize...", run_id)
         await asyncio.sleep(30)
-        
-        if run_state.trainer_process.poll() is not None:
+
+        trainer_exit_code = _get_run_component_returncode(run_state, "trainer")
+        if trainer_exit_code is not None:
             run_state.status = "failed"
-            run_state.error_message = f"Trainer exited with code {run_state.trainer_process.returncode}. Check {trainer_log}"
+            run_state.error_message = f"Trainer exited with code {trainer_exit_code}. Check {trainer_log}"
             _stop_training_run(run_state)
             return
-        
+
         logger.info("[%s] Trainer started, inference server on port 8001", run_id)
-        
+
         # Step 3: Start the environment
         logger.info("[%s] Waiting 90 more seconds before starting environment...", run_id)
         await asyncio.sleep(90)
-        
+
         # Find the environment file
         env_info = None
         for env in _environments:
             if env.name == run_state.environment:
                 env_info = env
                 break
-        
+
         if not env_info:
             run_state.status = "failed"
             run_state.error_message = f"Environment '{run_state.environment}' not found"
             _stop_training_run(run_state)
             return
-        
+
         logger.info("[%s] Starting environment: %s serve", run_id, env_info.file_path)
-        
-        env_log_file = open(env_log, "w")  # closed by _stop_training_run
-        run_state.env_log_file = env_log_file
-        run_state.env_process = subprocess.Popen(
-            [sys.executable, str(env_info.file_path), "serve", "--config", str(config_path)],
-            stdout=env_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=str(TINKER_ATROPOS_ROOT),
-        )
-        
+
+        if use_detached:
+            run_state.env_unit_name, run_state.env_exit_path = _launch_detached_training_component(
+                run_state=run_state,
+                component_name="env",
+                argv=[sys.executable, str(env_info.file_path), "serve", "--config", str(config_path)],
+                cwd=TINKER_ATROPOS_ROOT,
+                log_path=env_log,
+            )
+        else:
+            env_log_file = open(env_log, "w")  # closed by _stop_training_run
+            run_state.env_log_file = env_log_file
+            run_state.env_process = subprocess.Popen(
+                [sys.executable, str(env_info.file_path), "serve", "--config", str(config_path)],
+                stdout=env_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=str(TINKER_ATROPOS_ROOT),
+            )
+
         # Wait for environment to connect
         await asyncio.sleep(10)
-        
-        if run_state.env_process.poll() is not None:
+
+        env_exit_code = _get_run_component_returncode(run_state, "env")
+        if env_exit_code is not None:
             run_state.status = "failed"
-            run_state.error_message = f"Environment exited with code {run_state.env_process.returncode}. Check {env_log}"
+            run_state.error_message = f"Environment exited with code {env_exit_code}. Check {env_log}"
             _stop_training_run(run_state)
             return
-        
+
         run_state.status = "running"
         run_state.start_time = time.time()
         logger.info("[%s] Training run started successfully!", run_id)
-        
+
         # Start background monitoring
         asyncio.create_task(_monitor_training_run(run_state))
-        
+
     except Exception as e:
         run_state.status = "failed"
         run_state.error_message = str(e)
@@ -432,29 +571,29 @@ async def _monitor_training_run(run_state: RunState):
     """Background task to monitor a training run."""
     while run_state.status == "running":
         await asyncio.sleep(30)  # Check every 30 seconds
-        
-        # Check if any process has died
-        if run_state.env_process and run_state.env_process.poll() is not None:
-            exit_code = run_state.env_process.returncode
-            if exit_code == 0:
+
+        env_exit_code = _get_run_component_returncode(run_state, "env")
+        if env_exit_code is not None:
+            if env_exit_code == 0:
                 run_state.status = "completed"
             else:
                 run_state.status = "failed"
-                run_state.error_message = f"Environment process exited with code {exit_code}"
+                run_state.error_message = f"Environment process exited with code {env_exit_code}"
             _stop_training_run(run_state)
             break
-        
-        if run_state.trainer_process and run_state.trainer_process.poll() is not None:
-            exit_code = run_state.trainer_process.returncode
-            if exit_code == 0:
+
+        trainer_exit_code = _get_run_component_returncode(run_state, "trainer")
+        if trainer_exit_code is not None:
+            if trainer_exit_code == 0:
                 run_state.status = "completed"
             else:
                 run_state.status = "failed"
-                run_state.error_message = f"Trainer process exited with code {exit_code}"
+                run_state.error_message = f"Trainer process exited with code {trainer_exit_code}"
             _stop_training_run(run_state)
             break
-        
-        if run_state.api_process and run_state.api_process.poll() is not None:
+
+        api_exit_code = _get_run_component_returncode(run_state, "api")
+        if api_exit_code is not None:
             run_state.status = "failed"
             run_state.error_message = "API server exited unexpectedly"
             _stop_training_run(run_state)
@@ -471,7 +610,9 @@ def _stop_training_run(run_state: RunState):
             run_state.env_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             run_state.env_process.kill()
-    
+    else:
+        _stop_detached_component(run_state, "env", "environment")
+
     if run_state.trainer_process and run_state.trainer_process.poll() is None:
         logger.info("[%s] Stopping trainer process...", run_state.run_id)
         run_state.trainer_process.terminate()
@@ -479,7 +620,9 @@ def _stop_training_run(run_state: RunState):
             run_state.trainer_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             run_state.trainer_process.kill()
-    
+    else:
+        _stop_detached_component(run_state, "trainer", "trainer")
+
     if run_state.api_process and run_state.api_process.poll() is None:
         logger.info("[%s] Stopping API server...", run_state.run_id)
         run_state.api_process.terminate()
@@ -487,7 +630,9 @@ def _stop_training_run(run_state: RunState):
             run_state.api_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             run_state.api_process.kill()
-    
+    else:
+        _stop_detached_component(run_state, "api", "API server")
+
     if run_state.status == "running":
         run_state.status = "stopped"
 
@@ -850,9 +995,9 @@ async def rl_check_status(run_id: str) -> str:
     
     # Check process status
     processes = {
-        "api": run_state.api_process.poll() if run_state.api_process else None,
-        "trainer": run_state.trainer_process.poll() if run_state.trainer_process else None,
-        "env": run_state.env_process.poll() if run_state.env_process else None,
+        "api": _get_run_component_returncode(run_state, "api"),
+        "trainer": _get_run_component_returncode(run_state, "trainer"),
+        "env": _get_run_component_returncode(run_state, "env"),
     }
     
     running_time = time.time() - run_state.start_time if run_state.start_time else 0

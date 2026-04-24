@@ -39,6 +39,7 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _sanitize_subprocess_env
@@ -83,6 +84,9 @@ class ProcessSession:
     watcher_thread_id: str = ""
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    log_path: str = ""                          # Detached log file path (host-visible)
+    exit_code_path: str = ""                    # Detached exit code file path (host-visible)
+    unit_name: str = ""                         # Transient unit name when launched via systemd-run
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -141,19 +145,59 @@ class ProcessRegistry:
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
-        if session is None or session.exited or not session.detached or session.pid_scope != "host":
+        if session is None or not session.detached or session.pid_scope != "host":
+            return session
+
+        if session.log_path:
+            try:
+                log_text = Path(session.log_path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                log_text = ""
+            if log_text:
+                with session._lock:
+                    session.output_buffer = log_text[-session.max_output_chars:]
+
+        if session.exit_code_path and session.exit_code is None:
+            try:
+                raw_exit = Path(session.exit_code_path).read_text(encoding="utf-8", errors="replace").strip()
+                if raw_exit:
+                    with session._lock:
+                        session.exit_code = int(raw_exit.splitlines()[-1].strip())
+            except Exception:
+                pass
+
+        if session.exit_code is None and session.unit_name:
+            wsl_exe = "/mnt/c/Windows/System32/wsl.exe"
+            distro = os.getenv("WSL_DISTRO_NAME", "Ubuntu") or "Ubuntu"
+            if os.path.exists(wsl_exe):
+                try:
+                    probe = subprocess.run(
+                        [wsl_exe, "-d", distro, "-u", "root", "--", "systemctl", "show", session.unit_name, "--property", "ExecMainStatus", "--value"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    value = (probe.stdout or "").strip()
+                    if value.isdigit():
+                        with session._lock:
+                            session.exit_code = int(value)
+                except Exception:
+                    pass
+
+        if session.exited:
             return session
 
         if self._is_host_pid_alive(session.pid):
             return session
 
+        exit_code = session.exit_code
+
         with session._lock:
             if session.exited:
                 return session
             session.exited = True
-            # Recovered sessions no longer have a waitable handle, so the real
-            # exit code is unavailable once the original process object is gone.
-            session.exit_code = None
+            session.exit_code = exit_code
 
         self._move_to_finished(session)
         return session
@@ -281,6 +325,38 @@ class ProcessRegistry:
             self._prune_if_needed()
             self._running[session.id] = session
 
+        self._write_checkpoint()
+        return session
+
+    def register_detached_host_process(
+        self,
+        command: str,
+        pid: int,
+        cwd: str = None,
+        task_id: str = "",
+        session_key: str = "",
+        log_path: str = "",
+        exit_code_path: str = "",
+        unit_name: str = "",
+    ) -> ProcessSession:
+        """Register a host-visible detached process launched outside Popen()."""
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id,
+            session_key=session_key,
+            pid=pid,
+            cwd=cwd or os.getcwd(),
+            started_at=time.time(),
+            detached=True,
+            pid_scope="host",
+            log_path=log_path or "",
+            exit_code_path=exit_code_path or "",
+            unit_name=unit_name or "",
+        )
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
         self._write_checkpoint()
         return session
 
@@ -466,6 +542,29 @@ class ProcessRegistry:
             self._finished[session.id] = session
         self._write_checkpoint()
 
+        try:
+            from agent.harness import get_harness_manager
+            from tools.ansi_strip import strip_ansi
+
+            _harness = get_harness_manager()
+            if getattr(_harness, "enabled", False) and session.task_id:
+                output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+                _harness.record_process_completed(
+                    task_id=session.task_id,
+                    process_session_id=session.id,
+                    exit_code=session.exit_code,
+                    output_preview=output_tail,
+                    session_key=session.session_key,
+                    metadata={
+                        "command": session.command,
+                        "pid": session.pid,
+                        "detached": bool(session.detached),
+                        "pid_scope": session.pid_scope,
+                    },
+                )
+        except Exception:
+            pass
+
         # If the caller requested agent notification, enqueue the completion
         # so the CLI/gateway can auto-trigger a new agent turn.
         if session.notify_on_complete:
@@ -509,7 +608,10 @@ class ProcessRegistry:
             result["exit_code"] = session.exit_code
         if session.detached:
             result["detached"] = True
-            result["note"] = "Process recovered after restart -- output history unavailable"
+            if session.unit_name or session.log_path:
+                result["note"] = "Detached host process running outside the live gateway cgroup"
+            else:
+                result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
@@ -816,6 +918,9 @@ class ProcessRegistry:
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "log_path": s.log_path,
+                            "exit_code_path": s.exit_code_path,
+                            "unit_name": s.unit_name,
                         })
             
             # Atomic write to avoid corruption on crash
@@ -876,6 +981,9 @@ class ProcessRegistry:
                     watcher_thread_id=entry.get("watcher_thread_id", ""),
                     watcher_interval=entry.get("watcher_interval", 0),
                     notify_on_complete=entry.get("notify_on_complete", False),
+                    log_path=entry.get("log_path", ""),
+                    exit_code_path=entry.get("exit_code_path", ""),
+                    unit_name=entry.get("unit_name", ""),
                 )
                 with self._lock:
                     self._running[session.id] = session
