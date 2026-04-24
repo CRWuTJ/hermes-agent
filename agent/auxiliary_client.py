@@ -134,11 +134,11 @@ _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
 # Codex fallback: uses the Responses API (the only endpoint the Codex
 # OAuth token can access) for auxiliary tasks.
-# Current ChatGPT-backed Team accounts expose gpt-5.4 / gpt-5.4-mini /
-# gpt-5.3-codex / gpt-5.2 via the Codex models API; the legacy
-# gpt-5.2-codex slug is no longer part of the active pool and caused stale
-# auxiliary failures in this environment.
-_CODEX_AUX_MODEL = "gpt-5.4"
+# Current ChatGPT-backed Team accounts expose gpt-5.5 / gpt-5.5-mini /
+# gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex / gpt-5.2 via the Codex models API;
+# the legacy gpt-5.2-codex slug is no longer part of the active pool and caused
+# stale auxiliary failures in this environment.
+_CODEX_AUX_MODEL = "gpt-5.5"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 

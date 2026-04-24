@@ -31,6 +31,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("qwen/qwen3.6-plus:free", "free"),
     ("anthropic/claude-sonnet-4.5",     ""),
     ("anthropic/claude-haiku-4.5",      ""),
+    ("openai/gpt-5.5",                  ""),
+    ("openai/gpt-5.5-mini",             ""),
     ("openai/gpt-5.4",                  ""),
     ("openai/gpt-5.4-mini",             ""),
     ("xiaomi/mimo-v2-pro",               ""),
@@ -62,6 +64,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "anthropic/claude-sonnet-4.6",
         "anthropic/claude-sonnet-4.5",
         "anthropic/claude-haiku-4.5",
+        "openai/gpt-5.5",
+        "openai/gpt-5.5-mini",
         "openai/gpt-5.4",
         "openai/gpt-5.4-mini",
         "xiaomi/mimo-v2-pro",
@@ -96,6 +100,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "copilot-acp",
     ],
     "copilot": [
+        "gpt-5.5",
+        "gpt-5.5-mini",
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5-mini",
@@ -175,6 +181,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek-reasoner",
     ],
     "opencode-zen": [
+        "gpt-5.5",
         "gpt-5.4-pro",
         "gpt-5.4",
         "gpt-5.3-codex",
@@ -237,6 +244,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "kilocode": [
         "anthropic/claude-opus-4.6",
         "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.5",
         "openai/gpt-5.4",
         "google/gemini-3-pro-preview",
         "google/gemini-3-flash-preview",
@@ -810,7 +818,7 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
         openrouter:anthropic/claude-sonnet-4.5  →  ("openrouter", "anthropic/claude-sonnet-4.5")
         nous:hermes-3                           →  ("nous", "hermes-3")
         anthropic/claude-sonnet-4.5             →  (current_provider, "anthropic/claude-sonnet-4.5")
-        gpt-5.4                                 →  (current_provider, "gpt-5.4")
+        gpt-5.5                                 →  (current_provider, "gpt-5.5")
 
     The colon is only treated as a provider delimiter if the left side is a
     recognized provider name or alias.  This avoids misinterpreting model names

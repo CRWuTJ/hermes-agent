@@ -3,7 +3,7 @@ import os
 import sys
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
 
@@ -18,7 +18,7 @@ def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch
                 "models": [
                     {"slug": "gpt-5.3-codex", "priority": 20, "supported_in_api": True},
                     {"slug": "gpt-5.1-codex", "priority": 5, "supported_in_api": True},
-                    {"slug": "gpt-5.4", "priority": 1, "supported_in_api": True},
+                    {"slug": "gpt-5.5", "priority": 1, "supported_in_api": True},
                     {"slug": "gpt-5-hidden-codex", "priority": 2, "visibility": "hidden"},
                 ]
             }
@@ -32,8 +32,8 @@ def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch
     assert "gpt-5.1-codex" in models
     assert "gpt-5.3-codex" in models
     # Non-codex-suffixed models are included when the cache says they're available
-    assert "gpt-5.4" in models
-    assert "gpt-5.4-mini" in models
+    assert "gpt-5.5" in models
+    assert "gpt-5.5-mini" in models
     assert "gpt-5-hidden-codex" not in models
 
 
@@ -53,7 +53,7 @@ def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatc
     models = get_codex_model_ids()
 
     assert models[: len(DEFAULT_CODEX_MODELS)] == DEFAULT_CODEX_MODELS
-    assert "gpt-5.4" in models
+    assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
 
 
@@ -65,7 +65,7 @@ def test_get_codex_model_ids_adds_forward_compat_models_from_templates(monkeypat
 
     models = get_codex_model_ids(access_token="codex-access-token")
 
-    assert models == ["gpt-5.2-codex", "gpt-5.4-mini", "gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark"]
+    assert models == ["gpt-5.2-codex", "gpt-5.5-mini", "gpt-5.5", "gpt-5.4-mini", "gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark"]
 
 
 def test_model_command_uses_runtime_access_token_for_codex_list(monkeypatch):
