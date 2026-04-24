@@ -42,7 +42,7 @@ Point any OpenAI-compatible client at `http://localhost:8642/v1`:
 ```bash
 # Test with curl
 curl http://localhost:8642/v1/chat/completions \
-  -H "Authorization: Bearer change-me-local-dev" \
+  -H "Authorization: Bearer change...dev" \
   -H "Content-Type: application/json" \
   -d '{"model": "hermes-agent", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
@@ -157,6 +157,620 @@ Lists `hermes-agent` as an available model. Required by most frontends for model
 ### GET /health
 
 Health check. Returns `{"status": "ok"}`. Also available at **GET /v1/health** for OpenAI-compatible clients that expect the `/v1/` prefix.
+
+### GET /api/status
+
+Machine-readable gateway status for dashboards and automation. This is separate from `/health`: `/health` stays minimal for liveness checks, while `/api/status` exposes the current runtime state, live task lanes, and cron backlog summary.
+
+**Response:**
+```json
+{
+  "gateway_state": "running",
+  "exit_reason": null,
+  "updated_at": "2026-04-19T12:00:00+00:00",
+  "platforms": {
+    "telegram": {
+      "state": "connected",
+      "error_code": null,
+      "error_message": null,
+      "updated_at": "2026-04-19T12:00:00+00:00"
+    }
+  },
+  "queued_tasks": {
+    "queued_count": 1,
+    "lane_counts": {
+      "interactive": 0,
+      "cron_scout": 1,
+      "housekeeping": 0
+    },
+    "bucket_counts": {
+      "now": 1,
+      "next": 0,
+      "later": 0
+    },
+    "next_task": {
+      "task_id": "task-hi",
+      "state": "queued",
+      "session_key": "telegram:user:123",
+      "lane": "cron_scout",
+      "priority": 10,
+      "priority_bucket": "now",
+      "priority_bucket_options": ["now", "next", "later"],
+      "reply_policy": "status_only",
+      "cancellation_policy": "preserve",
+      "queued_at": "2026-04-19T12:00:00+00:00",
+      "wait_seconds": 300,
+      "wait_age": "5m",
+      "reason": "busy_followup",
+      "preview": "high priority queued follow-up",
+      "kind": "queued_message",
+      "control_mode": "queued",
+      "actions": ["foreground", "reprioritize", "cancel"],
+      "source": "telegram"
+    },
+    "oldest_waiting": {
+      "task_id": "task-hi",
+      "state": "queued",
+      "session_key": "telegram:user:123",
+      "lane": "cron_scout",
+      "priority": 10,
+      "priority_bucket": "now",
+      "priority_bucket_options": ["now", "next", "later"],
+      "reply_policy": "status_only",
+      "cancellation_policy": "preserve",
+      "queued_at": "2026-04-19T12:00:00+00:00",
+      "wait_seconds": 300,
+      "wait_age": "5m",
+      "reason": "busy_followup",
+      "preview": "high priority queued follow-up",
+      "kind": "queued_message",
+      "control_mode": "queued",
+      "actions": ["foreground", "reprioritize", "cancel"],
+      "source": "telegram"
+    },
+    "starving_bucket": {
+      "bucket": "now",
+      "queued_count": 1,
+      "oldest_wait_seconds": 300,
+      "oldest_wait_age": "5m",
+      "oldest_task_id": "task-hi"
+    },
+    "starvation_alert": null,
+    "tasks": [
+      {
+        "task_id": "task-hi",
+        "state": "queued",
+        "session_key": "telegram:user:123",
+        "lane": "cron_scout",
+        "priority": 10,
+        "priority_bucket": "now",
+        "priority_bucket_options": ["now", "next", "later"],
+        "reply_policy": "status_only",
+        "cancellation_policy": "preserve",
+        "queued_at": "2026-04-19T12:00:00+00:00",
+        "wait_seconds": 300,
+        "wait_age": "5m",
+        "reason": "busy_followup",
+        "preview": "high priority queued follow-up",
+        "kind": "queued_message",
+        "control_mode": "queued",
+        "actions": ["foreground", "reprioritize", "cancel"],
+        "source": "telegram"
+      }
+    ]
+  },
+  "live_tasks": {
+    "active_count": 1,
+    "lane_counts": {
+      "interactive": 0,
+      "cron_scout": 1,
+      "housekeeping": 0
+    },
+    "tasks": [
+      {
+        "task_id": "bg_120000_ab12cd",
+        "lane": "cron_scout",
+        "label": "background task",
+        "kind": "background",
+        "control_mode": "managed_runtime",
+        "actions": ["cancel"],
+        "source": "gateway",
+        "started_at": "2026-04-19T12:00:00+00:00"
+      }
+    ]
+  },
+  "cron": {
+    "active_jobs": 2,
+    "total_jobs": 2,
+    "lane_counts": {
+      "interactive": 1,
+      "cron_scout": 0,
+      "housekeeping": 1
+    },
+    "due_now": {
+      "interactive": 0,
+      "cron_scout": 0,
+      "housekeeping": 1
+    }
+  }
+}
+```
+
+### GET /api/tasks
+
+Machine-readable task control plane. This is the structured version of the chat `/tasks` surface: queued backlog on one side, active runtime tasks on the other, with explicit control metadata instead of human-only command hints.
+
+**Response:**
+```json
+{
+  "queued": {
+    "queued_count": 1,
+    "lane_counts": {
+      "interactive": 0,
+      "cron_scout": 1,
+      "housekeeping": 0
+    },
+    "bucket_counts": {
+      "now": 1,
+      "next": 0,
+      "later": 0
+    },
+    "next_task": {
+      "task_id": "task-hi",
+      "state": "queued",
+      "session_key": "telegram:user:123",
+      "lane": "cron_scout",
+      "priority": 10,
+      "priority_bucket": "now",
+      "priority_bucket_options": ["now", "next", "later"],
+      "reply_policy": "status_only",
+      "cancellation_policy": "preserve",
+      "queued_at": "2026-04-19T12:00:00+00:00",
+      "wait_seconds": 300,
+      "wait_age": "5m",
+      "reason": "busy_followup",
+      "preview": "high priority queued follow-up",
+      "kind": "queued_message",
+      "control_mode": "queued",
+      "actions": ["foreground", "reprioritize", "cancel"],
+      "source": "telegram"
+    },
+    "oldest_waiting": {
+      "task_id": "task-hi",
+      "state": "queued",
+      "session_key": "telegram:user:123",
+      "lane": "cron_scout",
+      "priority": 10,
+      "priority_bucket": "now",
+      "priority_bucket_options": ["now", "next", "later"],
+      "reply_policy": "status_only",
+      "cancellation_policy": "preserve",
+      "queued_at": "2026-04-19T12:00:00+00:00",
+      "wait_seconds": 300,
+      "wait_age": "5m",
+      "reason": "busy_followup",
+      "preview": "high priority queued follow-up",
+      "kind": "queued_message",
+      "control_mode": "queued",
+      "actions": ["foreground", "reprioritize", "cancel"],
+      "source": "telegram"
+    },
+    "starving_bucket": {
+      "bucket": "now",
+      "queued_count": 1,
+      "oldest_wait_seconds": 300,
+      "oldest_wait_age": "5m",
+      "oldest_task_id": "task-hi"
+    },
+    "starvation_alert": null,
+    "tasks": [
+      {
+        "task_id": "task-hi",
+        "state": "queued",
+        "session_key": "telegram:user:123",
+        "lane": "cron_scout",
+        "priority": 10,
+        "priority_bucket": "now",
+        "priority_bucket_options": ["now", "next", "later"],
+        "reply_policy": "status_only",
+        "cancellation_policy": "preserve",
+        "queued_at": "2026-04-19T12:00:00+00:00",
+        "wait_seconds": 300,
+        "wait_age": "5m",
+        "reason": "busy_followup",
+        "preview": "high priority queued follow-up",
+        "kind": "queued_message",
+        "control_mode": "queued",
+        "actions": ["foreground", "reprioritize", "cancel"],
+        "source": "telegram"
+      }
+    ]
+  },
+  "live": {
+    "active_count": 1,
+    "lane_counts": {
+      "interactive": 1,
+      "cron_scout": 0,
+      "housekeeping": 0
+    },
+    "tasks": [
+      {
+        "task_id": "turn-1",
+        "lane": "interactive",
+        "label": "message turn",
+        "kind": "live_turn",
+        "control_mode": "read_only",
+        "actions": [],
+        "source": "gateway",
+        "started_at": "2026-04-19T12:00:01+00:00"
+      }
+    ]
+  }
+}
+```
+
+#### GET /api/tasks/{task_id}
+
+Fetches one task by ID from either side of the control plane. Queued tasks come back with `state=queued`; active runtime tasks come back with `state=active`.
+
+**Response:**
+```json
+{
+  "task_id": "task-hi",
+  "state": "queued",
+  "task": {
+    "task_id": "task-hi",
+    "state": "queued",
+    "session_key": "telegram:user:123",
+    "lane": "cron_scout",
+    "priority": 10,
+    "priority_bucket": "now",
+    "priority_bucket_options": ["now", "next", "later"],
+    "reply_policy": "status_only",
+    "cancellation_policy": "preserve",
+    "queued_at": "2026-04-19T12:00:00+00:00",
+    "wait_seconds": 300,
+    "wait_age": "5m",
+    "reason": "busy_followup",
+    "preview": "high priority queued follow-up",
+    "kind": "queued_message",
+    "control_mode": "queued",
+    "actions": ["foreground", "reprioritize", "cancel"],
+    "source": "telegram"
+  }
+}
+```
+
+#### POST /api/tasks/{task_id}/foreground
+
+Promotes a queued task. If the chat is idle, the task starts immediately; if the chat is already busy, the task is moved to the front so it runs next.
+
+**Response:**
+```json
+{
+  "task_id": "task-hi",
+  "action": "foreground",
+  "status": "started",
+  "message": "Foregrounded queued task task-hi — starting now.",
+  "task": {
+    "task_id": "task-hi",
+    "state": "queued",
+    "session_key": "telegram:user:123",
+    "lane": "cron_scout",
+    "priority": 10,
+    "priority_bucket": "now",
+    "priority_bucket_options": ["now", "next", "later"],
+    "reply_policy": "status_only",
+    "cancellation_policy": "preserve",
+    "queued_at": "2026-04-19T12:00:00+00:00",
+    "wait_seconds": 300,
+    "wait_age": "5m",
+    "reason": "busy_followup",
+    "preview": "high priority queued follow-up",
+    "kind": "queued_message",
+    "control_mode": "queued",
+    "actions": ["foreground", "reprioritize", "cancel"],
+    "source": "telegram"
+  }
+}
+```
+
+#### POST /api/tasks/{task_id}/reprioritize
+
+Changes a queued task's bucket without forcing it to start immediately. The request body accepts one of `now`, `next`, or `later`.
+
+**Request:**
+```json
+{
+  "bucket": "later"
+}
+```
+
+**Response:**
+```json
+{
+  "task_id": "task-hi",
+  "action": "reprioritize",
+  "status": "reprioritized",
+  "message": "Moved queued task task-hi to later priority.",
+  "task": {
+    "task_id": "task-hi",
+    "state": "queued",
+    "session_key": "telegram:user:123",
+    "lane": "cron_scout",
+    "priority": 80,
+    "priority_bucket": "later",
+    "priority_bucket_options": ["now", "next", "later"],
+    "reply_policy": "status_only",
+    "cancellation_policy": "preserve",
+    "queued_at": "2026-04-19T12:00:00+00:00",
+    "wait_seconds": 300,
+    "wait_age": "5m",
+    "reason": "busy_followup",
+    "preview": "high priority queued follow-up",
+    "kind": "queued_message",
+    "control_mode": "queued",
+    "actions": ["foreground", "reprioritize", "cancel"],
+    "source": "telegram"
+  }
+}
+```
+
+#### POST /api/tasks/{task_id}/recover
+
+Applies the task's current starvation recovery recommendation. The control plane keeps the recommendation machine-readable via `suggested_action` / `suggested_bucket`, and this endpoint turns that into a one-hop shortcut.
+
+**Response:**
+```json
+{
+  "task_id": "task-stale",
+  "action": "recover",
+  "status": "recovered",
+  "message": "Recovered queued task task-stale — moved it to next priority.",
+  "task": {
+    "task_id": "task-stale",
+    "state": "queued",
+    "session_key": "telegram:user:123",
+    "lane": "housekeeping",
+    "priority": 50,
+    "priority_bucket": "next",
+    "priority_bucket_options": ["now", "next", "later"],
+    "reply_policy": "status_only",
+    "cancellation_policy": "preserve",
+    "queued_at": "2026-04-19T10:00:00+00:00",
+    "wait_seconds": 7500,
+    "wait_age": "2h 5m",
+    "reason": "busy_followup",
+    "preview": "stale queued follow-up",
+    "kind": "queued_message",
+    "control_mode": "queued",
+    "actions": ["foreground", "reprioritize", "cancel"],
+    "source": "telegram"
+  }
+}
+```
+
+#### POST /api/tasks/{task_id}/cancel
+
+Cancels a queued task immediately, or requests cancellation for a managed runtime task like `/background` or `/btw`.
+
+**Response:**
+```json
+{
+  "task_id": "bg-1",
+  "action": "cancel",
+  "status": "cancellation_requested",
+  "message": "Cancellation requested for active task bg-1.",
+  "task": {
+    "task_id": "bg-1",
+    "lane": "cron_scout",
+    "label": "background task",
+    "kind": "background",
+    "control_mode": "managed_runtime",
+    "actions": ["cancel"],
+    "source": "gateway",
+    "started_at": "2026-04-19T12:00:01+00:00"
+  }
+}
+```
+
+All `/api/status`, `/api/tasks*`, and `/api/jobs*` endpoints use the same bearer-token auth as the rest of the API server.
+
+### GET /openapi.json
+
+OpenAPI 3.1 contract for the Hermes control-plane surface. Right now it covers the machine-readable endpoints that matter for dashboards, frontends, and SDK generation:
+- `/api/status`
+- `/api/tasks`
+- `/api/tasks/{task_id}`
+- `/api/tasks/{task_id}/foreground`
+- `/api/tasks/{task_id}/reprioritize`
+- `/api/tasks/{task_id}/recover`
+- `/api/tasks/{task_id}/cancel`
+- `/api/jobs`
+- `/api/jobs/{job_id}`
+- `/api/jobs/{job_id}/pause`
+- `/api/jobs/{job_id}/resume`
+- `/api/jobs/{job_id}/run`
+
+The schema includes the canonical lane enum, the enriched job payload (`lane`, `effective_lane`, `lane_source`), the `/api/status` live-task/cron summary shapes, the queued-task payload behind `/api/tasks`, the per-task detail envelope behind `/api/tasks/{task_id}`, the action result envelope used by task control endpoints, and the reason-coded task-action error envelope those endpoints return on `400`/`404`. That means clients can generate forms and typed models from one source instead of scraping docs examples.
+
+**Response shape (abridged):**
+```json
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Hermes Control Plane API"
+  },
+  "paths": {
+    "/api/status": {"get": {}},
+    "/api/tasks": {"get": {}},
+    "/api/tasks/{task_id}": {"get": {}},
+    "/api/tasks/{task_id}/foreground": {"post": {}},
+    "/api/tasks/{task_id}/reprioritize": {"post": {}},
+    "/api/tasks/{task_id}/recover": {"post": {}},
+    "/api/tasks/{task_id}/cancel": {"post": {}},
+    "/api/jobs": {"get": {}, "post": {}},
+    "/api/jobs/{job_id}": {"get": {}, "patch": {}, "delete": {}},
+    "/api/jobs/{job_id}/pause": {"post": {}},
+    "/api/jobs/{job_id}/resume": {"post": {}},
+    "/api/jobs/{job_id}/run": {"post": {}}
+  },
+  "components": {
+    "schemas": {
+      "CronLaneValue": {
+        "enum": ["interactive", "cron_scout", "housekeeping"]
+      },
+      "CronJob": {
+        "properties": {
+          "lane": {},
+          "effective_lane": {},
+          "lane_source": {}
+        }
+      },
+      "LiveTask": {
+        "properties": {
+          "kind": {},
+          "control_mode": {},
+          "actions": {}
+        }
+      },
+      "QueuedTask": {
+        "properties": {
+          "priority": {},
+          "priority_bucket": {},
+          "priority_bucket_options": {},
+          "queued_at": {},
+          "wait_seconds": {},
+          "wait_age": {},
+          "control_mode": {},
+          "actions": {},
+          "starvation_alert": {}
+        }
+      },
+      "QueuedBucketStarvation": {
+        "properties": {
+          "bucket": {},
+          "queued_count": {},
+          "oldest_wait_seconds": {},
+          "oldest_wait_age": {},
+          "oldest_task_id": {}
+        }
+      },
+      "QueuedStarvationAlert": {
+        "properties": {
+          "level": {},
+          "reason_code": {},
+          "reason": {},
+          "bucket": {},
+          "threshold_seconds": {},
+          "threshold_age": {},
+          "current_wait_seconds": {},
+          "current_wait_age": {},
+          "oldest_task_id": {},
+          "suggested_action": {},
+          "suggested_bucket": {},
+          "suggested_command": {}
+        }
+      },
+      "QueuedTaskStatus": {
+        "properties": {
+          "queued_count": {},
+          "lane_counts": {},
+          "bucket_counts": {},
+          "next_task": {},
+          "oldest_waiting": {},
+          "starving_bucket": {},
+          "starvation_alert": {},
+          "tasks": {}
+        }
+      },
+      "GatewayStatus": {
+        "properties": {
+          "queued_tasks": {},
+          "live_tasks": {},
+          "cron": {}
+        }
+      },
+      "TaskDetailResponse": {
+        "properties": {
+          "state": {},
+          "task": {}
+        }
+      },
+      "TaskActionResponse": {
+        "properties": {
+          "action": {},
+          "status": {},
+          "task": {}
+        }
+      },
+      "TaskActionErrorResponse": {
+        "properties": {
+          "error": {},
+          "reason_code": {}
+        }
+      },
+      "errors": {
+        "auth": "ControlPlaneAuthErrorResponse",
+        "validation": "ControlPlaneErrorResponse",
+        "not_found": "ControlPlaneErrorResponse",
+        "server_error": "ControlPlaneErrorResponse",
+        "cron_unavailable": "ControlPlaneErrorResponse"
+      }
+    }
+  }
+}
+```
+
+### Control-plane error responses
+
+The control-plane endpoints use three error shapes today:
+- `401` auth failures return the same OpenAI-style error envelope the rest of the API server uses
+- task action endpoints (`/api/tasks/{task_id}/foreground`, `/reprioritize`, `/recover`, and `/cancel`) return `{error, reason_code}` on `400`/`404`
+- the rest of the `400`, `404`, `500`, and `501` control-plane failures return a simple Hermes control-plane error string
+
+**401 Unauthorized**
+```json
+{
+  "error": {
+    "message": "Invalid API key",
+    "type": "invalid_request_error",
+    "code": "invalid_api_key"
+  }
+}
+```
+
+**400 Validation / bad request**
+```json
+{
+  "error": "No valid fields to update"
+}
+```
+
+**404 Not found**
+```json
+{
+  "error": "Job not found"
+}
+```
+
+**500 Internal error**
+```json
+{
+  "error": "status exploded"
+}
+```
+
+**501 Cron unavailable**
+```json
+{
+  "error": "Cron module not available"
+}
+```
+
+### Jobs API (`/api/jobs`)
+
+The same API server also exposes a small REST API for cron job management. This is not part of the OpenAI-compatible surface — it's a Hermes-specific control plane for schedulers, dashboards, and automation UIs.
 
 ## System Prompt Handling
 

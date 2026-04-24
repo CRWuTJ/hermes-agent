@@ -185,6 +185,7 @@ Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children 
 - **Interrupt propagation** — interrupting the parent interrupts all active children
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
+- For local `codex_responses` adapters, Hermes can optionally mint **per-child API keys** via `/v1/internal/keys`; if that endpoint returns `404`, `405`, or `501`, Hermes automatically falls back to the parent credentials and caches the endpoint as unsupported for the rest of the process
 
 ## Delegation vs execute_code
 
