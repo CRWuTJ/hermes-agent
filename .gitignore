@@ -55,6 +55,12 @@ environments/benchmarks/evals/
 .release_notes.md
 mini-swe-agent/
 
+# Local Hermes runtime/conversation artifacts
+.hermes/
+.tmp/
+runtime/*.log
+knowledge_collection_*.md
+
 # Nix
 .direnv/
 result
