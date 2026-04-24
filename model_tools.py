@@ -169,13 +169,6 @@ def _discover_tools():
 
 _discover_tools()
 
-# MCP tool discovery (external MCP servers from config)
-try:
-    from tools.mcp_tool import discover_mcp_tools
-    discover_mcp_tools()
-except Exception as e:
-    logger.debug("MCP tool discovery failed: %s", e)
-
 # Plugin tool discovery (user/project/pip plugins)
 try:
     from hermes_cli.plugins import discover_plugins
@@ -185,12 +178,69 @@ except Exception as e:
 
 
 # =============================================================================
-# Backward-compat constants  (built once after discovery)
+# Dynamic discovery (MCP tools are loaded lazily on first compatible request)
 # =============================================================================
 
-TOOL_TO_TOOLSET_MAP: Dict[str, str] = registry.get_tool_to_toolset_map()
+_mcp_discovery_lock = threading.Lock()
+_mcp_discovery_attempted = False
 
-TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
+
+def _refresh_registry_snapshots() -> None:
+    global TOOL_TO_TOOLSET_MAP, TOOLSET_REQUIREMENTS
+    TOOL_TO_TOOLSET_MAP = registry.get_tool_to_toolset_map()
+    TOOLSET_REQUIREMENTS = registry.get_toolset_requirements()
+
+
+def _should_discover_mcp_for_request(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> bool:
+    """Return True when the requested tool view could expose dynamic MCP tools.
+
+    Safe skip cases: explicit enabled_toolsets that only ask for non-MCP,
+    non-hermes toolsets (e.g. terminal/file). Any all-tools view still loads
+    MCP so hermes-* umbrella toolsets keep their existing behavior.
+    """
+    if enabled_toolsets is None:
+        return True
+
+    requested = {str(ts).strip() for ts in enabled_toolsets if str(ts).strip()}
+    if not requested:
+        return False
+
+    return any(ts.startswith("mcp-") or ts.startswith("hermes-") for ts in requested)
+
+
+def _ensure_mcp_tool_discovery(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> None:
+    global _mcp_discovery_attempted
+
+    if not _should_discover_mcp_for_request(enabled_toolsets, disabled_toolsets):
+        return
+    if _mcp_discovery_attempted:
+        return
+
+    with _mcp_discovery_lock:
+        if _mcp_discovery_attempted:
+            return
+        try:
+            from tools.mcp_tool import discover_mcp_tools
+
+            discover_mcp_tools()
+        except Exception as e:
+            logger.debug("MCP tool discovery failed: %s", e)
+        else:
+            _mcp_discovery_attempted = True
+            _refresh_registry_snapshots()
+
+
+# =============================================================================
+# Backward-compat constants  (built once after static discovery; refreshed after MCP discovery)
+# =============================================================================
+
+_refresh_registry_snapshots()
 
 # Resolved tool names from the last get_tool_definitions() call.
 # Used by code_execution_tool to know which tools are available in this session.
@@ -249,6 +299,7 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    _ensure_mcp_tool_discovery(enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets)
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -498,6 +549,30 @@ def handle_function_call(
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
         try:
+            from agent.harness import get_harness_manager
+
+            _harness = get_harness_manager()
+            if getattr(_harness, "enabled", False):
+                decision = _harness.preflight_tool_call(
+                    task_id=task_id or "",
+                    tool_name=function_name,
+                    args=function_args,
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+                if isinstance(decision, dict) and not decision.get("allowed", True):
+                    return json.dumps(
+                        {
+                            "error": decision.get("reason") or f"Harness blocked {function_name}",
+                            "harness_state": decision.get("state") or "blocked",
+                            "blocked_by": "harness",
+                        },
+                        ensure_ascii=False,
+                    )
+        except Exception:
+            _harness = None
+
+        try:
             from hermes_cli.plugins import invoke_hook
             invoke_hook(
                 "pre_tool_call",
@@ -509,6 +584,18 @@ def handle_function_call(
             )
         except Exception:
             pass
+
+        try:
+            if getattr(_harness, "enabled", False):
+                _harness.record_tool_start(
+                    task_id=task_id or "",
+                    tool_name=function_name,
+                    args=function_args,
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+        except Exception:
+            _harness = None
 
         if function_name == "execute_code":
             # Prefer the caller-provided list so subagents can't overwrite
@@ -525,6 +612,19 @@ def handle_function_call(
                 task_id=task_id,
                 user_task=user_task,
             )
+
+        if getattr(_harness, "enabled", False):
+            try:
+                _harness.record_tool_complete(
+                    task_id=task_id or "",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+            except Exception:
+                pass
 
         try:
             from hermes_cli.plugins import invoke_hook
@@ -543,6 +643,20 @@ def handle_function_call(
         return result
 
     except Exception as e:
+        try:
+            from agent.harness import get_harness_manager
+
+            _harness = get_harness_manager()
+            if getattr(_harness, "enabled", False):
+                _harness.record_tool_error(
+                    task_id=task_id or "",
+                    tool_name=function_name,
+                    error=str(e),
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+        except Exception:
+            pass
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg}, ensure_ascii=False)
@@ -554,24 +668,29 @@ def handle_function_call(
 
 def get_all_tool_names() -> List[str]:
     """Return all registered tool names."""
+    _ensure_mcp_tool_discovery()
     return registry.get_all_tool_names()
 
 
 def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     """Return the toolset a tool belongs to."""
+    _ensure_mcp_tool_discovery()
     return registry.get_toolset_for_tool(tool_name)
 
 
 def get_available_toolsets() -> Dict[str, dict]:
     """Return toolset availability info for UI display."""
+    _ensure_mcp_tool_discovery()
     return registry.get_available_toolsets()
 
 
 def check_toolset_requirements() -> Dict[str, bool]:
     """Return {toolset: available_bool} for every registered toolset."""
+    _ensure_mcp_tool_discovery()
     return registry.check_toolset_requirements()
 
 
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """Return (available_toolsets, unavailable_info)."""
+    _ensure_mcp_tool_discovery()
     return registry.check_tool_availability(quiet=quiet)

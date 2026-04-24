@@ -477,6 +477,7 @@ class AIAgent:
         skip_memory: bool = False,
         session_db=None,
         parent_session_id: str = None,
+        parent_task_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -929,6 +930,8 @@ class AIAgent:
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._parent_session_id = parent_session_id
+        self._parent_task_id = parent_task_id
+        self._active_task_id = None
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         if self._session_db:
             try:
@@ -959,12 +962,27 @@ class AIAgent:
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
         
-        # Load config once for memory, skills, and compression sections
+        # Load config once for memory, skills, compression, and harness sections
         try:
             from hermes_cli.config import load_config as _load_agent_config
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+        self._agent_config = _agent_cfg
+
+        # Task harness — durable task admission / audit / acceptance substrate.
+        self._harness_config = _agent_cfg.get("harness", {}) if isinstance(_agent_cfg, dict) else {}
+        self._harness_enabled = bool(self._harness_config.get("enabled", False))
+        self._harness_manager = None
+        if self._harness_enabled:
+            try:
+                from agent.harness import get_harness_manager as _get_harness_manager
+
+                self._harness_manager = _get_harness_manager(_agent_cfg)
+            except Exception as exc:
+                logger.warning("Harness initialization failed: %s", exc)
+                self._harness_enabled = False
+                self._harness_manager = None
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1733,10 +1751,13 @@ class AIAgent:
         # Pick the right prompt based on which triggers fired
         if review_memory and review_skills:
             prompt = self._COMBINED_REVIEW_PROMPT
+            review_toolsets = ["memory", "skills"]
         elif review_memory:
             prompt = self._MEMORY_REVIEW_PROMPT
+            review_toolsets = ["memory"]
         else:
             prompt = self._SKILL_REVIEW_PROMPT
+            review_toolsets = ["skills"]
 
         def _run_review():
             import contextlib, os as _os
@@ -1751,6 +1772,7 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        enabled_toolsets=review_toolsets,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
@@ -5977,6 +5999,32 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _harness_preflight_tool(self, function_name: str, function_args: dict, effective_task_id: str,
+                                tool_call_id: Optional[str] = None) -> Optional[str]:
+        if not (self._harness_enabled and self._harness_manager and effective_task_id):
+            return None
+        try:
+            decision = self._harness_manager.preflight_tool_call(
+                task_id=effective_task_id,
+                tool_name=function_name,
+                args=function_args,
+                session_id=self.session_id or "",
+                tool_call_id=tool_call_id or "",
+            )
+        except Exception as exc:
+            logger.debug("Harness preflight failed for %s: %s", function_name, exc)
+            return None
+        if isinstance(decision, dict) and not decision.get("allowed", True):
+            return json.dumps(
+                {
+                    "error": decision.get("reason") or f"Harness blocked {function_name}",
+                    "harness_state": decision.get("state") or "blocked",
+                    "blocked_by": "harness",
+                },
+                ensure_ascii=False,
+            )
+        return None
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -5985,6 +6033,10 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        blocked_result = self._harness_preflight_tool(function_name, function_args, effective_task_id, tool_call_id)
+        if blocked_result is not None:
+            return blocked_result
+
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
@@ -6361,8 +6413,12 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            blocked_result = self._harness_preflight_tool(function_name, function_args, effective_task_id, tool_call.id)
 
-            if function_name == "todo":
+            if blocked_result is not None:
+                function_result = blocked_result
+                tool_duration = time.time() - tool_start_time
+            elif function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
                 function_result = _todo_tool(
                     todos=function_args.get("todos"),
@@ -6875,6 +6931,33 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        self._active_task_id = effective_task_id
+
+        harness_contract = None
+        if self._harness_enabled and self._harness_manager:
+            try:
+                _surface = os.environ.get("HERMES_SESSION_SOURCE") or (self.platform or "cli")
+                _workspace_root = (
+                    (self._agent_config.get("terminal", {}) or {}).get("cwd")
+                    if isinstance(getattr(self, "_agent_config", {}), dict)
+                    else ""
+                ) or os.getcwd()
+                harness_contract = self._harness_manager.admit_turn(
+                    task_id=effective_task_id,
+                    session_id=self.session_id or effective_task_id,
+                    surface=_surface,
+                    platform=getattr(self, "platform", None) or _surface,
+                    user_request=user_message,
+                    workspace_root=_workspace_root,
+                    max_iterations=self.max_iterations,
+                    parent_task_id=self._parent_task_id or self._parent_session_id or "",
+                )
+                _contract_context = self._harness_manager.build_turn_context(harness_contract)
+                if _contract_context:
+                    user_message = f"{user_message.rstrip()}\n\n{_contract_context}".strip()
+            except Exception as exc:
+                logger.warning("Harness admission failed for task %s: %s", effective_task_id, exc)
+                harness_contract = None
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -8064,6 +8147,31 @@ class AIAgent:
                         or "usage limit" in error_msg
                         or "quota" in error_msg
                     )
+                    if is_rate_limited and self._harness_enabled and self._harness_manager:
+                        try:
+                            if self._harness_manager.should_pause_for_rate_limit(
+                                provider=_provider,
+                                model=_model,
+                                error_text=error_msg,
+                                status_code=status_code,
+                            ):
+                                pause = self._harness_manager.record_budget_pause(
+                                    task_id=effective_task_id,
+                                    provider=_provider,
+                                    model=_model,
+                                    reason=error_msg,
+                                    metadata={"api_call_count": api_call_count},
+                                )
+                                retry_after_seconds = int(pause.get("retry_after_seconds") or 1800)
+                                retry_after_minutes = max(1, retry_after_seconds // 60)
+                                final_response = (
+                                    "High-value model quota was hit, so I paused this task instead of "
+                                    f"spending more tool turns retrying. Retry after about {retry_after_minutes} minutes."
+                                )
+                                interrupted = True
+                                break
+                        except Exception as exc:
+                            logger.debug("Harness budget pause check failed: %s", exc)
                     if is_rate_limited and self._fallback_index < len(self._fallback_chain):
                         # Don't eagerly fallback if credential pool rotation may
                         # still recover.  The pool's retry-then-rotate cycle needs
@@ -9126,7 +9234,11 @@ class AIAgent:
             final_response = self._handle_max_iterations(messages, api_call_count)
         
         # Determine if conversation completed successfully
-        completed = final_response is not None and api_call_count < self.max_iterations
+        completed = (
+            final_response is not None
+            and api_call_count < self.max_iterations
+            and not interrupted
+        )
 
         # Save trajectory if enabled
         self._save_trajectory(messages, user_message, completed)
@@ -9189,7 +9301,24 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "task_id": effective_task_id,
         }
+        if harness_contract is not None:
+            result["harness_plan_mode"] = harness_contract.plan_mode
+            result["plan_artifact_path"] = harness_contract.plan_artifact_path
+            try:
+                result["harness_state"] = self._harness_manager.finalize_turn(
+                    task_id=effective_task_id,
+                    final_response=final_response or "",
+                    completed=completed,
+                    interrupted=interrupted,
+                    api_calls=api_call_count,
+                    message_count=len(messages),
+                )
+            except Exception as exc:
+                logger.warning("Harness finalize failed for task %s: %s", effective_task_id, exc)
+                result["harness_state"] = "error"
+        self._active_task_id = None
         self._response_was_previewed = False
         
         # Include interrupt message if one triggered the interrupt

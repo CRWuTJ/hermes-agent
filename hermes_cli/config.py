@@ -464,6 +464,47 @@ DEFAULT_CONFIG = {
                                # independent of the parent's max_iterations)
     },
 
+    # Harness governance — task-centric execution control that sits above the
+    # raw agent loop.  This is the durable control-plane substrate for planning,
+    # admission, acceptance, drift detection, and audit evidence.
+    "harness": {
+        "enabled": False,
+        "db_path": "",  # empty = ~/.hermes/runtime/harness.sqlite3
+        "default_autonomy_target": "bounded",
+        "plan": {
+            "always_require_for_surfaces": ["cron", "delegate", "background"],
+            "max_direct_chars": 280,
+            "keywords": [
+                "plan", "design", "retrofit", "redesign", "refactor", "migration",
+                "architecture", "workflow", "harness", "规划", "方案", "改造",
+                "重构", "迁移", "架构", "治理",
+            ],
+            "inject_contract_context": True,
+        },
+        "acceptance": {
+            "require_evidence_for_plan_required": True,
+            "verification_tools": [
+                "terminal", "read_file", "search_files", "browser_console",
+                "browser_snapshot", "execute_code", "process",
+            ],
+        },
+        "drift": {
+            "enabled": True,
+            "blocked_tool_threshold": 2,
+            "read_only_streak_threshold": 6,
+        },
+        "audit": {
+            "capture_tool_results": True,
+            "result_preview_chars": 280,
+        },
+        "rate_limits": {
+            "subscription_retry_seconds": 1800,
+            "pause_high_value_models": True,
+            "allow_model_downgrade": False,
+            "high_value_model_patterns": ["gpt-5", "claude-opus", "claude-sonnet"],
+        },
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
@@ -548,7 +589,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 12,
+    "_config_version": 13,
 }
 
 # =============================================================================
@@ -1339,7 +1380,7 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "custom_providers", "memory", "gateway",
+    "harness", "auxiliary", "custom_providers", "memory", "gateway",
 }
 
 # Valid fields inside a custom_providers list entry
