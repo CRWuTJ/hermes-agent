@@ -68,9 +68,19 @@ class TestDetectAudioEnvironment:
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr("tools.voice_mode.os.path.exists", lambda path: False if path == "/.dockerenv" else os.path.exists(path))
 
-        from tools.voice_mode import detect_audio_environment
-        result = detect_audio_environment()
+        _real_open = open
+
+        def _fake_open(f, *a, **kw):
+            if f == "/proc/version":
+                from io import StringIO
+                return StringIO("Linux 6.6.0-generic")
+            return _real_open(f, *a, **kw)
+
+        with patch("builtins.open", side_effect=_fake_open):
+            from tools.voice_mode import detect_audio_environment
+            result = detect_audio_environment()
         assert result["available"] is True
         assert result["warnings"] == []
 

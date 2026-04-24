@@ -249,39 +249,41 @@ def _make_execute_only_env(forward_env=None):
 
 
 def test_execute_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):
-    env = _make_execute_only_env(["GITHUB_TOKEN"])
+    env = _make_execute_only_env(["TEST_FORWARD_ENV"])
     popen_calls = []
 
     def _fake_popen(cmd, **kwargs):
         popen_calls.append(cmd)
         return _FakePopen(cmd, **kwargs)
 
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"GITHUB_TOKEN": "value_from_dotenv"})
+    monkeypatch.delenv("TEST_FORWARD_ENV", raising=False)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"TEST_FORWARD_ENV": "value_from_dotenv"})
     monkeypatch.setattr(docker_env.subprocess, "Popen", _fake_popen)
 
     result = env.execute("echo hi")
 
     assert result["returncode"] == 0
-    assert "GITHUB_TOKEN=value_from_dotenv" in popen_calls[0]
+    env_pairs = list(zip(popen_calls[0], popen_calls[0][1:]))
+    assert ("-e", "TEST_FORWARD_ENV=value_from_dotenv") in env_pairs
 
 
 def test_execute_prefers_shell_env_over_hermes_dotenv(monkeypatch):
-    env = _make_execute_only_env(["GITHUB_TOKEN"])
+    env = _make_execute_only_env(["TEST_FORWARD_ENV"])
     popen_calls = []
 
     def _fake_popen(cmd, **kwargs):
         popen_calls.append(cmd)
         return _FakePopen(cmd, **kwargs)
 
-    monkeypatch.setenv("GITHUB_TOKEN", "value_from_shell")
-    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"GITHUB_TOKEN": "value_from_dotenv"})
+    monkeypatch.setenv("TEST_FORWARD_ENV", "value_from_shell")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"TEST_FORWARD_ENV": "value_from_dotenv"})
     monkeypatch.setattr(docker_env.subprocess, "Popen", _fake_popen)
 
     env.execute("echo hi")
 
-    assert "GITHUB_TOKEN=value_from_shell" in popen_calls[0]
-    assert "GITHUB_TOKEN=value_from_dotenv" not in popen_calls[0]
+    env_pairs = list(zip(popen_calls[0], popen_calls[0][1:]))
+    assert ("-e", "TEST_FORWARD_ENV=value_from_shell") in env_pairs
+    assert "TEST_FORWARD_ENV=value_from_dotenv" not in popen_calls[0]
 
 
 # ── docker_env tests ──────────────────────────────────────────────
