@@ -1306,6 +1306,22 @@ class TestConcurrentToolExecution:
             mock_todo.assert_called_once()
         assert "ok" in result
 
+    def test_invoke_tool_respects_harness_preflight_block(self, agent):
+        agent._harness_enabled = True
+        agent._harness_manager = MagicMock()
+        agent._harness_manager.preflight_tool_call.return_value = {
+            "allowed": False,
+            "reason": "blocked by harness",
+            "state": "planning",
+        }
+
+        with patch("tools.todo_tool.todo_tool") as mock_todo:
+            result = agent._invoke_tool("todo", {"todos": []}, "task-1", tool_call_id="c1")
+
+        mock_todo.assert_not_called()
+        assert "blocked by harness" in result
+        assert "planning" in result
+
 
 class TestPathsOverlap:
     """Unit tests for the _paths_overlap helper."""
@@ -3496,3 +3512,74 @@ class TestDeadRetryCode:
             f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
             f"but found {occurrences}"
         )
+
+
+class _ImmediateThread:
+    def __init__(self, target=None, args=(), kwargs=None, **_):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+
+class _ReviewChildAgent:
+    created_kwargs = []
+
+    def __init__(self, **kwargs):
+        self.__class__.created_kwargs.append(kwargs)
+        self._session_messages = []
+        self.client = None
+        self._memory_store = None
+        self._memory_enabled = False
+        self._user_profile_enabled = False
+        self._memory_nudge_interval = None
+        self._skill_nudge_interval = None
+
+    def run_conversation(self, user_message=None, conversation_history=None):
+        return None
+
+    def _close_openai_client(self, client, reason=None, shared=False):
+        return None
+
+
+@pytest.mark.parametrize(
+    ("review_memory", "review_skills", "expected_toolsets"),
+    [
+        (True, False, ["memory"]),
+        (False, True, ["skills"]),
+        (True, True, ["memory", "skills"]),
+    ],
+)
+def test_background_review_uses_minimal_toolsets(review_memory, review_skills, expected_toolsets):
+    _ReviewChildAgent.created_kwargs = []
+
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("memory", "skill_manage"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        parent = AIAgent(
+            api_key="test-key-1234567890",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    with (
+        patch("run_agent.AIAgent", _ReviewChildAgent),
+        patch("threading.Thread", _ImmediateThread),
+    ):
+        parent._spawn_background_review(
+            messages_snapshot=[{"role": "user", "content": "remember this"}],
+            review_memory=review_memory,
+            review_skills=review_skills,
+        )
+
+    assert len(_ReviewChildAgent.created_kwargs) == 1
+    assert _ReviewChildAgent.created_kwargs[0]["enabled_toolsets"] == expected_toolsets

@@ -20,6 +20,39 @@ from hermes_cli.runtime_provider import resolve_requested_provider
 from hermes_constants import OPENROUTER_MODELS_URL
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
+
+def _format_harness_control_summary(action_payload) -> str | None:
+    if not isinstance(action_payload, dict):
+        return None
+    action = str(action_payload.get("action") or "").strip()
+    status = str(action_payload.get("status") or "").strip()
+    surface = str(action_payload.get("surface") or "").strip()
+    target_bucket = str(action_payload.get("target_bucket") or "").strip()
+    created_at = str(action_payload.get("created_at") or "").strip()
+    parts = [part for part in [action, status] if part]
+    if surface:
+        parts.append(f"via {surface}")
+    if target_bucket:
+        parts.append(target_bucket)
+    if created_at:
+        parts.append(created_at)
+    return " · ".join(parts) if parts else None
+
+
+def _format_harness_recent_control(control_payload) -> str | None:
+    control = control_payload if isinstance(control_payload, dict) else {}
+    latest_control_action = _format_harness_control_summary(control.get("latest_action"))
+    latest_recovery = _format_harness_control_summary(control.get("latest_recovery"))
+    if not latest_control_action and not latest_recovery:
+        return None
+    parts = []
+    if latest_control_action:
+        parts.append(latest_control_action)
+    if latest_recovery and latest_recovery != latest_control_action:
+        parts.append(f"recovery: {latest_recovery}")
+    return " ; ".join(parts) if parts else None
+
+
 def check_mark(ok: bool) -> str:
     if ok:
         return color("✓", Colors.GREEN)
@@ -77,6 +110,21 @@ def _effective_provider_label() -> str:
         effective = "custom"
 
     return provider_label(effective)
+
+
+def _gateway_restart_command(system: bool = False, user: bool = False) -> str:
+    return f"{'sudo ' if system else ''}hermes gateway restart{' --system' if system else ' --user' if user else ''}"
+
+
+def _gateway_repair_preview_command(system: bool = False) -> str:
+    return f"hermes gateway repair{' --system' if system else ''}"
+
+
+def _gateway_repair_apply_command(system: bool = False, cleanup_legacy: bool = False) -> str:
+    command = f"{'sudo ' if system else ''}hermes gateway repair{' --system' if system else ''} --apply"
+    if cleanup_legacy:
+        command += " --cleanup-legacy"
+    return command
 
 
 def show_status(args):
@@ -309,22 +357,37 @@ def show_status(args):
     
     if sys.platform.startswith('linux'):
         try:
-            from hermes_cli.gateway import get_service_name
-            _gw_svc = get_service_name()
+            from hermes_cli.gateway import get_gateway_systemd_report, systemd_unit_path_is_current
+            gateway_report = get_gateway_systemd_report()
         except Exception:
-            _gw_svc = "hermes-gateway"
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-active", _gw_svc],
-                capture_output=True,
-                text=True,
-                timeout=5
+            gateway_report = {"installed": False}
+            systemd_unit_path_is_current = None
+
+        is_active = gateway_report.get("active") is True
+        state_label = "running" if is_active else (gateway_report.get("state") or "stopped")
+        manager_label = f"systemd ({gateway_report.get('scope')})" if gateway_report.get("installed") else "systemd (user)"
+        print(f"  Status:       {check_mark(is_active)} {state_label}")
+        print(f"  Manager:      {manager_label}")
+        if gateway_report.get("installed"):
+            unit_name = gateway_report.get("unit_name")
+            active_system = bool(gateway_report.get("system"))
+            unit_path = Path(gateway_report.get("unit_path")) if gateway_report.get("unit_path") else None
+            outdated = bool(
+                unit_path
+                and unit_path.exists()
+                and systemd_unit_path_is_current is not None
+                and not systemd_unit_path_is_current(unit_path, system=active_system)
             )
-            is_active = result.stdout.strip() == "active"
-        except subprocess.TimeoutExpired:
-            is_active = False
-        print(f"  Status:       {check_mark(is_active)} {'running' if is_active else 'stopped'}")
-        print("  Manager:      systemd (user)")
+            if gateway_report.get("drifted"):
+                print(f"  Unit:         {unit_name} (legacy/non-canonical)")
+                print("  Drift:        yes")
+                print(f"  Preview:      {_gateway_repair_preview_command(system=active_system)}")
+                print(f"  Apply:        {_gateway_repair_apply_command(system=active_system, cleanup_legacy=True)}")
+            else:
+                print(f"  Unit:         {unit_name}")
+            if outdated:
+                print("  Definition:   outdated")
+                print(f"  Refresh:      {_gateway_restart_command(system=active_system)}")
         
     elif sys.platform == 'darwin':
         from hermes_cli.gateway import get_launchd_label
@@ -343,27 +406,70 @@ def show_status(args):
     else:
         print(f"  Status:       {color('N/A', Colors.DIM)}")
         print("  Manager:      (not supported on this platform)")
+
+    try:
+        from gateway.status import build_gateway_status_payload, render_status_activity_block
+
+        status_payload = build_gateway_status_payload()
+        activity_block = render_status_activity_block(status_payload, style="cli")
+        activity_lines = activity_block.splitlines() if activity_block else []
+    except Exception:
+        status_payload = {"live_tasks": {}, "cron": None}
+        activity_lines = []
+
+    active_lane_lines = [line for line in activity_lines if line.startswith("  Active lanes:")]
+    cron_activity_lines = [line for line in activity_lines if not line.startswith("  Active lanes:")]
+    for line in active_lane_lines:
+        print(line)
     
     # =========================================================================
     # Cron Jobs
     # =========================================================================
     print()
     print(color("◆ Scheduled Jobs", Colors.CYAN, Colors.BOLD))
-    
-    jobs_file = get_hermes_home() / "cron" / "jobs.json"
-    if jobs_file.exists():
-        import json
-        try:
-            with open(jobs_file, encoding="utf-8") as f:
-                data = json.load(f)
-                jobs = data.get("jobs", [])
-                enabled_jobs = [j for j in jobs if j.get("enabled", True)]
-                print(f"  Jobs:         {len(enabled_jobs)} active, {len(jobs)} total")
-        except Exception:
-            print("  Jobs:         (error reading jobs file)")
+
+    if cron_activity_lines:
+        for line in cron_activity_lines:
+            print(line)
     else:
-        print("  Jobs:         0")
+        print("  Jobs:         (error reading jobs file)")
     
+    # =========================================================================
+    # Harness
+    # =========================================================================
+    print()
+    print(color("◆ Harness", Colors.CYAN, Colors.BOLD))
+    try:
+        from agent.harness import get_harness_manager
+
+        harness_manager = get_harness_manager(config)
+        if getattr(harness_manager, "enabled", False):
+            harness_summary = harness_manager.summarize_tasks(limit=3)
+            print(f"  Enabled:      yes")
+            print(f"  Tasks:        {int(harness_summary.get('total') or 0)} tracked")
+            states = harness_summary.get("states") if isinstance(harness_summary.get("states"), dict) else {}
+            if states:
+                state_parts = [f"{key}={value}" for key, value in sorted(states.items())]
+                print(f"  States:       {' | '.join(state_parts)}")
+            recent = harness_summary.get("recent") if isinstance(harness_summary.get("recent"), list) else []
+            if recent:
+                top = recent[0]
+                goal = " ".join(str(top.get("goal") or "").split()).strip()
+                goal = goal[:72] + "…" if len(goal) > 72 else goal
+                print(
+                    f"  Recent:       {top.get('task_id', '')} · {top.get('state', '')} · {top.get('surface', '')}"
+                    + (f" · {goal}" if goal else "")
+                )
+                recent_control = _format_harness_recent_control(top.get("control"))
+                if recent_control:
+                    print(f"  Recent Control: {recent_control}")
+            else:
+                print("  Recent:       none")
+        else:
+            print("  Enabled:      no")
+    except Exception:
+        print("  Enabled:      (error reading harness state)")
+
     # =========================================================================
     # Sessions
     # =========================================================================

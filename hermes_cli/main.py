@@ -4376,31 +4376,55 @@ For more help on a command:
     
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
-    gateway_start.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_start_scope = gateway_start.add_mutually_exclusive_group()
+    gateway_start_scope.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_start_scope.add_argument("--user", action="store_true", help="Target the Linux user-level gateway service")
     
     # gateway stop
     gateway_stop = gateway_subparsers.add_parser("stop", help="Stop gateway service")
-    gateway_stop.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_stop_scope = gateway_stop.add_mutually_exclusive_group()
+    gateway_stop_scope.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_stop_scope.add_argument("--user", action="store_true", help="Target the Linux user-level gateway service")
     gateway_stop.add_argument("--all", action="store_true", help="Stop ALL gateway processes across all profiles")
     
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")
-    gateway_restart.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_restart_scope = gateway_restart.add_mutually_exclusive_group()
+    gateway_restart_scope.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_restart_scope.add_argument("--user", action="store_true", help="Target the Linux user-level gateway service")
     
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     gateway_status.add_argument("--deep", action="store_true", help="Deep status check")
-    gateway_status.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_status_scope = gateway_status.add_mutually_exclusive_group()
+    gateway_status_scope.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_status_scope.add_argument("--user", action="store_true", help="Target the Linux user-level gateway service")
     
     # gateway install
     gateway_install = gateway_subparsers.add_parser("install", help="Install gateway as service")
     gateway_install.add_argument("--force", action="store_true", help="Force reinstall")
-    gateway_install.add_argument("--system", action="store_true", help="Install as a Linux system-level service (starts at boot)")
+    gateway_install_scope = gateway_install.add_mutually_exclusive_group()
+    gateway_install_scope.add_argument("--system", action="store_true", help="Install as a Linux system-level service (starts at boot)")
+    gateway_install_scope.add_argument("--user", action="store_true", help="Install as a Linux user-level service")
     gateway_install.add_argument("--run-as-user", dest="run_as_user", help="User account the Linux system service should run as")
     
     # gateway uninstall
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")
-    gateway_uninstall.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_uninstall_scope = gateway_uninstall.add_mutually_exclusive_group()
+    gateway_uninstall_scope.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_uninstall_scope.add_argument("--user", action="store_true", help="Target the Linux user-level gateway service")
+
+    # gateway repair
+    gateway_repair = gateway_subparsers.add_parser(
+        "repair",
+        help="Plan or execute canonical gateway service repair",
+    )
+    gateway_repair_scope = gateway_repair.add_mutually_exclusive_group()
+    gateway_repair_scope.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_repair_scope.add_argument("--user", action="store_true", help="Target the Linux user-level gateway service")
+    gateway_repair.add_argument("--apply", action="store_true", help="Execute the repair instead of printing the dry-run plan")
+    gateway_repair.add_argument("--dry-run", action="store_true", help="Print the repair plan explicitly (this is the default mode)")
+    gateway_repair.add_argument("--cleanup-legacy", action="store_true", help="Delete the legacy unit file after canonical ownership is verified")
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
@@ -4583,6 +4607,7 @@ For more help on a command:
     cron_create.add_argument("--name", help="Optional human-friendly job name")
     cron_create.add_argument("--deliver", help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id")
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
+    cron_create.add_argument("--lane", choices=["interactive", "cron_scout", "housekeeping"], help="Optional scheduler lane override")
     cron_create.add_argument("--skill", dest="skills", action="append", help="Attach a skill. Repeat to add multiple skills.")
     cron_create.add_argument("--script", help="Path to a Python script whose stdout is injected into the prompt each run")
 
@@ -4594,6 +4619,9 @@ For more help on a command:
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
+    lane_group = cron_edit.add_mutually_exclusive_group()
+    lane_group.add_argument("--lane", choices=["interactive", "cron_scout", "housekeeping"], help="Set an explicit scheduler lane override")
+    lane_group.add_argument("--clear-lane", action="store_true", help="Remove the explicit lane and return to default routing")
     cron_edit.add_argument("--skill", dest="skills", action="append", help="Replace the job's skills with this set. Repeat to attach multiple skills.")
     cron_edit.add_argument("--add-skill", dest="add_skills", action="append", help="Append a skill without replacing the existing list. Repeatable.")
     cron_edit.add_argument("--remove-skill", dest="remove_skills", action="append", help="Remove a specific attached skill. Repeatable.")

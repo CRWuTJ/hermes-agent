@@ -255,6 +255,46 @@ class TestRunBackgroundTask:
         assert "Background task complete" in content
         assert "Hello from background!" in content
 
+
+
+    @pytest.mark.asyncio
+    async def test_background_task_excludes_default_mcp_servers_from_gateway_toolsets(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        mock_result = {"final_response": "Hello from background!", "messages": []}
+        config = {
+            "mcp_servers": {
+                "exa": {"url": "https://mcp.exa.ai/mcp"},
+                "web-search-prime": {"url": "https://api.z.ai/api/mcp/web_search_prime/mcp"},
+            }
+        }
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}), \
+             patch("gateway.run._load_gateway_config", return_value=config), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.run_conversation.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        enabled_toolsets = set(MockAgent.call_args.kwargs["enabled_toolsets"])
+        assert "web" in enabled_toolsets
+        assert "exa" not in enabled_toolsets
+        assert "web-search-prime" not in enabled_toolsets
+
     @pytest.mark.asyncio
     async def test_exception_sends_error_message(self):
         """When the agent raises an exception, an error message is sent."""

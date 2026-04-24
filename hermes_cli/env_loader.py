@@ -8,11 +8,36 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def _read_dotenv_values(path: Path, *, encoding: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding=encoding).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        values[key] = value.strip().strip("'\"")
+    return values
+
+
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        loaded_values = _read_dotenv_values(path, encoding="utf-8")
     except UnicodeDecodeError:
         load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        loaded_values = _read_dotenv_values(path, encoding="latin-1")
+
+    # Be explicit about precedence. Some callers import us after shell exports or
+    # earlier dotenv loads; re-assign here so user/project .env ordering is
+    # deterministic across entrypoints and test runners.
+    for key, value in loaded_values.items():
+        if value is None:
+            continue
+        if override or key not in os.environ:
+            os.environ[key] = value
 
 
 def load_hermes_dotenv(

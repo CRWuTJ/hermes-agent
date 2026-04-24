@@ -278,6 +278,32 @@ class TestGatewayRuntimeStatus:
         assert payload["queued_tasks"]["tasks"][0]["task_id"] == "task-now"
         assert payload["queued_tasks"]["tasks"][0]["actions"] == ["foreground", "reprioritize", "cancel"]
 
+    def test_track_runtime_task_clears_live_task_from_runtime_status_on_exit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from gateway import run as gateway_run
+
+        gateway_run._set_runtime_status_adapters(None)
+        gateway_run.task_lane_registry.finish_task("telegram:dm:test-live")
+
+        with gateway_run._track_runtime_task(
+            task_id="telegram:dm:test-live",
+            lane="interactive",
+            label="message turn",
+            source="gateway",
+            kind="live_turn",
+            control_mode="read_only",
+            actions=[],
+        ):
+            payload = status.read_runtime_status()
+            assert payload["live_tasks"]["active_count"] == 1
+            assert payload["live_tasks"]["tasks"][0]["task_id"] == "telegram:dm:test-live"
+
+        payload = status.read_runtime_status()
+        assert payload["live_tasks"]["active_count"] == 0
+        assert payload["live_tasks"]["tasks"] == []
+        assert payload["live_tasks"].get("oldest_running") is None
+
     def test_build_gateway_status_payload_normalizes_legacy_lane_keys(self, monkeypatch):
         monkeypatch.setattr(
             "gateway.task_control._queued_task_now",
@@ -554,6 +580,24 @@ class TestGatewayRuntimeStatus:
                     "priority": 10,
                     "priority_bucket": "now",
                     "queued_at": "2026-04-19T12:00:00+00:00",
+                    "harness": {
+                        "control": {
+                            "latest_action": {
+                                "action": "reprioritize",
+                                "status": "reprioritized",
+                                "surface": "chat",
+                                "target_bucket": "later",
+                                "created_at": "2026-04-21T18:00:00+00:00",
+                            },
+                            "latest_recovery": {
+                                "action": "recover",
+                                "status": "recovered",
+                                "surface": "api",
+                                "target_bucket": "next",
+                                "created_at": "2026-04-21T17:55:00+00:00",
+                            },
+                        }
+                    },
                 },
                 "tasks": [
                     {
@@ -588,6 +632,7 @@ class TestGatewayRuntimeStatus:
             "**Queued Lanes:** interactive=1 | cron/scout=0 | housekeeping=1",
             "**Queued Buckets:** now=1 | next=0 | later=1",
             "**Next Queued:** `task-now · interactive · now (10) · waiting 5m since 2026-04-19T12:00:00+00:00`",
+            "**Next Queued Recent:** `reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00 ; recovery: recover · recovered · via api · next · 2026-04-21T17:55:00+00:00`",
             "**Oldest Waiting:** `task-later · housekeeping · later (80) · waiting 2h 5m since 2026-04-19T10:00:00+00:00`",
             "**Starving Bucket:** `later · 1 queued · oldest wait 2h 5m · task-later`",
             "**Starvation Alert:** `warning · later bucket exceeded 2h threshold · waiting 2h 5m · /task task-later recover`",
@@ -597,6 +642,7 @@ class TestGatewayRuntimeStatus:
             "  Queue lanes:  interactive=1 | cron/scout=0 | housekeeping=1",
             "  Buckets:      now=1 | next=0 | later=1",
             "  Next queued:  task-now · interactive · now (10) · waiting 5m since 2026-04-19T12:00:00+00:00",
+            "  Next recent:  reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00 ; recovery: recover · recovered · via api · next · 2026-04-21T17:55:00+00:00",
             "  Oldest wait:  task-later · housekeeping · later (80) · waiting 2h 5m since 2026-04-19T10:00:00+00:00",
             "  Starving:     later · 1 queued · oldest wait 2h 5m · task-later",
             "  Alert:        warning · later bucket exceeded 2h threshold · waiting 2h 5m · /task task-later recover",
@@ -622,6 +668,16 @@ class TestGatewayRuntimeStatus:
                         "label": "background task",
                         "source": "gateway",
                         "started_at": "2026-01-01T00:00:00+00:00",
+                        "harness": {
+                            "control": {
+                                "latest_action": {
+                                    "action": "cancel",
+                                    "status": "cancellation_requested",
+                                    "surface": "chat",
+                                    "created_at": "2026-04-21T18:10:00+00:00",
+                                }
+                            }
+                        },
                     },
                     {
                         "task_id": "turn-1",
@@ -637,10 +693,12 @@ class TestGatewayRuntimeStatus:
         assert status.render_status_activity_lines(payload, style="chat") == [
             "**Active Lanes:** interactive=1 | cron/scout=1 | housekeeping=0",
             "**Longest Running:** `bg-1 · cron/scout · background task · running 5m since 2026-01-01T00:00:00+00:00`",
+            "**Longest Running Recent:** `cancel · cancellation_requested · via chat · 2026-04-21T18:10:00+00:00`",
         ]
         assert status.render_status_activity_lines(payload, style="cli") == [
             "  Active lanes: interactive=1 | cron/scout=1 | housekeeping=0",
             "  Longest run:  bg-1 · cron/scout · background task · running 5m since 2026-01-01T00:00:00+00:00",
+            "  Longest recent: cancel · cancellation_requested · via chat · 2026-04-21T18:10:00+00:00",
         ]
 
     def test_render_status_activity_block_supports_chat_and_cli_styles(self):

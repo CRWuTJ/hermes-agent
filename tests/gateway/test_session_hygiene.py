@@ -330,6 +330,8 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._topic_routing = {}
+    runner._background_tasks = set()
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key="agent:main:telegram:group:-1001:17585",
@@ -384,3 +386,102 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     # Compression warnings are no longer sent to users — compression
     # happens silently with server-side logging only.
     assert len(adapter.sent) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_telegram_dm_hard_limit_compresses_before_huge_context(monkeypatch, tmp_path):
+    """Telegram DM sessions should compress before they reach hundreds of messages.
+
+    Regression: with GPT-5.4's ~1M context window, a long-running Telegram DM
+    could grow to 200+ transcript messages without crossing the token-based
+    85% hygiene threshold. In practice this still caused bad UX: huge request
+    bodies, slow retries, and fallback churn. We enforce an earlier hard
+    message-count safety valve for Telegram DMs.
+    """
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class FakeCompressAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._print_fn = None
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            self.session_id = f"{self.session_id}_compressed"
+            return ([{"role": "assistant", "content": "compressed"}], None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = HygieneCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._topic_routing = {}
+    runner._background_tasks = set()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:6141351975",
+        session_id="sess-long-dm",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(232, content_size=10)
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 1_048_576,
+    )
+
+    event = MessageEvent(
+        text="continue",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="6141351975",
+            chat_type="dm",
+            user_id="6141351975",
+            user_name="tester",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert runner.session_store.rewrite_transcript.called, (
+        "Telegram DM hard message-limit should trigger hygiene compression "
+        "before running the agent under huge-context models"
+    )

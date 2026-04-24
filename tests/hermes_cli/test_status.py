@@ -135,6 +135,58 @@ def test_show_status_reports_live_task_lane_totals_from_runtime_status(monkeypat
     assert "Active lanes: interactive=1 | cron/scout=2 | housekeeping=0" in output
 
 
+def test_show_status_reports_harness_summary(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_gateway_systemd_report",
+        lambda: {"installed": False, "active": True, "state": "running", "scope": "user"},
+    )
+
+    fake_harness = type("FakeHarness", (), {
+        "enabled": True,
+        "summarize_tasks": lambda self, limit=3: {
+            "total": 4,
+            "states": {"completed": 2, "needs_replan": 1, "planning": 1},
+            "recent": [
+                {
+                    "task_id": "task-123",
+                    "state": "needs_replan",
+                    "surface": "cron",
+                    "goal": "Retrofit Hermes harness runtime unification",
+                    "control": {
+                        "latest_action": {
+                            "action": "reprioritize",
+                            "status": "reprioritized",
+                            "surface": "chat",
+                            "target_bucket": "later",
+                            "created_at": "2026-04-21T18:00:00+00:00",
+                        },
+                        "latest_recovery": {
+                            "action": "recover",
+                            "status": "recovered",
+                            "surface": "api",
+                            "target_bucket": "next",
+                            "created_at": "2026-04-21T17:55:00+00:00",
+                        },
+                    },
+                }
+            ],
+        },
+    })()
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "◆ Harness" in output
+    assert "Enabled:      yes" in output
+    assert "Tasks:        4 tracked" in output
+    assert "States:       completed=2 | needs_replan=1 | planning=1" in output
+    assert "Recent:       task-123 · needs_replan · cron · Retrofit Hermes harness runtime unification" in output
+    assert "Recent Control: reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00 ; recovery: recover · recovered · via api · next · 2026-04-21T17:55:00+00:00" in output
+
+
 def test_show_status_reads_persisted_queued_backlog_from_runtime_status_file(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(
@@ -261,10 +313,20 @@ def test_show_status_uses_shared_status_activity_block_renderer(monkeypatch, cap
     )
     with patch(
         "gateway.status.render_status_activity_block",
-        return_value="  Active lanes: interactive=7 | cron/scout=0 | housekeeping=0\n  Jobs:         42 active, 42 total",
+        return_value=(
+            "  Active lanes: interactive=7 | cron/scout=0 | housekeeping=0\n"
+            "  Jobs:         42 active, 42 total\n"
+            "  Next queued:  task-next · interactive · next (80)\n"
+            "  Next Queued Recent: reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00\n"
+            "  Longest running: runtime-1 · interactive · active\n"
+            "  Longest Running Recent: cancel · cancellation_requested · via chat · 2026-04-21T18:10:00+00:00"
+        ),
     ):
         show_status(SimpleNamespace(all=False, deep=False))
 
     output = capsys.readouterr().out
     assert "Active lanes: interactive=7 | cron/scout=0 | housekeeping=0" in output
     assert "Jobs:         42 active, 42 total" in output
+    assert "Next queued:  task-next · interactive · next (80)" in output
+    assert "Next Queued Recent: reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00" in output
+    assert "Longest Running Recent: cancel · cancellation_requested · via chat · 2026-04-21T18:10:00+00:00" in output
