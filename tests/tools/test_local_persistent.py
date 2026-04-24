@@ -75,6 +75,15 @@ class TestLocalOneShotRegression:
         assert "printf '" not in r["output"]
         assert "exit $" not in r["output"]
 
+    def test_oneshot_stdin_can_carry_heredoc_script(self):
+        """stdin lets callers avoid an outer shell consuming heredoc syntax."""
+        env = LocalEnvironment(persistent=False)
+        script = "cat <<'H_EOF'\nstdin heredoc body\nH_EOF\n"
+        r = env.execute("bash -s", stdin_data=script)
+        env.cleanup()
+        assert r["returncode"] == 0
+        assert r["output"].strip() == "stdin heredoc body"
+
 
 class TestLocalPersistent:
     @pytest.fixture

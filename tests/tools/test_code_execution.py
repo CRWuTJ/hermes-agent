@@ -115,6 +115,11 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def retry(", src)
         self.assertIn("import json, os, socket, shlex, time", src)
 
+    def test_terminal_stub_accepts_stdin(self):
+        src = generate_hermes_tools_module(["terminal"])
+        self.assertIn("def terminal(command: str, timeout: int = None, workdir: str = None, stdin: str = None):", src)
+        self.assertIn('"stdin": stdin', src)
+
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
 class TestExecuteCode(unittest.TestCase):

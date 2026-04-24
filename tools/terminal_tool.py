@@ -459,6 +459,7 @@ Background: Set background=true to get a session_id. Two patterns:
   (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
 Working directory: Use 'workdir' for per-command cwd.
+stdin: Use 'stdin' to feed multi-line scripts or payloads into commands, especially when a Windows PowerShell/WSL bridge would otherwise let the outer shell consume heredoc syntax like <<EOF.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
@@ -1042,6 +1043,7 @@ def terminal_tool(
     check_interval: Optional[int] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
+    stdin: Optional[str] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -1056,6 +1058,7 @@ def terminal_tool(
         check_interval: Seconds between auto-checks for background processes (gateway only, min 30)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, auto-notify the agent when the process exits
+        stdin: Optional text to pipe to the command's standard input
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1250,6 +1253,14 @@ def terminal_tool(
 
         # Prepare command for execution
         if background:
+            if stdin is not None:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "stdin is only supported for foreground terminal commands",
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
@@ -1365,6 +1376,8 @@ def terminal_tool(
                     execute_kwargs = {"timeout": effective_timeout}
                     if workdir:
                         execute_kwargs["cwd"] = workdir
+                    if stdin is not None:
+                        execute_kwargs["stdin_data"] = stdin
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
@@ -1629,6 +1642,10 @@ TERMINAL_SCHEMA = {
                 "type": "string",
                 "description": "Working directory for this command (absolute path). Defaults to the session working directory."
             },
+            "stdin": {
+                "type": "string",
+                "description": "Optional text to pipe to the command's stdin. Use this for multi-line scripts or heredoc-heavy payloads instead of embedding them in a PowerShell/WSL command line."
+            },
             "check_interval": {
                 "type": "integer",
                 "description": "Seconds between automatic status checks for background processes (gateway/messaging only, minimum 30). When set, I'll proactively report progress.",
@@ -1660,6 +1677,7 @@ def _handle_terminal(args, **kw):
         check_interval=args.get("check_interval"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
+        stdin=args.get("stdin"),
     )
 
 
