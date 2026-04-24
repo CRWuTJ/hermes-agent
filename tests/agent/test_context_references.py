@@ -106,6 +106,29 @@ def test_expand_file_range_and_folder_listing(sample_repo: Path):
     assert not result.warnings
 
 
+def test_folder_listing_falls_back_when_rg_cannot_execute(sample_repo: Path, monkeypatch):
+    from agent import context_references
+
+    real_run = context_references.subprocess.run
+
+    def fake_run(args, *pos_args, **kwargs):
+        if args and args[0] == "rg":
+            raise PermissionError("Permission denied: 'rg'")
+        return real_run(args, *pos_args, **kwargs)
+
+    monkeypatch.setattr(context_references.subprocess, "run", fake_run)
+
+    result = context_references.preprocess_context_references(
+        "Review @folder:src/",
+        cwd=sample_repo,
+        context_length=100_000,
+    )
+
+    assert "main.py" in result.message
+    assert "helper.py" in result.message
+    assert not result.warnings
+
+
 def test_expand_git_diff_staged_and_log(sample_repo: Path):
     from agent.context_references import preprocess_context_references
 

@@ -456,6 +456,8 @@ def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
         )
     except FileNotFoundError:
         return None
+    except OSError:
+        return None
     except subprocess.TimeoutExpired:
         return None
     if result.returncode != 0:
