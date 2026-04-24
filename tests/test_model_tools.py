@@ -1,6 +1,8 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
+import importlib
 import json
+import sys
 from unittest.mock import call, patch
 
 import pytest
@@ -13,6 +15,50 @@ from model_tools import (
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+def _fresh_import_model_tools():
+    sys.modules.pop("model_tools", None)
+    return importlib.import_module("model_tools")
+
+
+class TestLazyMcpDiscovery:
+    def test_import_does_not_eagerly_discover_mcp(self):
+        with patch("tools.mcp_tool.discover_mcp_tools") as mock_discover:
+            _fresh_import_model_tools()
+
+        assert mock_discover.call_count == 0
+
+    def test_non_mcp_toolsets_skip_mcp_discovery(self):
+        with patch("tools.mcp_tool.discover_mcp_tools") as mock_discover:
+            model_tools = _fresh_import_model_tools()
+            with patch.object(model_tools.registry, "get_definitions", return_value=[]):
+                model_tools.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+
+        assert mock_discover.call_count == 0
+
+    def test_hermes_toolsets_trigger_mcp_discovery_once(self):
+        with patch("tools.mcp_tool.discover_mcp_tools") as mock_discover:
+            model_tools = _fresh_import_model_tools()
+            with patch.object(model_tools.registry, "get_definitions", return_value=[]):
+                model_tools.get_tool_definitions(enabled_toolsets=["hermes-api-server"], quiet_mode=True)
+                model_tools.get_tool_definitions(enabled_toolsets=["hermes-api-server"], quiet_mode=True)
+
+        assert mock_discover.call_count == 1
+
+
+    def test_platform_like_toolsets_with_raw_mcp_server_name_skip_discovery(self):
+        enabled = [
+            "browser", "clarify", "code_execution", "cronjob", "delegation",
+            "file", "homeassistant", "image_gen", "memory", "session_search",
+            "skills", "terminal", "todo", "tts", "vision", "web", "websearch",
+        ]
+        with patch("tools.mcp_tool.discover_mcp_tools") as mock_discover:
+            model_tools = _fresh_import_model_tools()
+            with patch.object(model_tools.registry, "get_definitions", return_value=[]):
+                model_tools.get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+
+        assert mock_discover.call_count == 0
 
 
 # =========================================================================
