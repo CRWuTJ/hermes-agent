@@ -11,6 +11,40 @@ import scripts.gateway_canonical_repair as repair_script
 
 
 class TestSystemdServiceRefresh:
+    def test_unit_current_preserves_installed_venv_when_checker_runs_from_other_venv(self, tmp_path, monkeypatch):
+        project = tmp_path / "repo"
+        project.mkdir()
+        installed_venv = project / "venv"
+        active_venv = project / ".venv"
+        (installed_venv / "bin").mkdir(parents=True)
+        (active_venv / "bin").mkdir(parents=True)
+        (installed_venv / "bin" / "python").write_text("", encoding="utf-8")
+        (active_venv / "bin" / "python").write_text("", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", project)
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: active_venv)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(active_venv / "bin" / "python"))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("wutj", "wutj", "/home/wutj"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_build_user_local_paths",
+            lambda home, existing: ["/home/wutj/.local/bin"],
+        )
+        monkeypatch.setattr(gateway_cli, "_hermes_home_for_target_user", lambda home: "/home/wutj/.hermes")
+
+        unit_text = gateway_cli.generate_systemd_unit(system=True, run_as_user="wutj").replace(
+            str(active_venv),
+            str(installed_venv),
+        )
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text(unit_text, encoding="utf-8")
+
+        assert gateway_cli.systemd_unit_path_is_current(unit_path, system=True) is True
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -124,6 +158,20 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "TimeoutStopSec=60" in unit
 
+    def test_user_unit_includes_control_plane_limits_without_forcing_system_slice(self):
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert "Delegate=no" in unit
+        assert "CPUAccounting=yes" in unit
+        assert "MemoryAccounting=yes" in unit
+        assert "TasksAccounting=yes" in unit
+        assert "CPUWeight=50" in unit
+        assert "TasksMax=128" in unit
+        assert "MemoryHigh=384M" in unit
+        assert "MemoryMax=768M" in unit
+        assert "OOMPolicy=stop" in unit
+        assert "Slice=system.slice" not in unit
+
     def test_user_unit_includes_resolved_node_directory_in_path(self, monkeypatch):
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: "/home/test/.nvm/versions/node/v24.14.0/bin/node" if cmd == "node" else None)
 
@@ -138,6 +186,41 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "TimeoutStopSec=60" in unit
         assert "WantedBy=multi-user.target" in unit
+
+    def test_system_unit_includes_control_plane_limits_and_explicit_system_slice(self):
+        unit = gateway_cli.generate_systemd_unit(system=True)
+
+        assert "Slice=system.slice" in unit
+        assert "Delegate=no" in unit
+        assert "CPUAccounting=yes" in unit
+        assert "MemoryAccounting=yes" in unit
+        assert "TasksAccounting=yes" in unit
+        assert "CPUWeight=50" in unit
+        assert "TasksMax=128" in unit
+        assert "MemoryHigh=384M" in unit
+        assert "MemoryMax=768M" in unit
+        assert "OOMPolicy=stop" in unit
+
+    def test_control_plane_limits_have_safe_operator_overrides(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_CONTROL_PLANE_TASKS_MAX", "512")
+        monkeypatch.setenv("HERMES_GATEWAY_CONTROL_PLANE_MEMORY_HIGH", "1G")
+        monkeypatch.setenv("HERMES_GATEWAY_CONTROL_PLANE_MEMORY_MAX", "2G")
+        monkeypatch.setenv("HERMES_GATEWAY_CONTROL_PLANE_CPU_WEIGHT", "75")
+
+        unit = gateway_cli.generate_systemd_unit(system=True)
+
+        assert "TasksMax=512" in unit
+        assert "MemoryHigh=1G" in unit
+        assert "MemoryMax=2G" in unit
+        assert "CPUWeight=75" in unit
+        assert "TasksMax=128" not in unit
+        assert "MemoryMax=768M" not in unit
+
+    def test_control_plane_limit_override_rejects_unit_injection(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_CONTROL_PLANE_MEMORY_MAX", "768M\nExecStart=/bin/true")
+
+        with pytest.raises(ValueError, match="HERMES_GATEWAY_CONTROL_PLANE_MEMORY_MAX"):
+            gateway_cli.generate_systemd_unit(system=True)
 
 
 class TestGatewayStopCleanup:

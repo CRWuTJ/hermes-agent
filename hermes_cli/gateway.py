@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -254,6 +255,53 @@ def is_windows() -> bool:
 
 _SERVICE_BASE = "hermes-gateway"
 SERVICE_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
+_GATEWAY_CONTROL_PLANE_SYSTEMD_PROPERTIES = (
+    ("Delegate", "no"),
+    ("CPUAccounting", "yes"),
+    ("MemoryAccounting", "yes"),
+    ("TasksAccounting", "yes"),
+    ("CPUWeight", "50"),
+    ("TasksMax", "128"),
+    ("MemoryHigh", "384M"),
+    ("MemoryMax", "768M"),
+    ("OOMPolicy", "stop"),
+)
+
+
+def _control_plane_property_env_key(key: str) -> str:
+    snake = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", snake)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", snake).strip("_").upper()
+    return f"HERMES_GATEWAY_CONTROL_PLANE_{normalized}"
+
+
+def _control_plane_property_value(key: str, default: str) -> str:
+    """Resolve a gateway control-plane systemd property.
+
+    Defaults intentionally keep the live gateway as a small control plane; heavy
+    conversations run in detached hermes-worker.slice units. Operators with
+    larger chat fan-out can override any property via env, e.g.
+    HERMES_GATEWAY_CONTROL_PLANE_MEMORY_MAX=2G.
+    """
+    env_key = _control_plane_property_env_key(key)
+    raw_value = os.getenv(env_key)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+    value = str(raw_value).strip()
+    if any(ch in value for ch in "\r\n="):
+        raise ValueError(f"Invalid {env_key}: systemd property values must be single-line values")
+    return value
+
+
+def _render_gateway_control_plane_properties(*, system: bool) -> str:
+    lines = []
+    if system:
+        lines.append("Slice=system.slice")
+    lines.extend(
+        f"{key}={_control_plane_property_value(key, value)}"
+        for key, value in _GATEWAY_CONTROL_PLANE_SYSTEMD_PROPERTIES
+    )
+    return "\n".join(lines)
 
 
 def _profile_suffix() -> str:
@@ -1001,6 +1049,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
     venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
     node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
+    control_plane_properties = _render_gateway_control_plane_properties(system=system)
 
     path_entries = [venv_bin, node_bin]
     resolved_node = shutil.which("node")
@@ -1037,6 +1086,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+{control_plane_properties}
 Restart=on-failure
 RestartSec=30
 KillMode=mixed
@@ -1067,6 +1117,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+{control_plane_properties}
 Restart=on-failure
 RestartSec=30
 KillMode=mixed
@@ -1085,7 +1136,18 @@ def _normalize_service_definition(text: str) -> str:
 
 def _expected_systemd_unit_text(unit_path: Path, system: bool = False) -> str:
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
-    return generate_systemd_unit(system=system, run_as_user=expected_user)
+    expected = generate_systemd_unit(system=system, run_as_user=expected_user)
+    installed_venv = _read_systemd_env_from_unit(unit_path, "VIRTUAL_ENV")
+    detected_venv = _detect_venv_dir()
+    if installed_venv and detected_venv:
+        installed_venv_path = Path(installed_venv)
+        if (
+            installed_venv_path != detected_venv
+            and installed_venv_path.is_dir()
+            and (installed_venv_path / ("Scripts" if is_windows() else "bin")).is_dir()
+        ):
+            expected = expected.replace(str(detected_venv), str(installed_venv_path))
+    return expected
 
 
 def systemd_unit_path_is_current(unit_path: Path, system: bool = False) -> bool:
