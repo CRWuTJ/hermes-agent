@@ -501,6 +501,7 @@ def _build_child_agent(
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, '_session_db', None),
         parent_session_id=getattr(parent_agent, 'session_id', None),
+        parent_task_id=getattr(parent_agent, '_active_task_id', None),
         providers_allowed=parent_agent.providers_allowed,
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
@@ -508,6 +509,9 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    child._delegate_child_toolsets = list(child_toolsets)
+    child._delegate_child_system_prompt = child_prompt
+    child._delegate_child_acp_args = list(effective_acp_args)
     child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
@@ -528,6 +532,99 @@ def _build_child_agent(
             parent_agent._active_children.append(child)
 
     return child
+
+
+def _should_use_detached_delegate_worker(child, parent_agent) -> bool:
+    try:
+        from tools.detached_runtime import transient_unit_launcher_available
+        from tools.terminal_tool import _has_live_or_origin_messaging_context
+    except Exception:
+        return False
+    return _has_live_or_origin_messaging_context() and transient_unit_launcher_available()
+
+
+def _detached_delegate_pool_hint(child) -> tuple[Optional[str], Optional[str]]:
+    child_pool = getattr(child, "_credential_pool", None)
+    if child_pool is None:
+        return None, None
+    provider = str(getattr(child_pool, "provider", "") or "").strip() or None
+    preferred_id = None
+    try:
+        current_entry = child_pool.current()
+    except Exception:
+        current_entry = None
+    if current_entry is None and hasattr(child_pool, "peek"):
+        try:
+            current_entry = child_pool.peek()
+        except Exception:
+            current_entry = None
+    if current_entry is not None:
+        preferred_id = str(getattr(current_entry, "id", "") or "").strip() or None
+    return provider, preferred_id
+
+
+def _build_detached_delegate_request(task_index: int, goal: str, child, parent_agent) -> Dict[str, Any]:
+    child_task_id = getattr(child, "session_id", None) or f"delegate-{task_index}"
+    runtime_kwargs: Dict[str, Any] = {
+        "base_url": getattr(child, "base_url", None),
+        "api_key": getattr(child, "api_key", None),
+        "provider": getattr(child, "provider", None),
+        "api_mode": getattr(child, "api_mode", None),
+        "acp_command": getattr(child, "acp_command", None),
+        "acp_args": list(getattr(child, "_delegate_child_acp_args", None) or getattr(child, "acp_args", []) or []),
+        "max_tokens": getattr(child, "max_tokens", None),
+        "skip_context_files": True,
+        "skip_memory": True,
+        "parent_session_id": getattr(child, "parent_session_id", None) or getattr(parent_agent, "session_id", None),
+        "parent_task_id": getattr(child, "parent_task_id", None) or getattr(parent_agent, "_active_task_id", None),
+        "log_prefix": getattr(child, "log_prefix", None),
+    }
+    credential_pool_provider, preferred_credential_id = _detached_delegate_pool_hint(child)
+    return {
+        "message": goal,
+        "conversation_history": [],
+        "max_iterations": int(getattr(child, "max_iterations", DEFAULT_MAX_ITERATIONS) or DEFAULT_MAX_ITERATIONS),
+        "enabled_toolsets": list(getattr(child, "_delegate_child_toolsets", None) or getattr(child, "enabled_toolsets", None) or []),
+        "ephemeral_system_prompt": getattr(child, "_delegate_child_system_prompt", None) or getattr(child, "ephemeral_system_prompt", None),
+        "prefill_messages": getattr(child, "prefill_messages", None),
+        "reasoning_config": getattr(child, "reasoning_config", None),
+        "providers_allowed": getattr(child, "providers_allowed", None),
+        "providers_ignored": getattr(child, "providers_ignored", None),
+        "providers_order": getattr(child, "providers_order", None),
+        "provider_sort": getattr(child, "provider_sort", None),
+        "provider_require_parameters": bool(getattr(child, "provider_require_parameters", False)),
+        "provider_data_collection": getattr(child, "provider_data_collection", None),
+        "credential_pool_provider": credential_pool_provider,
+        "preferred_credential_id": preferred_credential_id,
+        "session_id": child_task_id,
+        "platform": getattr(child, "platform", None),
+        "model": getattr(child, "model", None),
+        "with_session_db": bool(getattr(child, "_session_db", None)),
+        "runtime_kwargs": runtime_kwargs,
+        "fallback_model": getattr(child, "fallback_model", None),
+    }
+
+
+def _attach_detached_delegate_worker(task_index: int, goal: str, child, parent_agent):
+    if not _should_use_detached_delegate_worker(child, parent_agent):
+        return None
+    try:
+        from gateway.worker_runtime import start_gateway_conversation_worker
+    except Exception:
+        logger.debug("Detached delegate worker runtime unavailable", exc_info=True)
+        return None
+    try:
+        handle = start_gateway_conversation_worker(
+            request=_build_detached_delegate_request(task_index, goal, child, parent_agent),
+        )
+    except Exception:
+        logger.warning("Detached delegate worker launch failed; falling back to in-process child execution.", exc_info=True)
+        return None
+    child._delegate_detached_handle = handle
+    child.interrupt = handle.interrupt
+    child.get_activity_summary = handle.get_activity_summary
+    return handle
+
 
 def _run_single_child(
     task_index: int,
@@ -551,9 +648,10 @@ def _run_single_child(
     _saved_tool_names = getattr(child, "_delegate_saved_tool_names",
                                 list(model_tools._last_resolved_tool_names))
 
+    detached_handle = _attach_detached_delegate_worker(task_index, goal, child, parent_agent)
     child_pool = getattr(child, '_credential_pool', None)
     leased_cred_id = None
-    if child_pool is not None:
+    if detached_handle is None and child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
             try:
@@ -564,10 +662,19 @@ def _run_single_child(
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 
     try:
-        result = child.run_conversation(user_message=goal)
+        child_task_id = getattr(child, "session_id", None) or f"delegate-{task_index}"
+        if detached_handle is not None:
+            result = detached_handle.wait_for_result_blocking()
+        else:
+            try:
+                result = child.run_conversation(user_message=goal, task_id=child_task_id)
+            except TypeError as exc:
+                if "task_id" not in str(exc) or "unexpected keyword" not in str(exc):
+                    raise
+                result = child.run_conversation(user_message=goal)
 
         # Flush any remaining batched progress to gateway
-        if child_progress_cb and hasattr(child_progress_cb, '_flush'):
+        if detached_handle is None and child_progress_cb and hasattr(child_progress_cb, '_flush'):
             try:
                 child_progress_cb._flush()
             except Exception as e:
@@ -637,9 +744,14 @@ def _run_single_child(
             exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
-        _input_tokens = getattr(child, "session_prompt_tokens", 0)
-        _output_tokens = getattr(child, "session_completion_tokens", 0)
-        _model = getattr(child, "model", None)
+        if detached_handle is not None:
+            _input_tokens = getattr(detached_handle, "session_prompt_tokens", 0)
+            _output_tokens = getattr(detached_handle, "session_completion_tokens", 0)
+            _model = getattr(detached_handle, "model", None) or getattr(child, "model", None)
+        else:
+            _input_tokens = getattr(child, "session_prompt_tokens", 0)
+            _output_tokens = getattr(child, "session_completion_tokens", 0)
+            _model = getattr(child, "model", None)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,

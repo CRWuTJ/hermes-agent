@@ -95,3 +95,43 @@ def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
             await server.shutdown()
 
     asyncio.run(_test())
+
+
+def test_run_stdio_wraps_live_context_in_attached_worker_unit(tmp_path):
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+
+    async def _test():
+        with patch("tools.mcp_tool.shutil.which", return_value='/opt/node/bin/npx'), \
+             patch.dict("os.environ", {"PATH": "/usr/bin", "HOME": str(tmp_path)}, clear=False), \
+             patch("tools.mcp_tool.StdioServerParameters") as mock_params, \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm), \
+             patch("tools.mcp_tool._should_attach_stdio_mcp_server", return_value=True), \
+             patch("tools.detached_runtime.build_piped_transient_unit_command", return_value=(["/mnt/c/Windows/System32/wsl.exe", "--wrapped", "cmd"], "hermes-mcp-websearch-123")) as mock_wrap, \
+             patch("tools.osv_check.check_package_for_malware", return_value=None) as mock_osv:
+            server = MCPServerTask("websearch")
+            await server.start({"command": "npx", "args": ["-y", "pkg"], "env": {"PATH": "/usr/bin"}})
+
+            call_kwargs = mock_params.call_args.kwargs
+            assert call_kwargs["command"] == "/mnt/c/Windows/System32/wsl.exe"
+            assert call_kwargs["args"] == ["--wrapped", "cmd"]
+            assert call_kwargs["env"] is None
+            mock_wrap.assert_called_once()
+            wrap_kwargs = mock_wrap.call_args.kwargs
+            assert wrap_kwargs["argv"] == ['/opt/node/bin/npx', '-y', 'pkg']
+            assert wrap_kwargs["extra_env"]["PATH"].startswith('/opt/node/bin')
+            mock_osv.assert_called_once_with('/opt/node/bin/npx', ['-y', 'pkg'])
+
+            await server.shutdown()
+
+    asyncio.run(_test())

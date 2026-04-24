@@ -31,6 +31,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _should_use_detached_delegate_worker,
+    _build_detached_delegate_request,
 )
 
 
@@ -55,6 +57,34 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
+
+
+class _FakeDetachedHandle:
+    def __init__(self, result=None):
+        self._result = result or {
+            "final_response": "ok from worker",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        self.model = "worker-model"
+        self.session_prompt_tokens = 11
+        self.session_completion_tokens = 7
+        self.interrupt_calls = []
+
+    def wait_for_result_blocking(self):
+        return dict(self._result)
+
+    def interrupt(self, message=None):
+        self.interrupt_calls.append(message)
+        return True
+
+    def get_activity_summary(self):
+        return {
+            "last_activity_ts": 123.0,
+            "last_activity_desc": "worker active",
+            "current_tool": "delegate_task",
+        }
 
 
 class TestDelegateRequirements(unittest.TestCase):
@@ -255,6 +285,84 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    def test_single_task_uses_detached_worker_in_live_messaging_context(self):
+        parent = _make_mock_parent(depth=0)
+        parent.platform = "telegram"
+        handle = _FakeDetachedHandle(
+            {
+                "final_response": "ok from worker",
+                "completed": True,
+                "api_calls": 2,
+                "messages": [],
+            }
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._attach_detached_delegate_worker", return_value=handle) as mock_attach:
+            mock_child = MagicMock()
+            mock_child.model = "parent-model"
+            mock_child._credential_pool = None
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Use worker lane", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["summary"], "ok from worker")
+        self.assertEqual(result["results"][0]["model"], "worker-model")
+        self.assertEqual(result["results"][0]["tokens"], {"input": 11, "output": 7})
+        mock_attach.assert_called_once()
+        mock_child.run_conversation.assert_not_called()
+
+    def test_detached_worker_gate_allows_credential_pool(self):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child._credential_pool = object()
+
+        with patch("tools.detached_runtime.transient_unit_launcher_available", return_value=True), \
+             patch("tools.terminal_tool._has_live_or_origin_messaging_context", return_value=True):
+            self.assertTrue(_should_use_detached_delegate_worker(child, parent))
+
+    def test_detached_delegate_request_carries_pool_metadata(self):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child.session_id = "child-1"
+        child.base_url = "https://openrouter.ai/api/v1"
+        child.api_key = "test-key"
+        child.provider = "openrouter"
+        child.api_mode = "chat_completions"
+        child.acp_command = None
+        child.acp_args = []
+        child.max_tokens = None
+        child.parent_session_id = "parent-session"
+        child.parent_task_id = "parent-task"
+        child.log_prefix = "[subagent-0]"
+        child.max_iterations = 42
+        child._delegate_child_toolsets = ["terminal", "file"]
+        child._delegate_child_system_prompt = "delegate prompt"
+        child.prefill_messages = []
+        child.reasoning_config = None
+        child.providers_allowed = None
+        child.providers_ignored = None
+        child.providers_order = None
+        child.provider_sort = None
+        child.provider_require_parameters = False
+        child.provider_data_collection = None
+        child.platform = "telegram"
+        child.model = "worker-model"
+        child._session_db = None
+        child.fallback_model = None
+        pool = MagicMock()
+        pool.provider = "custom:team-a"
+        pool.current.return_value = None
+        preferred_entry = MagicMock()
+        preferred_entry.id = "cred-42"
+        pool.peek.return_value = preferred_entry
+        child._credential_pool = pool
+
+        request = _build_detached_delegate_request(0, "do the thing", child, parent)
+
+        self.assertEqual(request["credential_pool_provider"], "custom:team-a")
+        self.assertEqual(request["preferred_credential_id"], "cred-42")
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)

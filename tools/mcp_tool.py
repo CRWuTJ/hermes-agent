@@ -69,6 +69,7 @@ Thread safety:
     free-threading).
 """
 
+import atexit
 import asyncio
 import inspect
 import json
@@ -79,9 +80,11 @@ import re
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_ATEEXIT_CLEANUP_REGISTERED = False
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -92,6 +95,66 @@ _MCP_HTTP_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_MESSAGE_HANDLER_SUPPORTED = False
+
+
+def _install_fallback_sampling_types() -> None:
+    global CreateMessageResult, CreateMessageResultWithTools, ErrorData
+    global SamplingCapability, SamplingToolsCapability, TextContent, ToolUseContent
+
+    if "TextContent" not in globals():
+        @dataclass
+        class TextContent:  # type: ignore[no-redef]
+            type: str
+            text: str
+        globals()["TextContent"] = TextContent
+
+    if "ToolUseContent" not in globals():
+        @dataclass
+        class ToolUseContent:  # type: ignore[no-redef]
+            type: str
+            id: str
+            name: str
+            input: Dict[str, Any]
+        globals()["ToolUseContent"] = ToolUseContent
+
+    if "CreateMessageResult" not in globals():
+        @dataclass
+        class CreateMessageResult:  # type: ignore[no-redef]
+            role: str
+            content: Any
+            model: str
+            stopReason: str
+        globals()["CreateMessageResult"] = CreateMessageResult
+
+    if "CreateMessageResultWithTools" not in globals():
+        @dataclass
+        class CreateMessageResultWithTools:  # type: ignore[no-redef]
+            role: str
+            content: List[Any]
+            model: str
+            stopReason: str
+        globals()["CreateMessageResultWithTools"] = CreateMessageResultWithTools
+
+    if "ErrorData" not in globals():
+        @dataclass
+        class ErrorData:  # type: ignore[no-redef]
+            code: int
+            message: str
+        globals()["ErrorData"] = ErrorData
+
+    if "SamplingToolsCapability" not in globals():
+        @dataclass
+        class SamplingToolsCapability:  # type: ignore[no-redef]
+            pass
+        globals()["SamplingToolsCapability"] = SamplingToolsCapability
+
+    if "SamplingCapability" not in globals():
+        @dataclass
+        class SamplingCapability:  # type: ignore[no-redef]
+            tools: Optional[Any] = None
+        globals()["SamplingCapability"] = SamplingCapability
+
+
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -122,6 +185,7 @@ try:
         _MCP_SAMPLING_TYPES = True
     except ImportError:
         logger.debug("MCP sampling types not available -- sampling disabled")
+        _install_fallback_sampling_types()
     # Notification types for dynamic tool discovery (tools/list_changed)
     try:
         from mcp.types import (
@@ -134,7 +198,52 @@ try:
     except ImportError:
         logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
 except ImportError:
+    ClientSession = None  # type: ignore[assignment]
+    StdioServerParameters = None  # type: ignore[assignment]
+    stdio_client = None  # type: ignore[assignment]
+    streamablehttp_client = None  # type: ignore[assignment]
+    streamable_http_client = None  # type: ignore[assignment]
     logger.debug("mcp package not installed -- MCP tool support disabled")
+
+
+def _ensure_sampling_type_symbols() -> None:
+    global _MCP_SAMPLING_TYPES
+    missing = [
+        name for name in (
+            "CreateMessageResult",
+            "CreateMessageResultWithTools",
+            "ErrorData",
+            "SamplingCapability",
+            "SamplingToolsCapability",
+            "TextContent",
+            "ToolUseContent",
+        )
+        if name not in globals()
+    ]
+    if not missing:
+        return
+    try:
+        from mcp.types import (
+            CreateMessageResult,
+            CreateMessageResultWithTools,
+            ErrorData,
+            SamplingCapability,
+            SamplingToolsCapability,
+            TextContent,
+            ToolUseContent,
+        )
+        globals().update({
+            "CreateMessageResult": CreateMessageResult,
+            "CreateMessageResultWithTools": CreateMessageResultWithTools,
+            "ErrorData": ErrorData,
+            "SamplingCapability": SamplingCapability,
+            "SamplingToolsCapability": SamplingToolsCapability,
+            "TextContent": TextContent,
+            "ToolUseContent": ToolUseContent,
+        })
+        _MCP_SAMPLING_TYPES = True
+    except ImportError:
+        _install_fallback_sampling_types()
 
 
 def _check_message_handler_support() -> bool:
@@ -152,6 +261,8 @@ def _check_message_handler_support() -> bool:
 
 
 _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
+if _MCP_AVAILABLE and not _MCP_SAMPLING_TYPES:
+    _ensure_sampling_type_symbols()
 if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
     logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
 
@@ -265,6 +376,20 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
         resolved_env = _prepend_path(resolved_env, command_dir)
 
     return resolved_command, resolved_env
+
+
+def _should_attach_stdio_mcp_server() -> bool:
+    try:
+        from tools.detached_runtime import transient_unit_launcher_available
+        from tools.terminal_tool import _has_live_or_origin_messaging_context
+    except Exception:
+        return False
+    return _has_live_or_origin_messaging_context() and transient_unit_launcher_available()
+
+
+def _stdio_unit_prefix(server_name: str) -> str:
+    safe = re.sub(r"[^a-z0-9-]+", "-", (server_name or "mcp").lower()).strip("-") or "mcp"
+    return f"hermes-mcp-{safe[:24]}"
 
 
 def _format_connect_error(exc: BaseException) -> str:
@@ -490,7 +615,8 @@ class SamplingHandler:
     @staticmethod
     def _error(message: str, code: int = -1):
         """Return ErrorData (MCP spec) or raise as fallback."""
-        if _MCP_SAMPLING_TYPES:
+        _ensure_sampling_type_symbols()
+        if _MCP_SAMPLING_TYPES or "ErrorData" in globals():
             return ErrorData(code=code, message=message)
         raise Exception(message)
 
@@ -498,6 +624,7 @@ class SamplingHandler:
 
     def _build_tool_use_result(self, choice, response):
         """Build a CreateMessageResultWithTools from an LLM tool_calls response."""
+        _ensure_sampling_type_symbols()
         self.metrics["tool_use_count"] += 1
 
         # Tool loop governance
@@ -555,6 +682,7 @@ class SamplingHandler:
 
     def _build_text_result(self, choice, response):
         """Build a CreateMessageResult from a normal text response."""
+        _ensure_sampling_type_symbols()
         self._tool_loop_count = 0  # reset on text response
         response_text = choice.message.content or ""
 
@@ -576,6 +704,7 @@ class SamplingHandler:
 
     def session_kwargs(self) -> dict:
         """Return kwargs to pass to ClientSession for sampling support."""
+        _ensure_sampling_type_symbols()
         return {
             "sampling_callback": self,
             "sampling_capabilities": SamplingCapability(
@@ -731,6 +860,7 @@ class MCPServerTask:
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
+        "_attached_unit_name",
     )
 
     def __init__(self, name: str):
@@ -842,6 +972,22 @@ class MCPServerTask:
                 f"MCP server '{self.name}': {malware_error}"
             )
 
+        if _should_attach_stdio_mcp_server():
+            from tools.detached_runtime import build_piped_transient_unit_command
+
+            wrapped_cmd, unit_name = build_piped_transient_unit_command(
+                unit_prefix=_stdio_unit_prefix(self.name),
+                cwd=os.getcwd(),
+                argv=[command] + list(args),
+                extra_env=safe_env,
+            )
+            command = wrapped_cmd[0]
+            args = wrapped_cmd[1:]
+            safe_env = None
+            self._attached_unit_name = unit_name
+        else:
+            self._attached_unit_name = ""
+
         server_params = StdioServerParameters(
             command=command,
             args=args,
@@ -870,6 +1016,7 @@ class MCPServerTask:
         if new_pids:
             with _lock:
                 _stdio_pids.difference_update(new_pids)
+        self._attached_unit_name = ""
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
@@ -1058,6 +1205,15 @@ class MCPServerTask:
                     await self._task
                 except asyncio.CancelledError:
                     pass
+        if self._attached_unit_name:
+            try:
+                from tools.detached_runtime import signal_unit
+                signal_unit(self._attached_unit_name, "TERM")
+                await asyncio.sleep(0.2)
+                signal_unit(self._attached_unit_name, "KILL")
+            except Exception:
+                pass
+            self._attached_unit_name = ""
         self.session = None
 
 
@@ -2165,6 +2321,15 @@ def _kill_orphaned_mcp_children() -> None:
             pass  # Already exited or inaccessible
 
 
+def _ensure_mcp_atexit_cleanup_registered() -> None:
+    """Register one best-effort process-exit cleanup for MCP servers."""
+    global _ATEEXIT_CLEANUP_REGISTERED
+    if _ATEEXIT_CLEANUP_REGISTERED:
+        return
+    atexit.register(shutdown_mcp_servers)
+    _ATEEXIT_CLEANUP_REGISTERED = True
+
+
 def _stop_mcp_loop():
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
@@ -2184,3 +2349,5 @@ def _stop_mcp_loop():
         # After closing the loop, any stdio subprocesses that survived the
         # graceful shutdown are now orphaned.  Force-kill them.
         _kill_orphaned_mcp_children()
+
+_ensure_mcp_atexit_cleanup_registered()

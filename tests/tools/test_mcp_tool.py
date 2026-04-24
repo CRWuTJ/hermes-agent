@@ -682,6 +682,22 @@ class TestShutdown:
         _servers.clear()
         shutdown_mcp_servers()  # Should not raise
 
+    def test_atexit_cleanup_registration_is_idempotent(self):
+        """MCP atexit cleanup is registered once even if helper is called repeatedly."""
+        import tools.mcp_tool as mcp_mod
+
+        previous = mcp_mod._ATEEXIT_CLEANUP_REGISTERED
+        try:
+            mcp_mod._ATEEXIT_CLEANUP_REGISTERED = False
+            with patch.object(mcp_mod.atexit, "register") as mock_register:
+                mcp_mod._ensure_mcp_atexit_cleanup_registered()
+                mcp_mod._ensure_mcp_atexit_cleanup_registered()
+
+            mock_register.assert_called_once_with(mcp_mod.shutdown_mcp_servers)
+            assert mcp_mod._ATEEXIT_CLEANUP_REGISTERED is True
+        finally:
+            mcp_mod._ATEEXIT_CLEANUP_REGISTERED = previous
+
     def test_shutdown_clears_servers(self):
         """shutdown_mcp_servers calls shutdown() on each server and clears dict."""
         import tools.mcp_tool as mcp_mod
@@ -1556,6 +1572,7 @@ from mcp.types import (
     ToolUseContent,
 )
 
+import tools.mcp_tool as mcp_tool
 from tools.mcp_tool import SamplingHandler, _safe_numeric
 
 
@@ -1867,6 +1884,27 @@ class TestConvertMessages:
 class TestSamplingCallbackText:
     def setup_method(self):
         self.handler = SamplingHandler("txt", {})
+
+    def test_text_response_recovers_missing_module_symbols(self, monkeypatch):
+        """Sampling handler should heal missing MCP sampling globals before building a result."""
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = _make_llm_response(
+            content="Hello from LLM"
+        )
+        monkeypatch.delattr(mcp_tool, "CreateMessageResult", raising=False)
+        monkeypatch.delattr(mcp_tool, "TextContent", raising=False)
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=fake_client.chat.completions.create.return_value,
+        ):
+            params = _make_sampling_params()
+            result = asyncio.run(self.handler(None, params))
+
+        assert result.content.text == "Hello from LLM"
+        assert result.model == "test-model"
+        assert hasattr(mcp_tool, "CreateMessageResult")
+        assert hasattr(mcp_tool, "TextContent")
 
     def test_text_response(self):
         """Full flow: text response returns CreateMessageResult."""
