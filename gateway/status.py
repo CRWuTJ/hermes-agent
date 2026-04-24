@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from gateway.task_control import (
+    format_harness_control_summary,
     normalize_priority_bucket,
     queued_task_iso,
     queued_task_priority_bucket,
@@ -844,6 +845,24 @@ def format_status_next_queued_task(task: Any) -> Optional[str]:
 
 
 
+def format_status_recent_control(task: Any) -> Optional[str]:
+    if not isinstance(task, dict):
+        return None
+    normalized = dict(task)
+    harness = normalized.get("harness") if isinstance(normalized.get("harness"), dict) else {}
+    harness_control = harness.get("control") if isinstance(harness.get("control"), dict) else {}
+    latest_control_action = format_harness_control_summary(harness_control.get("latest_action"))
+    latest_recovery = format_harness_control_summary(harness_control.get("latest_recovery"))
+    if not latest_control_action and not latest_recovery:
+        return None
+    parts = []
+    if latest_control_action:
+        parts.append(latest_control_action)
+    if latest_recovery and latest_recovery != latest_control_action:
+        parts.append(f"recovery: {latest_recovery}")
+    return " ; ".join(parts) if parts else None
+
+
 def format_status_oldest_running_task(task: Any) -> Optional[str]:
     normalized = _normalize_single_live_task(task)
     if normalized is None:
@@ -940,9 +959,13 @@ def render_status_activity_lines(status_payload: Any, *, style: str = "chat") ->
                 f"**Queued Lanes:** {format_status_lane_counts(queued_status.get('lane_counts'))}",
                 f"**Queued Buckets:** {format_status_bucket_counts(queued_status.get('bucket_counts'))}",
             ])
-            next_queued = format_status_next_queued_task(queued_status.get("next_task"))
+            next_queued_task = queued_status.get("next_task")
+            next_queued = format_status_next_queued_task(next_queued_task)
             if next_queued:
                 lines.append(f"**Next Queued:** `{next_queued}`")
+            next_recent = format_status_recent_control(next_queued_task)
+            if next_recent:
+                lines.append(f"**Next Queued Recent:** `{next_recent}`")
             oldest_waiting = format_status_next_queued_task(queued_status.get("oldest_waiting"))
             if oldest_waiting:
                 lines.append(f"**Oldest Waiting:** `{oldest_waiting}`")
@@ -954,9 +977,13 @@ def render_status_activity_lines(status_payload: Any, *, style: str = "chat") ->
                 lines.append(f"**Starvation Alert:** `{starvation_alert}`")
         if any(live_tasks["lane_counts"].values()):
             lines.append(f"**Active Lanes:** {format_status_lane_counts(live_tasks['lane_counts'])}")
-            oldest_running = format_status_oldest_running_task(live_tasks.get("oldest_running"))
+            oldest_running_task = live_tasks.get("oldest_running")
+            oldest_running = format_status_oldest_running_task(oldest_running_task)
             if oldest_running:
                 lines.append(f"**Longest Running:** `{oldest_running}`")
+            oldest_recent = format_status_recent_control(oldest_running_task)
+            if oldest_recent:
+                lines.append(f"**Longest Running Recent:** `{oldest_recent}`")
         if cron_status is not None:
             lines.extend([
                 f"**Cron Jobs:** {int(cron_status.get('active_jobs', 0) or 0)} active",
@@ -972,9 +999,13 @@ def render_status_activity_lines(status_payload: Any, *, style: str = "chat") ->
                 f"  Queue lanes:  {format_status_lane_counts(queued_status.get('lane_counts'))}",
                 f"  Buckets:      {format_status_bucket_counts(queued_status.get('bucket_counts'))}",
             ])
-            next_queued = format_status_next_queued_task(queued_status.get("next_task"))
+            next_queued_task = queued_status.get("next_task")
+            next_queued = format_status_next_queued_task(next_queued_task)
             if next_queued:
                 lines.append(f"  Next queued:  {next_queued}")
+            next_recent = format_status_recent_control(next_queued_task)
+            if next_recent:
+                lines.append(f"  Next recent:  {next_recent}")
             oldest_waiting = format_status_next_queued_task(queued_status.get("oldest_waiting"))
             if oldest_waiting:
                 lines.append(f"  Oldest wait:  {oldest_waiting}")
@@ -986,9 +1017,13 @@ def render_status_activity_lines(status_payload: Any, *, style: str = "chat") ->
                 lines.append(f"  Alert:        {starvation_alert}")
         if any(live_tasks["lane_counts"].values()):
             lines.append(f"  Active lanes: {format_status_lane_counts(live_tasks['lane_counts'])}")
-            oldest_running = format_status_oldest_running_task(live_tasks.get("oldest_running"))
+            oldest_running_task = live_tasks.get("oldest_running")
+            oldest_running = format_status_oldest_running_task(oldest_running_task)
             if oldest_running:
                 lines.append(f"  Longest run:  {oldest_running}")
+            oldest_recent = format_status_recent_control(oldest_running_task)
+            if oldest_recent:
+                lines.append(f"  Longest recent: {oldest_recent}")
         if cron_status is not None:
             lines.extend([
                 f"  Jobs:         {int(cron_status.get('active_jobs', 0) or 0)} active, {int(cron_status.get('total_jobs', 0) or 0)} total",

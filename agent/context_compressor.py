@@ -290,6 +290,9 @@ Update the summary using this exact structure. PRESERVE all existing information
 ## Constraints & Preferences
 [User preferences, coding style, constraints, important decisions — accumulate across compactions]
 
+## Do Not Do
+[Actions, shortcuts, resets, model changes, service restarts, or scope changes the user explicitly forbade. Preserve these across compactions.]
+
 ## Progress
 ### Done
 [Completed work — include specific file paths, commands run, results obtained]
@@ -327,6 +330,9 @@ Use this exact structure:
 
 ## Constraints & Preferences
 [User preferences, coding style, constraints, important decisions]
+
+## Do Not Do
+[Actions, shortcuts, resets, model changes, service restarts, or scope changes the user explicitly forbade]
 
 ## Progress
 ### Done

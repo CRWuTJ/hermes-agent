@@ -11,6 +11,7 @@ from gateway.task_control import (
     queued_task_wait_age,
     queued_task_wait_seconds,
     render_gateway_task_detail_block,
+    render_gateway_tasks_block,
     task_command_usage_text,
 )
 
@@ -259,3 +260,90 @@ def test_render_gateway_task_detail_block_includes_recover_shortcut_in_control_t
     )
 
     assert "**Control:** queued for this chat — use /task task-stale recover; /task task-stale now|next|later to reprioritize" in rendered
+
+
+
+def test_render_gateway_task_detail_block_includes_harness_control_summary():
+    rendered = render_gateway_task_detail_block(
+        {
+            "task_id": "task-hi",
+            "state": "queued",
+            "task": {
+                "task_id": "task-hi",
+                "lane": "interactive",
+                "priority": 50,
+                "priority_bucket": "next",
+                "kind": "queued_message",
+                "control_mode": "queued",
+                "actions": ["foreground", "reprioritize", "cancel"],
+                "source": "telegram",
+                "harness": {
+                    "control": {
+                        "latest_action": {
+                            "action": "reprioritize",
+                            "status": "reprioritized",
+                            "surface": "chat",
+                            "target_bucket": "later",
+                            "session_key": "telegram:user:123",
+                            "created_at": "2026-04-21T18:00:00+00:00",
+                        },
+                        "latest_recovery": {
+                            "action": "recover",
+                            "status": "recovered",
+                            "surface": "api",
+                            "target_bucket": "next",
+                            "session_key": "telegram:user:123",
+                            "created_at": "2026-04-21T17:55:00+00:00",
+                        },
+                    }
+                },
+            },
+        }
+    )
+
+    assert "**Latest Control Action:** reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00" in rendered
+    assert "**Latest Recovery:** recover · recovered · via api · next · 2026-04-21T17:55:00+00:00" in rendered
+
+
+
+def test_render_gateway_tasks_block_includes_harness_control_summary():
+    rendered = render_gateway_tasks_block(
+        {
+            "queued": {
+                "queued_count": 1,
+                "tasks": [
+                    {
+                        "task_id": "task-hi",
+                        "lane": "interactive",
+                        "priority": 50,
+                        "priority_bucket": "next",
+                        "reply_policy": "status_only",
+                        "preview": "queued follow-up",
+                        "actions": ["foreground", "reprioritize", "cancel"],
+                        "harness": {
+                            "control": {
+                                "latest_action": {
+                                    "action": "reprioritize",
+                                    "status": "reprioritized",
+                                    "surface": "chat",
+                                    "target_bucket": "later",
+                                    "created_at": "2026-04-21T18:00:00+00:00",
+                                },
+                                "latest_recovery": {
+                                    "action": "recover",
+                                    "status": "recovered",
+                                    "surface": "api",
+                                    "target_bucket": "next",
+                                    "created_at": "2026-04-21T17:55:00+00:00",
+                                },
+                            }
+                        },
+                    }
+                ],
+            },
+            "live": {"active_count": 0, "tasks": []},
+        }
+    )
+
+    assert "↳ recent: reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00" in rendered
+    assert "recover · recovered · via api · next · 2026-04-21T17:55:00+00:00" in rendered

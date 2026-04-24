@@ -489,6 +489,9 @@ def render_gateway_tasks_block(
         )
         if hint_line:
             lines.append(f"   {hint_line}")
+        recent_line = format_harness_recent_control_line(task)
+        if recent_line:
+            lines.append(f"   {recent_line}")
         alert = task.get("starvation_alert") if isinstance(task.get("starvation_alert"), dict) else None
         alert_line = format_task_starvation_alert(alert)
         if alert_line:
@@ -536,6 +539,9 @@ def render_gateway_tasks_block(
         hint_line = render_task_command_hints(task_id, actions=task.get("actions"))
         if hint_line:
             lines.append(f"   {hint_line}")
+        recent_line = format_harness_recent_control_line(task)
+        if recent_line:
+            lines.append(f"   {recent_line}")
 
     if not queued_tasks and not live_tasks:
         lines.append("No queued or active tasks.")
@@ -695,9 +701,79 @@ def build_task_action_error_payload(
     }
 
 
+def record_harness_task_action(
+    *,
+    task_id: str,
+    action: str,
+    status: str,
+    surface: str,
+    session_key: str = "",
+    platform: str = "",
+    target_bucket: Any = None,
+    task_context: Any = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return
+    try:
+        from agent.harness import get_harness_manager
+
+        manager = get_harness_manager()
+        if not getattr(manager, "enabled", False):
+            return
+        manager.record_task_action(
+            task_id=task_id,
+            action=action,
+            status=status,
+            surface=surface,
+            session_key=session_key,
+            platform=platform,
+            target_bucket=target_bucket,
+            task_context=task_context,
+            metadata=metadata,
+        )
+    except Exception:
+        return
+
+
 def humanize_task_kind(kind: Any) -> str:
     text = " ".join(str(kind or "").replace("_", " ").split()).strip()
     return text
+
+
+def format_harness_control_summary(action_payload: Any) -> Optional[str]:
+    if not isinstance(action_payload, dict):
+        return None
+    action = str(action_payload.get("action") or "").strip()
+    status = str(action_payload.get("status") or "").strip()
+    surface = str(action_payload.get("surface") or "").strip()
+    target_bucket = str(action_payload.get("target_bucket") or "").strip()
+    created_at = str(action_payload.get("created_at") or "").strip()
+    parts = [part for part in [action, status] if part]
+    if surface:
+        parts.append(f"via {surface}")
+    if target_bucket:
+        parts.append(target_bucket)
+    if created_at:
+        parts.append(created_at)
+    return " · ".join(parts) if parts else None
+
+
+def format_harness_recent_control_line(task_payload: Any) -> Optional[str]:
+    task = task_payload if isinstance(task_payload, dict) else {}
+    harness = task.get("harness") if isinstance(task.get("harness"), dict) else {}
+    harness_control = harness.get("control") if isinstance(harness.get("control"), dict) else {}
+    latest_control_action = format_harness_control_summary(harness_control.get("latest_action"))
+    latest_recovery = format_harness_control_summary(harness_control.get("latest_recovery"))
+    if not latest_control_action and not latest_recovery:
+        return None
+    parts: List[str] = []
+    if latest_control_action:
+        parts.append(latest_control_action)
+    if latest_recovery and latest_recovery != latest_control_action:
+        parts.append(f"recovery: {latest_recovery}")
+    return f"↳ recent: {' ; '.join(parts)}" if parts else None
 
 
 def describe_task_control(detail_payload: Any) -> Optional[str]:
@@ -758,6 +834,10 @@ def render_gateway_task_detail_block(
     preview = task.get("preview")
     actions = normalize_task_actions(task.get("actions"))
     control = describe_task_control(payload)
+    harness = task.get("harness") if isinstance(task.get("harness"), dict) else {}
+    harness_control = harness.get("control") if isinstance(harness.get("control"), dict) else {}
+    latest_control_action = format_harness_control_summary(harness_control.get("latest_action"))
+    latest_recovery = format_harness_control_summary(harness_control.get("latest_recovery"))
     starvation_alert = task.get("starvation_alert") if isinstance(task.get("starvation_alert"), dict) else None
     starvation_alert_text = format_task_starvation_alert(starvation_alert)
     suggested_command = str((starvation_alert or {}).get("suggested_command") or "").strip()
@@ -799,6 +879,10 @@ def render_gateway_task_detail_block(
         lines.append(f"**Preview:** {preview_text}")
     if control:
         lines.append(f"**Control:** {control}")
+    if latest_control_action:
+        lines.append(f"**Latest Control Action:** {latest_control_action}")
+    if latest_recovery and latest_recovery != latest_control_action:
+        lines.append(f"**Latest Recovery:** {latest_recovery}")
     if starvation_alert_text:
         lines.append(f"**Starvation Alert:** {starvation_alert_text}")
     if suggested_command:

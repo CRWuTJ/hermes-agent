@@ -80,19 +80,29 @@ def route_telegram_dm_turn(
     # 2. Keyword-based resume matching
     if mode == "keyword" and candidates:
         threshold = config.get("resume_threshold", 0.7)
+        current_score = _keyword_overlap_score(message, current_title or "") if current_title else 0.0
         best_match = None
         best_score = 0.0
 
         for cand in candidates:
-            title = cand.get("title", "")
-            if not title:
+            if cand.get("id") == current_session_id:
+                continue
+            topic_text = _candidate_topic_text(cand)
+            if not topic_text:
                 continue
 
             # Simple keyword overlap scoring
-            score = _keyword_overlap_score(message, title)
+            score = _keyword_overlap_score(message, topic_text)
             if score > best_score and score >= threshold:
                 best_score = score
                 best_match = cand
+
+        if current_score >= threshold and (best_match is None or current_score >= best_score):
+            return TopicRouteResult(
+                action="stay",
+                confidence=current_score,
+                reason="current session matches topic",
+            )
 
         if best_match:
             return TopicRouteResult(
@@ -105,6 +115,19 @@ def route_telegram_dm_turn(
 
     # 3. Default: stay in current session
     return TopicRouteResult(action="stay", reason="no routing triggered")
+
+
+def _candidate_topic_text(candidate: dict) -> str:
+    """Build the searchable topic text for a candidate session."""
+    parts = []
+    for key in ("title", "summary", "description", "workstream"):
+        value = candidate.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    keywords = candidate.get("keywords")
+    if isinstance(keywords, (list, tuple, set)):
+        parts.extend(str(item).strip() for item in keywords if str(item).strip())
+    return " ".join(parts)
 
 
 def _extract_title(message: str, trigger_keyword: str) -> Optional[str]:
@@ -216,5 +239,20 @@ def _keyword_overlap_score(message: str, title: str) -> float:
         score = max(score, 0.92)
     elif len(english_overlap) >= 2 and msg_en_words and english_overlap == msg_en_words:
         score = max(score, 0.82)
+
+    try:
+        from agent.harness import classify_workstream
+
+        message_workstream = classify_workstream(message)
+        title_workstream = classify_workstream(title)
+        if (
+            message_workstream
+            and title_workstream
+            and message_workstream == title_workstream
+            and message_workstream != "general"
+        ):
+            score = max(score, 0.86)
+    except Exception:
+        pass
 
     return score

@@ -600,3 +600,45 @@ class TestSummaryTargetRatio:
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
         assert c.protect_last_n == 20
+
+
+class TestSummaryPromptPreservesOperationalContext:
+    def _capture_summary_prompt(self, previous_summary: str = "") -> str:
+        captured = {}
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary body"
+
+        def fake_call_llm(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return mock_response
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=128_000), patch(
+            "agent.context_compressor.call_llm", side_effect=fake_call_llm
+        ):
+            compressor = ContextCompressor(model="gpt-5.5", quiet_mode=True)
+            compressor._previous_summary = previous_summary
+            compressor._generate_summary(
+                [
+                    {"role": "user", "content": "不要重启 live Telegram 服务。下一步继续恢复队列。"},
+                    {"role": "assistant", "content": "已记录约束。"},
+                ]
+            )
+
+        return captured["prompt"]
+
+    def test_first_summary_prompt_preserves_do_not_do_and_next_steps(self):
+        prompt = self._capture_summary_prompt()
+
+        assert "## Do Not Do" in prompt
+        assert "user explicitly forbade" in prompt
+        assert "## Next Steps" in prompt
+
+    def test_iterative_summary_prompt_preserves_do_not_do_and_next_steps(self):
+        prompt = self._capture_summary_prompt(
+            previous_summary="## Do Not Do\n- Do not restart live Telegram service."
+        )
+
+        assert "## Do Not Do" in prompt
+        assert "PRESERVE" in prompt
+        assert "## Next Steps" in prompt

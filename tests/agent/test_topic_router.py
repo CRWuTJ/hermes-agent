@@ -33,3 +33,56 @@ def test_route_telegram_dm_turn_resumes_english_subset_for_longer_topic_title():
     assert result.action == "resume"
     assert result.target_session_id == "sess-routing"
     assert result.target_title == "Telegram DM topic routing"
+
+
+def test_route_telegram_dm_turn_uses_workstream_match_across_languages():
+    result = route_telegram_dm_turn(
+        message="先解决工具上限的问题，再继续推进",
+        current_session_id="sess-current",
+        current_title="Hermes gateway worker 改造",
+        candidates=[
+            {"id": "sess-gateway", "title": "Hermes gateway worker detached runtime"},
+            {"id": "sess-tool-limit", "title": "Hermes tool quota recovery"},
+        ],
+        config=DEFAULT_CONFIG,
+    )
+
+    assert result.action == "resume"
+    assert result.target_session_id == "sess-tool-limit"
+    assert result.target_title == "Hermes tool quota recovery"
+
+
+def test_route_telegram_dm_turn_stays_when_current_title_matches_workstream():
+    result = route_telegram_dm_turn(
+        message="工具上限恢复后继续推进队列",
+        current_session_id="sess-current",
+        current_title="Hermes tool quota recovery",
+        candidates=[
+            {"id": "sess-gateway", "title": "Hermes gateway worker detached runtime"},
+            {"id": "sess-current", "title": "Hermes tool quota recovery"},
+        ],
+        config=DEFAULT_CONFIG,
+    )
+
+    assert result.action == "stay"
+    assert result.reason == "current session matches topic"
+
+
+def test_route_telegram_dm_turn_matches_candidate_summary_when_title_is_generic():
+    result = route_telegram_dm_turn(
+        message="继续处理 CPA proxy 8317 的模型链路",
+        current_session_id="sess-current",
+        current_title="Hermes gateway worker 改造",
+        candidates=[
+            {
+                "id": "sess-cpa",
+                "title": "Hermes 改造计划",
+                "summary": "CPA proxy 8317 model chain and provider routing verification",
+            },
+            {"id": "sess-worker", "title": "Gateway worker detached runtime"},
+        ],
+        config=DEFAULT_CONFIG,
+    )
+
+    assert result.action == "resume"
+    assert result.target_session_id == "sess-cpa"
