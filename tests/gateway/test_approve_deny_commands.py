@@ -75,6 +75,24 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+    mod._approval_session_key.set("")
+    for key in (
+        "HERMES_EXEC_ASK",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_INTERACTIVE",
+        "HERMES_YOLO_MODE",
+    ):
+        os.environ.pop(key, None)
+
+
+def _manual_approval_config(*, gateway_timeout: int = 300) -> dict:
+    """Keep E2E approval tests independent from the developer's local config."""
+    return {"mode": "manual", "gateway_timeout": gateway_timeout}
+
+
+def _tirith_allow_result() -> dict:
+    """Keep approval flow tests focused on approval queuing, not tirith subprocess timing."""
+    return {"action": "allow", "findings": [], "summary": ""}
 
 
 # ------------------------------------------------------------------
@@ -396,9 +414,13 @@ class TestBlockingApprovalE2E:
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
-                result_holder[0] = check_all_command_guards(
-                    "rm -rf /important", "local"
-                )
+                with patch("tools.approval._get_approval_config",
+                           return_value=_manual_approval_config()), \
+                     patch("tools.tirith_security.check_command_security",
+                           return_value=_tirith_allow_result()):
+                    result_holder[0] = check_all_command_guards(
+                        "rm -rf /important", "local"
+                    )
             finally:
                 os.environ.pop("HERMES_EXEC_ASK", None)
                 os.environ.pop("HERMES_SESSION_KEY", None)
@@ -442,9 +464,13 @@ class TestBlockingApprovalE2E:
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
-                result_holder[0] = check_all_command_guards(
-                    "rm -rf /important", "local"
-                )
+                with patch("tools.approval._get_approval_config",
+                           return_value=_manual_approval_config()), \
+                     patch("tools.tirith_security.check_command_security",
+                           return_value=_tirith_allow_result()):
+                    result_holder[0] = check_all_command_guards(
+                        "rm -rf /important", "local"
+                    )
             finally:
                 os.environ.pop("HERMES_EXEC_ASK", None)
                 os.environ.pop("HERMES_SESSION_KEY", None)
@@ -484,7 +510,9 @@ class TestBlockingApprovalE2E:
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
                 with patch("tools.approval._get_approval_config",
-                           return_value={"gateway_timeout": 1}):
+                           return_value=_manual_approval_config(gateway_timeout=1)), \
+                     patch("tools.tirith_security.check_command_security",
+                           return_value=_tirith_allow_result()):
                     result_holder[0] = check_all_command_guards(
                         "rm -rf /important", "local"
                     )
@@ -523,7 +551,11 @@ class TestBlockingApprovalE2E:
                 os.environ["HERMES_EXEC_ASK"] = "1"
                 os.environ["HERMES_SESSION_KEY"] = session_key
                 try:
-                    results[idx] = check_all_command_guards(cmd, "local")
+                    with patch("tools.approval._get_approval_config",
+                               return_value=_manual_approval_config()), \
+                         patch("tools.tirith_security.check_command_security",
+                               return_value=_tirith_allow_result()):
+                        results[idx] = check_all_command_guards(cmd, "local")
                 finally:
                     os.environ.pop("HERMES_EXEC_ASK", None)
                     os.environ.pop("HERMES_SESSION_KEY", None)
@@ -578,7 +610,11 @@ class TestBlockingApprovalE2E:
                 os.environ["HERMES_EXEC_ASK"] = "1"
                 os.environ["HERMES_SESSION_KEY"] = session_key
                 try:
-                    results[idx] = check_all_command_guards(cmd, "local")
+                    with patch("tools.approval._get_approval_config",
+                               return_value=_manual_approval_config()), \
+                         patch("tools.tirith_security.check_command_security",
+                               return_value=_tirith_allow_result()):
+                        results[idx] = check_all_command_guards(cmd, "local")
                 finally:
                     os.environ.pop("HERMES_EXEC_ASK", None)
                     os.environ.pop("HERMES_SESSION_KEY", None)

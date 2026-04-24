@@ -315,7 +315,7 @@ class TestFallbackTransportInit:
         transport = tnet.TelegramFallbackTransport(["149.154.167.220", "not-an-ip"])
         assert transport._fallback_ips == ["149.154.167.220"]
 
-    def test_uses_proxy_env_for_primary_and_fallback_transports(self, monkeypatch):
+    def test_uses_proxy_env_only_for_primary_transport(self, monkeypatch):
         seen_kwargs = []
 
         def factory(**kwargs):
@@ -331,7 +331,8 @@ class TestFallbackTransportInit:
 
         assert transport._fallback_ips == ["149.154.167.220"]
         assert len(seen_kwargs) == 2
-        assert all(kwargs["proxy"] == "http://proxy.example:8080" for kwargs in seen_kwargs)
+        assert seen_kwargs[0]["proxy"] == "http://proxy.example:8080"
+        assert "proxy" not in seen_kwargs[1]
 
 
 class TestFallbackTransportClose:
@@ -574,6 +575,18 @@ class TestDiscoverFallbackIps:
 
         ips = await tnet.discover_fallback_ips()
         assert ips == ["149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_discovered_ips_are_supplemented_with_seed_fallbacks(self, monkeypatch):
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("149.154.166.110")),
+            "https://cloudflare-dns.com": (200, _doh_answer()),
+        }, system_dns_ips=["149.154.166.111"])
+
+        ips = await tnet.discover_fallback_ips()
+
+        assert ips[0] == "149.154.166.110"
+        assert "149.154.167.220" in ips
 
     @pytest.mark.asyncio
     async def test_system_dns_failure_keeps_all_doh_ips(self, monkeypatch):

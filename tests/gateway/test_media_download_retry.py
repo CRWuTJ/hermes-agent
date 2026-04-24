@@ -18,6 +18,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import httpx
 
+
+@pytest.fixture(autouse=True)
+def _allow_mocked_remote_urls(monkeypatch):
+    """Keep retry tests hermetic even if example.com resolves to a blocked range."""
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+
+
 # ---------------------------------------------------------------------------
 # Helpers for building httpx exceptions
 # ---------------------------------------------------------------------------

@@ -63,12 +63,27 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 
     def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
         self._fallback_ips = [ip for ip in dict.fromkeys(_normalize_fallback_ips(fallback_ips))]
+        primary_kwargs = dict(transport_kwargs)
+        fallback_kwargs = dict(transport_kwargs)
+
         proxy_url = _resolve_proxy_url()
-        if proxy_url and "proxy" not in transport_kwargs:
-            transport_kwargs["proxy"] = proxy_url
-        self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
+        if proxy_url and "proxy" not in primary_kwargs:
+            primary_kwargs["proxy"] = proxy_url
+
+        # HTTP CONNECT proxies terminate TLS using the remote origin host
+        # (the fallback IP), ignoring request.extensions["sni_hostname"].
+        # That breaks Telegram fallback IPs with certificate mismatch errors.
+        # Keep the proxy for the primary hostname path, but bypass it for
+        # direct fallback-IP dials so Host/SNI remain api.telegram.org.
+        active_proxy = primary_kwargs.get("proxy")
+        if isinstance(active_proxy, str):
+            lowered_proxy = active_proxy.lower()
+            if lowered_proxy.startswith(("http://", "https://")):
+                fallback_kwargs.pop("proxy", None)
+
+        self._primary = httpx.AsyncHTTPTransport(**primary_kwargs)
         self._fallbacks = {
-            ip: httpx.AsyncHTTPTransport(**transport_kwargs) for ip in self._fallback_ips
+            ip: httpx.AsyncHTTPTransport(**fallback_kwargs) for ip in self._fallback_ips
         }
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
@@ -205,10 +220,12 @@ async def discover_fallback_ips() -> list[str]:
         if isinstance(r, list):
             doh_ips.extend(r)
 
-    # Deduplicate preserving order, exclude system-DNS IPs
+    # Deduplicate preserving order, exclude system-DNS IPs. Append seed IPs even
+    # when DoH finds candidates so a single bad discovered IP does not strand
+    # the transport without another fallback attempt.
     seen: set[str] = set()
     candidates: list[str] = []
-    for ip in doh_ips:
+    for ip in [*doh_ips, *_SEED_FALLBACK_IPS]:
         if ip not in seen and ip not in system_ips:
             seen.add(ip)
             candidates.append(ip)
