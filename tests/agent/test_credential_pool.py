@@ -94,6 +94,7 @@ def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
 
 def test_round_robin_strategy_rotates_priorities(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     _write_auth_store(
         tmp_path,
         {
@@ -134,6 +135,13 @@ def test_round_robin_strategy_rotates_priorities(tmp_path, monkeypatch):
     second = reloaded.select()
     assert second is not None
     assert second.id == "cred-2"
+
+    auth_store = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    stored_entries = auth_store["credential_pool"]["openrouter"]
+    assert [entry["id"] for entry in stored_entries] == ["cred-1", "cred-2"]
+
+    runtime_state = json.loads((tmp_path / "hermes" / "runtime" / "credential_pool_state.json").read_text())
+    assert runtime_state["providers"]["openrouter"]["round_robin_next_id"] == "cred-1"
 
 
 def test_random_strategy_uses_random_choice(tmp_path, monkeypatch):

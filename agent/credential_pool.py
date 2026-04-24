@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import random
+import re
+import tempfile
 import threading
 import time
 import uuid
-import os
-import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -344,6 +347,92 @@ def get_pool_strategy(provider: str) -> str:
     if strategy in SUPPORTED_POOL_STRATEGIES:
         return strategy
     return STRATEGY_FILL_FIRST
+
+
+def _credential_pool_runtime_state_path() -> Path:
+    return get_hermes_home() / "runtime" / "credential_pool_state.json"
+
+
+def _load_credential_pool_runtime_state() -> Dict[str, Any]:
+    path = _credential_pool_runtime_state_path()
+    try:
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_credential_pool_runtime_state(payload: Dict[str, Any]) -> None:
+    path = _credential_pool_runtime_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="credential-pool-state-",
+        suffix=".json",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def _load_round_robin_next_id(provider: str) -> Optional[str]:
+    state = _load_credential_pool_runtime_state()
+    providers = state.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    provider_state = providers.get(provider)
+    if not isinstance(provider_state, dict):
+        return None
+    next_id = provider_state.get("round_robin_next_id")
+    return next_id if isinstance(next_id, str) and next_id.strip() else None
+
+
+def _store_round_robin_next_id(provider: str, next_id: Optional[str]) -> None:
+    state = _load_credential_pool_runtime_state()
+    providers = state.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        state["providers"] = providers
+
+    provider_state = providers.get(provider)
+    if not isinstance(provider_state, dict):
+        provider_state = {}
+        providers[provider] = provider_state
+
+    if next_id:
+        provider_state["round_robin_next_id"] = next_id
+    else:
+        provider_state.pop("round_robin_next_id", None)
+
+    if not provider_state:
+        providers.pop(provider, None)
+    if not providers:
+        state.pop("providers", None)
+
+    _write_credential_pool_runtime_state(state)
+
+
+def _rotate_entries_to_next_id(entries: List[PooledCredential], next_id: Optional[str]) -> List[PooledCredential]:
+    ordered = sorted(entries, key=lambda item: item.priority)
+    if not ordered or not next_id:
+        return ordered
+    try:
+        start = next(idx for idx, entry in enumerate(ordered) if entry.id == next_id)
+    except StopIteration:
+        return ordered
+    rotated = ordered[start:] + ordered[:start]
+    return [replace(entry, priority=idx) for idx, entry in enumerate(rotated)]
 
 
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
@@ -725,7 +814,8 @@ class CredentialPool:
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist()
+            next_id = self._entries[0].id if self._entries else None
+            _store_round_robin_next_id(self.provider, next_id)
             self._current_id = entry.id
             return self.current() or entry
 
@@ -1204,4 +1294,8 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
         )
+
+    if get_pool_strategy(provider) == STRATEGY_ROUND_ROBIN:
+        entries = _rotate_entries_to_next_id(entries, _load_round_robin_next_id(provider))
+
     return CredentialPool(provider, entries)
