@@ -28,7 +28,9 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -57,6 +59,16 @@ def _safe_find_spec(module_name: str) -> bool:
 
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
+
+if not _HAS_FASTER_WHISPER and "faster_whisper" not in sys.modules:
+    _fw_stub = types.ModuleType("faster_whisper")
+
+    class _MissingWhisperModel:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("faster-whisper not installed")
+
+    _fw_stub.WhisperModel = _MissingWhisperModel
+    sys.modules["faster_whisper"] = _fw_stub
 
 # ---------------------------------------------------------------------------
 # Constants
