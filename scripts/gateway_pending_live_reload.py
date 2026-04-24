@@ -181,6 +181,9 @@ def main() -> int:
                     rc = run_restart_verify()
                     post = build_probe()
                     log("restart verify exit rc=%s post=%s" % (rc, json.dumps(post, ensure_ascii=False)))
+                    if DRY_RUN:
+                        log("dry-run completed; gateway freshness is unchanged because no restart was performed")
+                        return rc
                     if rc == 0 and post.get("stale"):
                         log("restart verify reported success but gateway still stale after reload")
                         return 11

@@ -186,6 +186,22 @@ def test_main_returns_nonzero_when_restart_verify_reports_success_but_gateway_st
                 "queued_lanes": {},
                 "oldest_running": None,
             },
+            {
+                "stale": True,
+                "live_active": 0,
+                "live_lanes": {},
+                "queued_count": 0,
+                "queued_lanes": {},
+                "oldest_running": None,
+            },
+            {
+                "stale": True,
+                "live_active": 0,
+                "live_lanes": {},
+                "queued_count": 0,
+                "queued_lanes": {},
+                "oldest_running": None,
+            },
         ]
     )
     logs = []
@@ -202,3 +218,50 @@ def test_main_returns_nonzero_when_restart_verify_reports_success_but_gateway_st
 
     assert rc == 11
     assert any("restart verify reported success but gateway still stale after reload" in entry for entry in logs)
+
+
+def test_main_dry_run_does_not_fail_because_gateway_stays_stale(monkeypatch):
+    @contextmanager
+    def fake_lock(path):
+        yield
+
+    probe_sequence = iter(
+        [
+            {
+                "stale": True,
+                "live_active": 0,
+                "live_lanes": {},
+                "queued_count": 0,
+                "queued_lanes": {},
+                "oldest_running": None,
+            },
+            {
+                "stale": True,
+                "live_active": 0,
+                "live_lanes": {},
+                "queued_count": 0,
+                "queued_lanes": {},
+                "oldest_running": None,
+            },
+            {
+                "stale": True,
+                "live_active": 0,
+                "live_lanes": {},
+                "queued_count": 0,
+                "queued_lanes": {},
+                "oldest_running": None,
+            },
+        ]
+    )
+    logs = []
+
+    monkeypatch.setattr(pending_reload, "singleton_lock", fake_lock)
+    monkeypatch.setattr(pending_reload, "build_probe", lambda: next(probe_sequence))
+    monkeypatch.setattr(pending_reload, "run_restart_verify", lambda: 0)
+    monkeypatch.setattr(pending_reload, "log", logs.append)
+    monkeypatch.setattr(pending_reload, "DRY_RUN", True)
+
+    rc = pending_reload.main()
+
+    assert rc == 0
+    assert any("dry-run completed" in entry for entry in logs)
