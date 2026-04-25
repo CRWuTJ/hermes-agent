@@ -2039,6 +2039,62 @@ class TestControlPlaneStatusEndpoint:
         assert data["live_tasks"]["tasks"][0]["harness"]["control"]["latest_action"]["status"] == "cancellation_requested"
 
 
+    @pytest.mark.asyncio
+    async def test_api_status_exposes_top_level_worker_contracts_when_available(self, adapter, monkeypatch):
+        queued_task = _make_queued_task(task_id="task-contract")
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+        monkeypatch.setattr(
+            "gateway.run._current_live_task_status_payload",
+            lambda: _make_live_tasks_payload(
+                tasks=[
+                    {
+                        "task_id": "bg-contract",
+                        "lane": "cron_scout",
+                        "label": "background task",
+                        "kind": "background",
+                        "control_mode": "managed_runtime",
+                        "actions": ["cancel"],
+                        "source": "gateway",
+                    }
+                ]
+            ),
+        )
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        fake_harness.task_snapshot.side_effect = lambda task_id: {
+            "task_id": task_id,
+            "state": "queued" if task_id == "task-contract" else "active",
+            "task_contract": {
+                "worker_class": "runtime_coordinator" if task_id == "task-contract" else "detached_worker",
+                "decision_state": "ready" if task_id == "task-contract" else "running",
+                "approval_state": "approved",
+                "next_action": "take_next_queue_action" if task_id == "task-contract" else "continue_execution",
+                "review_surface": f"/task {task_id}",
+            },
+        } if task_id in {"task-contract", "bg-contract"} else None
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/status")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["queued_tasks"]["tasks"][0]["task_contract"]["worker_class"] == "runtime_coordinator"
+        assert data["queued_tasks"]["next_task"]["task_contract"]["next_action"] == "take_next_queue_action"
+        assert data["live_tasks"]["tasks"][0]["task_contract"]["worker_class"] == "detached_worker"
+        assert data["live_tasks"]["oldest_running"]["task_contract"]["decision_state"] == "running"
+
+
 class TestTasksEndpoint:
     @pytest.mark.asyncio
     async def test_api_tasks_returns_queued_and_live_payload(self, adapter, monkeypatch):
@@ -2156,6 +2212,55 @@ class TestTasksEndpoint:
             "state": "planning",
             "surface": "gateway",
         }
+
+
+    @pytest.mark.asyncio
+    async def test_api_tasks_and_detail_expose_top_level_worker_contracts_when_available(self, adapter, monkeypatch):
+        queued_task = _make_queued_task(task_id="task-contract")
+        control_adapter = MagicMock()
+        control_adapter.all_pending_tasks_snapshot.return_value = [queued_task]
+        control_adapter.foreground_pending_task = MagicMock()
+        control_adapter.reprioritize_pending_task = MagicMock()
+        control_adapter.cancel_pending_task = MagicMock()
+        _attach_control_runner(adapter, control_adapter)
+
+        fake_harness = MagicMock()
+        fake_harness.enabled = True
+        fake_harness.task_snapshot.side_effect = lambda task_id: {
+            "task_id": task_id,
+            "state": "queued",
+            "task_contract": {
+                "worker_class": "runtime_coordinator",
+                "decision_state": "ready",
+                "approval_state": "approved",
+                "next_action": "take_next_queue_action",
+                "review_surface": f"/task {task_id}",
+            },
+        } if task_id == "task-contract" else None
+        monkeypatch.setattr(
+            "agent.harness.get_harness_manager",
+            lambda *args, **kwargs: fake_harness,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            list_resp = await cli.get("/api/tasks")
+            list_data = await list_resp.json()
+            detail_resp = await cli.get("/api/tasks/task-contract")
+            detail_data = await detail_resp.json()
+
+        assert list_resp.status == 200
+        assert detail_resp.status == 200
+        assert list_data["queued"]["tasks"][0]["task_contract"] == {
+            "worker_class": "runtime_coordinator",
+            "decision_state": "ready",
+            "approval_state": "approved",
+            "next_action": "take_next_queue_action",
+            "review_surface": "/task task-contract",
+        }
+        assert list_data["queued"]["next_task"]["task_contract"]["worker_class"] == "runtime_coordinator"
+        assert detail_data["task"]["task_contract"]["next_action"] == "take_next_queue_action"
+        assert detail_data["task"]["harness"]["task_contract"] == detail_data["task"]["task_contract"]
 
 
     @pytest.mark.asyncio
@@ -2617,9 +2722,22 @@ class TestOpenAPIEndpoint:
         assert queued_task_schema["properties"]["wait_age"]["type"] == "string"
         assert queued_task_schema["properties"]["actions"]["items"]["enum"] == ["foreground", "reprioritize", "cancel"]
         assert queued_task_schema["properties"]["starvation_alert"]["anyOf"][0]["$ref"] == "#/components/schemas/QueuedStarvationAlert"
+        task_contract_schema = data["components"]["schemas"]["TaskContract"]
+        assert task_contract_schema["properties"]["worker_class"]["enum"] == [
+            "hermes_brain",
+            "runtime_coordinator",
+            "detached_worker",
+            "external_executor",
+            "shared_capability",
+            "department_lane",
+            "human_owner",
+            "unknown",
+        ]
+        assert queued_task_schema["properties"]["task_contract"]["anyOf"][0]["$ref"] == "#/components/schemas/TaskContract"
         live_task_schema = data["components"]["schemas"]["LiveTask"]
         assert live_task_schema["properties"]["running_seconds"]["type"] == "integer"
         assert live_task_schema["properties"]["running_age"]["type"] == "string"
+        assert live_task_schema["properties"]["task_contract"]["anyOf"][0]["$ref"] == "#/components/schemas/TaskContract"
         live_status_schema = data["components"]["schemas"]["LiveTaskStatus"]
         assert live_status_schema["properties"]["oldest_running"]["anyOf"][0]["$ref"] == "#/components/schemas/LiveTask"
         task_action_schema = data["components"]["schemas"]["TaskActionResponse"]

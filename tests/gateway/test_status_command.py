@@ -659,6 +659,55 @@ async def test_tasks_command_surfaces_recent_harness_control_summary(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_tasks_command_surfaces_company_os_worker_contract_from_harness_snapshot(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_tasks_snapshot.return_value = [
+        MessageTaskEnvelope(
+            task_id="task-contract",
+            session_key=session_entry.session_key,
+            message_event=_make_event("queued worker contract"),
+            priority=50,
+            lane="interactive",
+            reply_policy="status_only",
+            cancellation_policy="preserve",
+        ),
+    ]
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.task_snapshot.side_effect = lambda task_id: {
+        "task_id": task_id,
+        "state": "queued",
+        "task_contract": {
+            "worker_class": "runtime_coordinator",
+            "decision_state": "ready",
+            "approval_state": "approved",
+            "next_action": "take_next_queue_action",
+            "review_surface": "/task task-contract",
+        },
+    } if task_id == "task-contract" else None
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch(
+        "gateway.run.task_lane_registry.status_snapshot",
+        return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []},
+    ):
+        result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "↳ worker: runtime_coordinator · ready · approved · next: take_next_queue_action" in result
+
+
+@pytest.mark.asyncio
 async def test_tasks_command_appends_harness_visibility_digest(monkeypatch):
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
@@ -1107,6 +1156,53 @@ async def test_task_command_reports_harness_control_summary(monkeypatch):
 
     assert "**Latest Control Action:** reprioritize · reprioritized · via chat · later · 2026-04-21T18:00:00+00:00" in result
     assert "**Latest Recovery:** recover · recovered · via api · next · 2026-04-21T17:55:00+00:00" in result
+
+
+@pytest.mark.asyncio
+async def test_task_command_surfaces_company_os_worker_contract_from_harness_snapshot(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.pending_tasks_snapshot.return_value = [
+        MessageTaskEnvelope(
+            task_id="task-contract",
+            session_key=session_entry.session_key,
+            message_event=_make_event("queued worker contract"),
+            priority=50,
+            lane="interactive",
+            reply_policy="status_only",
+            cancellation_policy="preserve",
+            queued_at=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
+        )
+    ]
+
+    fake_harness = MagicMock()
+    fake_harness.enabled = True
+    fake_harness.task_snapshot.side_effect = lambda task_id: {
+        "task_id": task_id,
+        "state": "queued",
+        "task_contract": {
+            "worker_class": "runtime_coordinator",
+            "decision_state": "ready",
+            "approval_state": "approved",
+            "next_action": "take_next_queue_action",
+            "review_surface": "/task task-contract",
+        },
+    } if task_id == "task-contract" else None
+    monkeypatch.setattr("agent.harness.get_harness_manager", lambda *args, **kwargs: fake_harness)
+
+    with patch("gateway.task_control._queued_task_now", return_value=datetime(2026, 4, 19, 12, 5, 0, tzinfo=timezone.utc)), patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {"interactive": 0, "cron_scout": 0, "housekeeping": 0}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/task task-contract"))
+
+    assert "**Worker:** runtime_coordinator · ready · approved · next: take_next_queue_action · review: /task task-contract" in result
 
 
 @pytest.mark.asyncio

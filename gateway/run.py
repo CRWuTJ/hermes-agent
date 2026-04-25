@@ -328,10 +328,14 @@ def _harness_task_snapshot(task_id: Any) -> Optional[Dict[str, Any]]:
         snapshot = snapshot_task(task_id_text)
         if not isinstance(snapshot, dict):
             return None
+        public_snapshot: Dict[str, Any] = {}
         control = snapshot.get("control")
-        if not isinstance(control, dict):
-            return None
-        return {"control": dict(control)}
+        if isinstance(control, dict):
+            public_snapshot["control"] = dict(control)
+        task_contract = snapshot.get("task_contract")
+        if isinstance(task_contract, dict):
+            public_snapshot["task_contract"] = dict(task_contract)
+        return public_snapshot or None
     except Exception:
         return None
 
@@ -347,6 +351,9 @@ def _attach_harness_task_snapshot(task_payload: Any) -> Any:
     merged = dict(existing)
     merged.update(snapshot)
     attached["harness"] = merged
+    task_contract = merged.get("task_contract")
+    if isinstance(task_contract, dict):
+        attached["task_contract"] = dict(task_contract)
     return attached
 
 

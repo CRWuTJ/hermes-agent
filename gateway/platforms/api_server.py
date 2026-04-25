@@ -1360,6 +1360,51 @@ class APIServerAdapter(BasePlatformAdapter):
                 "required": ["ok"],
                 "additionalProperties": False,
             },
+            "TaskContract": {
+                "type": "object",
+                "properties": {
+                    "workflow_name": {"type": "string"},
+                    "run_id": {"type": "string"},
+                    "worker_class": {
+                        "type": "string",
+                        "enum": [
+                            "hermes_brain",
+                            "runtime_coordinator",
+                            "detached_worker",
+                            "external_executor",
+                            "shared_capability",
+                            "department_lane",
+                            "human_owner",
+                            "unknown",
+                        ],
+                    },
+                    "owner": {"type": "string"},
+                    "source_pointer": {"type": "string"},
+                    "current_step": {"type": "string"},
+                    "approval_state": {"type": "string"},
+                    "decision_state": {"type": "string"},
+                    "next_action": {"type": "string"},
+                    "evidence_pointer": {"type": "string"},
+                    "canonical_work_product": {"type": "string"},
+                    "review_surface": {"type": "string"},
+                    "reuse_path": {"type": "string"},
+                },
+                "required": ["worker_class", "approval_state", "decision_state", "next_action", "review_surface"],
+                "additionalProperties": True,
+            },
+            "HarnessTaskSnapshot": {
+                "type": "object",
+                "properties": {
+                    "task_contract": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/TaskContract"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "control": {"type": "object", "additionalProperties": True},
+                },
+                "additionalProperties": True,
+            },
             "GatewayPlatformStatus": {
                 "type": "object",
                 "properties": {
@@ -1386,6 +1431,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "started_at": _nullable_string(fmt="date-time"),
                     "running_seconds": {"type": "integer", "minimum": 0},
                     "running_age": {"type": "string"},
+                    "task_contract": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/TaskContract"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "harness": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/HarnessTaskSnapshot"},
+                            {"type": "null"},
+                        ]
+                    },
                 },
                 "required": ["task_id", "lane", "kind", "control_mode", "actions"],
                 "additionalProperties": True,
@@ -1430,6 +1487,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "starvation_alert": {
                         "anyOf": [
                             {"$ref": "#/components/schemas/QueuedStarvationAlert"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "task_contract": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/TaskContract"},
+                            {"type": "null"},
+                        ]
+                    },
+                    "harness": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/HarnessTaskSnapshot"},
                             {"type": "null"},
                         ]
                     },
@@ -2008,7 +2077,13 @@ class APIServerAdapter(BasePlatformAdapter):
         payload = dict(task_payload or {})
         snapshot = self._harness_task_snapshot(payload.get("task_id"))
         if snapshot is not None:
-            payload["harness"] = snapshot
+            existing = payload.get("harness") if isinstance(payload.get("harness"), dict) else {}
+            harness = dict(existing)
+            harness.update(snapshot)
+            payload["harness"] = harness
+            task_contract = harness.get("task_contract")
+            if isinstance(task_contract, dict):
+                payload["task_contract"] = dict(task_contract)
         return payload
 
     def _normalize_queued_task_payload(self, task_payload: Dict[str, Any]) -> Dict[str, Any]:
