@@ -594,12 +594,35 @@ def test_task_snapshot_exposes_company_os_contract_for_cron_worker(tmp_path):
         "decision_state": "needs-approval",
         "next_action": "write_or_update_plan_artifact",
         "deadline_or_sla": "",
-        "evidence_pointer": "",
+        "evidence_pointer": "/task cron-pr-monitor",
         "stop_reason": "",
-        "canonical_work_product": "",
+        "canonical_work_product": "/task cron-pr-monitor",
         "review_surface": "/task cron-pr-monitor",
         "reuse_path": "",
     }
+
+
+def test_task_contract_exposes_internal_evidence_for_detached_worker_surfaces(tmp_path):
+    manager = HarnessManager(_config(tmp_path))
+
+    for surface in ["cron", "background", "delegate"]:
+        task_id = f"{surface}-worker"
+        manager.admit_turn(
+            task_id=task_id,
+            session_id=f"session-{task_id}",
+            surface=surface,
+            platform=surface,
+            user_request=f"Run {surface} worker",
+            workspace_root="/repo",
+            max_iterations=20,
+        )
+
+        contract = manager.task_snapshot(task_id)["task_contract"]
+
+        assert contract["worker_class"] == "detached_worker"
+        assert contract["review_surface"] == f"/task {task_id}"
+        assert contract["evidence_pointer"] == f"/task {task_id}"
+        assert contract["canonical_work_product"] == f"/task {task_id}"
 
 
 def test_task_snapshot_maps_gateway_queue_stub_to_runtime_coordinator(tmp_path):
@@ -629,6 +652,9 @@ def test_task_snapshot_maps_gateway_queue_stub_to_runtime_coordinator(tmp_path):
     assert snapshot["task_contract"]["approval_state"] == "approved"
     assert snapshot["task_contract"]["source_pointer"] == "telegram:telegram:user:123"
     assert snapshot["task_contract"]["next_action"] == "take_next_queue_action"
+    assert snapshot["task_contract"]["review_surface"] == "/task queued-worker"
+    assert snapshot["task_contract"]["evidence_pointer"] == "/task queued-worker"
+    assert snapshot["task_contract"]["canonical_work_product"] == "/task queued-worker"
 
 
 def test_task_contract_uses_latest_artifact_as_evidence_pointer(tmp_path):

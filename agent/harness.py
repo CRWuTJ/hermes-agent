@@ -1042,7 +1042,16 @@ class HarnessManager:
         source = str(metadata.get("source") or task.get("platform") or task.get("surface") or "").strip()
         session_pointer = str(metadata.get("session_key") or task.get("session_id") or task_id).strip()
         latest_artifact = artifacts[-1] if artifacts else {}
-        evidence_pointer = str(latest_artifact.get("artifact_path") or "").strip()
+        artifact_pointer = str(latest_artifact.get("artifact_path") or "").strip()
+        source_pointer = f"{source}:{session_pointer}" if source and session_pointer else source or session_pointer
+        review_surface = str(metadata.get("review_surface") or (f"/task {task_id}" if task_id else source_pointer)).strip()
+        evidence_pointer = str(
+            artifact_pointer
+            or metadata.get("evidence_pointer")
+            or metadata.get("evidence")
+            or review_surface
+            or source_pointer
+        ).strip()
         workflow_name = str(
             metadata.get("workflow_name")
             or metadata.get("workstream")
@@ -1053,7 +1062,7 @@ class HarnessManager:
             "workflow_name": workflow_name,
             "run_id": task_id,
             "object_id": str(metadata.get("object_id") or task_id).strip(),
-            "source_pointer": f"{source}:{session_pointer}" if source and session_pointer else source or session_pointer,
+            "source_pointer": source_pointer,
             "current_step": state,
             "owner": str(metadata.get("owner") or "Hermes").strip() or "Hermes",
             "worker_class": _infer_worker_class(task),
@@ -1064,7 +1073,7 @@ class HarnessManager:
             "evidence_pointer": evidence_pointer,
             "stop_reason": str(task.get("last_error") or metadata.get("stop_reason") or "").strip(),
             "canonical_work_product": str(metadata.get("canonical_work_product") or evidence_pointer).strip(),
-            "review_surface": str(metadata.get("review_surface") or f"/task {task_id}").strip(),
+            "review_surface": review_surface,
             "reuse_path": str(metadata.get("reuse_path") or metadata.get("skill") or "").strip(),
         }
 
