@@ -383,6 +383,146 @@ def _terminal_is_mutating(command: str) -> bool:
     return False
 
 
+_WORKER_CLASS_ALIASES = {
+    "hermes-brain": "hermes_brain",
+    "hermes brain": "hermes_brain",
+    "brain": "hermes_brain",
+    "runtime-coordinator": "runtime_coordinator",
+    "runtime coordinator": "runtime_coordinator",
+    "coordinator": "runtime_coordinator",
+    "detached-worker": "detached_worker",
+    "detached worker": "detached_worker",
+    "worker": "detached_worker",
+    "external-executor": "external_executor",
+    "external executor": "external_executor",
+    "executor": "external_executor",
+    "shared-capability": "shared_capability",
+    "shared capability": "shared_capability",
+    "capability": "shared_capability",
+    "department-lane": "department_lane",
+    "department lane": "department_lane",
+    "department": "department_lane",
+    "human-owner": "human_owner",
+    "human owner": "human_owner",
+    "human": "human_owner",
+}
+
+_KNOWN_WORKER_CLASSES = {
+    "hermes_brain",
+    "runtime_coordinator",
+    "detached_worker",
+    "external_executor",
+    "shared_capability",
+    "department_lane",
+    "human_owner",
+}
+
+_DETACHED_WORKER_SURFACES = {"background", "delegate", "cron", "batch"}
+_EXTERNAL_EXECUTOR_MARKERS = {"claude", "codex", "opencode", "gemini", "langgraph", "crew", "temporal"}
+_SHARED_CAPABILITY_MARKERS = {"skill", "tool", "mcp", "n8n", "workflow", "script"}
+
+
+def _normalize_worker_class(value: Any, *, fallback: str = "hermes_brain") -> str:
+    raw = str(value or "").strip().lower().replace("/", "_")
+    if not raw:
+        return fallback
+    normalized = raw.replace("-", "_").replace(" ", "_")
+    normalized = _WORKER_CLASS_ALIASES.get(raw, _WORKER_CLASS_ALIASES.get(normalized, normalized))
+    if normalized in _KNOWN_WORKER_CLASSES:
+        return normalized
+    return fallback
+
+
+def _infer_worker_class(task: dict[str, Any]) -> str:
+    metadata = task.get("metadata") or {}
+    explicit = _normalize_worker_class(metadata.get("worker_class"), fallback="")
+    if explicit:
+        return explicit
+
+    text = " ".join(
+        str(value or "").strip().lower()
+        for value in (
+            task.get("surface"),
+            task.get("platform"),
+            metadata.get("kind"),
+            metadata.get("source"),
+            metadata.get("created_from"),
+            metadata.get("control_mode"),
+        )
+        if str(value or "").strip()
+    )
+    surface = str(task.get("surface") or "").strip().lower()
+
+    if metadata.get("created_from") == "task_control" or str(metadata.get("control_mode") or "").strip():
+        return "runtime_coordinator"
+    if surface in _DETACHED_WORKER_SURFACES:
+        return "detached_worker"
+    if any(marker in text for marker in _EXTERNAL_EXECUTOR_MARKERS):
+        return "external_executor"
+    if any(marker in text for marker in _SHARED_CAPABILITY_MARKERS):
+        return "shared_capability"
+    if "department" in text:
+        return "department_lane"
+    return "hermes_brain"
+
+
+def _decision_state_for_task_state(state: Any) -> str:
+    normalized = str(state or "").strip().lower()
+    if normalized in {"planning", "needs_acceptance"}:
+        return "needs-approval"
+    if normalized in {"admitted", "queued"}:
+        return "ready"
+    if normalized == "active":
+        return "running"
+    if normalized == "completed":
+        return "completed"
+    if normalized in {"cancelled", "stale"}:
+        return "stale"
+    if normalized in {"failed", "needs_replan", "waiting_external"}:
+        return "blocked"
+    return normalized or "ready"
+
+
+def _approval_state_for_task(task: dict[str, Any]) -> str:
+    state = str(task.get("state") or "").strip().lower()
+    if state == "planning" and task.get("plan_mode") == "plan_required":
+        return "pending_plan"
+    if state == "needs_acceptance":
+        return "pending_acceptance"
+    if state == "needs_replan":
+        return "needs_replan"
+    if state in {"failed", "waiting_external"}:
+        return "blocked"
+    if state == "cancelled":
+        return "withdrawn"
+    return "approved"
+
+
+def _next_action_for_task(task: dict[str, Any]) -> str:
+    state = str(task.get("state") or "").strip().lower()
+    if state == "planning" and task.get("plan_mode") == "plan_required":
+        return "write_or_update_plan_artifact"
+    if state == "needs_acceptance":
+        return "collect_acceptance_or_verification"
+    if state == "needs_replan":
+        return "replan_or_reduce_scope"
+    if state == "waiting_external":
+        return "wait_for_external_unblock"
+    if state == "failed":
+        return "diagnose_failure"
+    if state == "queued":
+        return "take_next_queue_action"
+    if state == "active":
+        return "continue_execution_and_verify"
+    if state == "admitted":
+        return "start_execution"
+    if state == "completed":
+        return "review_or_archive"
+    if state == "cancelled":
+        return "none"
+    return "inspect_task_state"
+
+
 def _task_context_details(task_context: Any) -> dict[str, Any]:
     details = {
         "preview": "",
@@ -895,6 +1035,39 @@ class HarnessManager:
             lines.append("Do not jump into broad implementation before producing or updating the plan artifact.")
         return "\n".join(lines)
 
+    def _company_os_task_contract(self, task: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, str]:
+        task_id = str(task.get("task_id") or "").strip()
+        metadata = task.get("metadata") or {}
+        state = str(task.get("state") or "").strip() or "unknown"
+        source = str(metadata.get("source") or task.get("platform") or task.get("surface") or "").strip()
+        session_pointer = str(metadata.get("session_key") or task.get("session_id") or task_id).strip()
+        latest_artifact = artifacts[-1] if artifacts else {}
+        evidence_pointer = str(latest_artifact.get("artifact_path") or "").strip()
+        workflow_name = str(
+            metadata.get("workflow_name")
+            or metadata.get("workstream")
+            or metadata.get("lane")
+            or "general"
+        ).strip() or "general"
+        return {
+            "workflow_name": workflow_name,
+            "run_id": task_id,
+            "object_id": str(metadata.get("object_id") or task_id).strip(),
+            "source_pointer": f"{source}:{session_pointer}" if source and session_pointer else source or session_pointer,
+            "current_step": state,
+            "owner": str(metadata.get("owner") or "Hermes").strip() or "Hermes",
+            "worker_class": _infer_worker_class(task),
+            "approval_state": _approval_state_for_task(task),
+            "decision_state": _decision_state_for_task_state(state),
+            "next_action": str(metadata.get("next_action") or _next_action_for_task(task)).strip(),
+            "deadline_or_sla": str(metadata.get("deadline_or_sla") or metadata.get("sla") or "").strip(),
+            "evidence_pointer": evidence_pointer,
+            "stop_reason": str(task.get("last_error") or metadata.get("stop_reason") or "").strip(),
+            "canonical_work_product": str(metadata.get("canonical_work_product") or evidence_pointer).strip(),
+            "review_surface": str(metadata.get("review_surface") or f"/task {task_id}").strip(),
+            "reuse_path": str(metadata.get("reuse_path") or metadata.get("skill") or "").strip(),
+        }
+
     def task_snapshot(self, task_id: str) -> Optional[dict[str, Any]]:
         if not self.enabled or not task_id:
             return None
@@ -949,6 +1122,7 @@ class HarnessManager:
             "updated_at": task.get("updated_at"),
             "completed_at": task.get("completed_at"),
             "last_error": task.get("last_error") or "",
+            "task_contract": self._company_os_task_contract(task, artifacts),
             "artifacts": {
                 "count": len(artifacts),
                 "by_kind": artifact_counts,

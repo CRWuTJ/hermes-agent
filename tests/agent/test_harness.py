@@ -568,6 +568,96 @@ def test_rate_limit_policy_never_downgrades_models(tmp_path):
     ) is False
 
 
+def test_task_snapshot_exposes_company_os_contract_for_cron_worker(tmp_path):
+    manager = HarnessManager(_config(tmp_path))
+    manager.admit_turn(
+        task_id="cron-pr-monitor",
+        session_id="cron-pr-monitor",
+        surface="cron",
+        platform="cron",
+        user_request="Monitor Hermes upstream PR #15649",
+        workspace_root="/repo",
+        max_iterations=20,
+    )
+
+    snapshot = manager.task_snapshot("cron-pr-monitor")
+
+    assert snapshot["task_contract"] == {
+        "workflow_name": "general",
+        "run_id": "cron-pr-monitor",
+        "object_id": "cron-pr-monitor",
+        "source_pointer": "cron:cron-pr-monitor",
+        "current_step": "planning",
+        "owner": "Hermes",
+        "worker_class": "detached_worker",
+        "approval_state": "pending_plan",
+        "decision_state": "needs-approval",
+        "next_action": "write_or_update_plan_artifact",
+        "deadline_or_sla": "",
+        "evidence_pointer": "",
+        "stop_reason": "",
+        "canonical_work_product": "",
+        "review_surface": "/task cron-pr-monitor",
+        "reuse_path": "",
+    }
+
+
+def test_task_snapshot_maps_gateway_queue_stub_to_runtime_coordinator(tmp_path):
+    manager = HarnessManager(_config(tmp_path))
+    manager.record_task_action(
+        task_id="queued-worker",
+        action="reprioritize",
+        status="reprioritized",
+        surface="chat",
+        session_key="telegram:user:123",
+        platform="telegram",
+        target_bucket="next",
+        task_context={
+            "preview": "Queued follow-up",
+            "lane": "interactive",
+            "kind": "queued_message",
+            "priority": 50,
+            "control_mode": "queued",
+            "source": "telegram",
+        },
+    )
+
+    snapshot = manager.task_snapshot("queued-worker")
+
+    assert snapshot["task_contract"]["worker_class"] == "runtime_coordinator"
+    assert snapshot["task_contract"]["decision_state"] == "ready"
+    assert snapshot["task_contract"]["approval_state"] == "approved"
+    assert snapshot["task_contract"]["source_pointer"] == "telegram:telegram:user:123"
+    assert snapshot["task_contract"]["next_action"] == "take_next_queue_action"
+
+
+def test_task_contract_uses_latest_artifact_as_evidence_pointer(tmp_path):
+    manager = HarnessManager(_config(tmp_path))
+    manager.admit_turn(
+        task_id="artifact-task",
+        session_id="telegram-session",
+        surface="telegram",
+        platform="telegram",
+        user_request="Write and verify a small artifact",
+        workspace_root="/repo",
+        max_iterations=20,
+    )
+    manager.record_tool_complete(
+        task_id="artifact-task",
+        tool_name="write_file",
+        args={"path": "/repo/report.md", "content": "done"},
+        result='{"success": true}',
+        session_id="telegram-session",
+        tool_call_id="call-write",
+    )
+
+    snapshot = manager.task_snapshot("artifact-task")
+
+    assert snapshot["task_contract"]["decision_state"] == "running"
+    assert snapshot["task_contract"]["evidence_pointer"] == "/repo/report.md"
+    assert snapshot["task_contract"]["canonical_work_product"] == "/repo/report.md"
+
+
 def test_visibility_digest_groups_completed_blocked_and_next_work(tmp_path):
     manager = HarnessManager(_config(tmp_path))
     for task_id, request in [
