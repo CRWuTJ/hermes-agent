@@ -489,6 +489,9 @@ def render_gateway_tasks_block(
         )
         if hint_line:
             lines.append(f"   {hint_line}")
+        worker_line = format_harness_task_contract_summary(task)
+        if worker_line:
+            lines.append(f"   ↳ worker: {worker_line}")
         recent_line = format_harness_recent_control_line(task)
         if recent_line:
             lines.append(f"   {recent_line}")
@@ -539,6 +542,9 @@ def render_gateway_tasks_block(
         hint_line = render_task_command_hints(task_id, actions=task.get("actions"))
         if hint_line:
             lines.append(f"   {hint_line}")
+        worker_line = format_harness_task_contract_summary(task)
+        if worker_line:
+            lines.append(f"   ↳ worker: {worker_line}")
         recent_line = format_harness_recent_control_line(task)
         if recent_line:
             lines.append(f"   {recent_line}")
@@ -776,6 +782,29 @@ def format_harness_recent_control_line(task_payload: Any) -> Optional[str]:
     return f"↳ recent: {' ; '.join(parts)}" if parts else None
 
 
+def format_harness_task_contract_summary(task_payload: Any, *, include_review: bool = False) -> Optional[str]:
+    task = task_payload if isinstance(task_payload, dict) else {}
+    harness = task.get("harness") if isinstance(task.get("harness"), dict) else {}
+    contract = harness.get("task_contract") if isinstance(harness.get("task_contract"), dict) else {}
+    if not contract:
+        return None
+
+    parts = [
+        str(contract.get("worker_class") or "").strip(),
+        str(contract.get("decision_state") or "").strip(),
+        str(contract.get("approval_state") or "").strip(),
+    ]
+    next_action = str(contract.get("next_action") or "").strip()
+    if next_action:
+        parts.append(f"next: {next_action}")
+    if include_review:
+        review_surface = str(contract.get("review_surface") or "").strip()
+        if review_surface:
+            parts.append(f"review: {review_surface}")
+    summary = " · ".join(part for part in parts if part)
+    return summary or None
+
+
 def describe_task_control(detail_payload: Any) -> Optional[str]:
     payload = detail_payload if isinstance(detail_payload, dict) else {}
     task_id = str(payload.get("task_id") or "").strip()
@@ -834,6 +863,7 @@ def render_gateway_task_detail_block(
     preview = task.get("preview")
     actions = normalize_task_actions(task.get("actions"))
     control = describe_task_control(payload)
+    worker_summary = format_harness_task_contract_summary(task, include_review=True)
     harness = task.get("harness") if isinstance(task.get("harness"), dict) else {}
     harness_control = harness.get("control") if isinstance(harness.get("control"), dict) else {}
     latest_control_action = format_harness_control_summary(harness_control.get("latest_action"))
@@ -879,6 +909,8 @@ def render_gateway_task_detail_block(
         lines.append(f"**Preview:** {preview_text}")
     if control:
         lines.append(f"**Control:** {control}")
+    if worker_summary:
+        lines.append(f"**Worker:** {worker_summary}")
     if latest_control_action:
         lines.append(f"**Latest Control Action:** {latest_control_action}")
     if latest_recovery and latest_recovery != latest_control_action:

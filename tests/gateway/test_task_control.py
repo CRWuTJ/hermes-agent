@@ -306,6 +306,68 @@ def test_render_gateway_task_detail_block_includes_harness_control_summary():
 
 
 
+def test_render_gateway_task_detail_block_includes_company_os_worker_contract():
+    rendered = render_gateway_task_detail_block(
+        {
+            "task_id": "task-contract",
+            "state": "queued",
+            "task": {
+                "task_id": "task-contract",
+                "lane": "interactive",
+                "priority": 50,
+                "priority_bucket": "next",
+                "kind": "queued_message",
+                "control_mode": "queued",
+                "actions": ["foreground", "reprioritize", "cancel"],
+                "source": "telegram",
+                "harness": {
+                    "task_contract": {
+                        "worker_class": "runtime_coordinator",
+                        "decision_state": "ready",
+                        "approval_state": "approved",
+                        "next_action": "take_next_queue_action",
+                        "review_surface": "/task task-contract",
+                    }
+                },
+            },
+        }
+    )
+
+    assert "**Worker:** runtime_coordinator · ready · approved · next: take_next_queue_action · review: /task task-contract" in rendered
+
+
+def test_render_gateway_tasks_block_includes_company_os_worker_contract_summary():
+    rendered = render_gateway_tasks_block(
+        {
+            "queued": {
+                "queued_count": 1,
+                "tasks": [
+                    {
+                        "task_id": "task-contract",
+                        "lane": "interactive",
+                        "priority": 50,
+                        "priority_bucket": "next",
+                        "reply_policy": "status_only",
+                        "preview": "queued follow-up",
+                        "actions": ["foreground", "reprioritize", "cancel"],
+                        "harness": {
+                            "task_contract": {
+                                "worker_class": "runtime_coordinator",
+                                "decision_state": "ready",
+                                "approval_state": "approved",
+                                "next_action": "take_next_queue_action",
+                            }
+                        },
+                    }
+                ],
+            },
+            "live": {"active_count": 0, "tasks": []},
+        }
+    )
+
+    assert "↳ worker: runtime_coordinator · ready · approved · next: take_next_queue_action" in rendered
+
+
 def test_render_gateway_tasks_block_includes_harness_control_summary():
     rendered = render_gateway_tasks_block(
         {
