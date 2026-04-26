@@ -383,6 +383,16 @@ DEFAULT_CONFIG = {
         "background_review_notifications": False,  # Send post-turn memory/profile update summaries in messaging gateways
     },
 
+    # User-facing response style guardrails. Disabled by default; when enabled,
+    # Hermes injects a style prompt and can lightly reformat gateway replies.
+    "response_style": {
+        "enabled": False,
+        "profile": "secretary",
+        "platforms": ["telegram"],
+        "require_labels": True,
+        "max_chars": 700,
+    },
+
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
@@ -589,7 +599,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 13,
+    "_config_version": 14,
 }
 
 # =============================================================================
@@ -1380,7 +1390,7 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "harness", "auxiliary", "custom_providers", "memory", "gateway",
+    "response_style", "harness", "auxiliary", "custom_providers", "memory", "gateway",
 }
 
 # Valid fields inside a custom_providers list entry

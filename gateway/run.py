@@ -93,6 +93,7 @@ from gateway.task_control import (
     task_command_usage_text as shared_task_command_usage_text,
 )
 from task_lanes import TaskLaneRegistry, normalize_task_lane
+from agent.response_style import apply_response_style_guard
 from utils import atomic_yaml_write
 _hermes_home = get_hermes_home()
 
@@ -3648,6 +3649,13 @@ class GatewayRunner:
                 pass
 
             response = agent_result.get("final_response") or ""
+            response_style_config = _load_gateway_config()
+            response = apply_response_style_guard(
+                response,
+                response_style_config,
+                platform=source.platform.value if source.platform else None,
+                user_message=message_text,
+            )
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
