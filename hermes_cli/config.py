@@ -481,6 +481,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "db_path": "",  # empty = ~/.hermes/runtime/harness.sqlite3
         "default_autonomy_target": "bounded",
+        "extra_write_roots": [],
         "plan": {
             "always_require_for_surfaces": ["cron", "delegate", "background"],
             "max_direct_chars": 280,
@@ -2617,7 +2618,9 @@ def set_config_value(key: str, value: str):
             current[part] = {}
         current = current[part]
     
-    # Convert value to appropriate type
+    # Convert value to appropriate type.  For structured YAML-like values
+    # (lists/dicts), preserve the structure instead of writing a quoted string.
+    raw_value = value
     if value.lower() in ('true', 'yes', 'on'):
         value = True
     elif value.lower() in ('false', 'no', 'off'):
@@ -2626,6 +2629,13 @@ def set_config_value(key: str, value: str):
         value = int(value)
     elif value.replace('.', '', 1).isdigit():
         value = float(value)
+    else:
+        try:
+            parsed = yaml.safe_load(raw_value)
+            if isinstance(parsed, (list, dict)):
+                value = parsed
+        except Exception:
+            pass
     
     current[parts[-1]] = value
     

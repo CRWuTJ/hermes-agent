@@ -142,6 +142,7 @@ def _discover_tools():
         "tools.vision_tools",
         "tools.mixture_of_agents_tool",
         "tools.image_generation_tool",
+        "tools.video_generation_tool",
         "tools.skills_tool",
         "tools.skill_manager_tool",
         "tools.browser_tool",
@@ -154,6 +155,7 @@ def _discover_tools():
         "tools.clarify_tool",
         "tools.code_execution_tool",
         "tools.delegate_tool",
+        "tools.claude_code_tool",
         "tools.process_registry",
         "tools.send_message_tool",
         # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
@@ -257,6 +259,7 @@ _LEGACY_TOOLSET_MAP = {
     "vision_tools": ["vision_analyze"],
     "moa_tools": ["mixture_of_agents"],
     "image_tools": ["image_generate"],
+    "video_tools": ["video_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
     "browser_tools": [
         "browser_navigate", "browser_snapshot", "browser_click",

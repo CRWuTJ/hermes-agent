@@ -9,6 +9,7 @@ def test_default_config_has_harness_section():
     assert "acceptance" in harness
     assert "drift" in harness
     assert "audit" in harness
+    assert harness["extra_write_roots"] == []
 
 
 def test_known_root_keys_include_harness():

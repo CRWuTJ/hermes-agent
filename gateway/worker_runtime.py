@@ -114,6 +114,7 @@ class GatewayConversationWorkerHandle:
         self._pending_approval: Optional[Dict[str, Any]] = None
         self._pending_approval_lock = threading.Lock()
         self._result: Optional[Dict[str, Any]] = None
+        self._result_lock = threading.Lock()
         self._stderr_tail: list[str] = []
         self.model: Optional[str] = None
         self.session_prompt_tokens = 0
@@ -123,6 +124,22 @@ class GatewayConversationWorkerHandle:
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
         self._stdout_thread.start()
         self._stderr_thread.start()
+
+    def _set_result_once(self, result: Dict[str, Any]) -> bool:
+        """Store a terminal result exactly once and release waiters."""
+        with self._result_lock:
+            if self._result_event.is_set():
+                return False
+            self._result = result
+            self._result_event.set()
+            return True
+
+    def _recover_result_from_artifacts(self) -> bool:
+        """Load durable worker artifacts if the stdout protocol path failed."""
+        recovered = self._result_from_artifacts()
+        if not recovered:
+            return False
+        return self._set_result_once(recovered)
 
     def _result_from_artifacts(self) -> Optional[Dict[str, Any]]:
         if self.runtime_dir is None:
@@ -200,85 +217,92 @@ class GatewayConversationWorkerHandle:
         except Exception:
             logger.debug("Detached worker stderr remainder read failed", exc_info=True)
         recovered = self._result_from_artifacts()
-        self._result = recovered or self._protocol_failure_result()
-        self._result_event.set()
+        self._set_result_once(recovered or self._protocol_failure_result())
 
     def _stdout_loop(self) -> None:
         if self.proc.stdout is None:
-            self._result = {
+            self._set_result_once({
                 "final_response": "⚠️ Detached worker did not expose stdout.",
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
                 "failed": True,
-            }
-            self._result_event.set()
+            })
             return
-        for raw_line in self.proc.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except Exception:
-                logger.debug("Ignoring non-JSON worker stdout line: %s", line[:200])
-                continue
-            msg_type = data.get("type")
-            if msg_type == "status":
-                activity = data.get("activity") or {}
-                if isinstance(activity, dict):
-                    self._latest_status = activity
-                continue
-            if msg_type == "approval_request":
-                approval = data.get("approval") or {}
-                if isinstance(approval, dict):
-                    with self._pending_approval_lock:
-                        self._pending_approval = approval
-                    if callable(self._approval_request_callback):
-                        try:
-                            self._approval_request_callback(dict(approval))
-                        except Exception:
-                            logger.debug("Detached approval callback failed", exc_info=True)
-                continue
-            if msg_type == "result":
-                result = data.get("result") or {}
-                if isinstance(result, dict):
-                    self._result = result
-                    self._result.setdefault("failed", False)
-                    self._result.setdefault("terminal_state", "completed")
-                    self._result.setdefault("failure_kind", "")
-                    self.model = result.get("model") or self.model
-                    self.session_prompt_tokens = int(result.get("input_tokens") or 0)
-                    self.session_completion_tokens = int(result.get("output_tokens") or 0)
-                    self.context_compressor = SimpleNamespace(last_prompt_tokens=int(result.get("last_prompt_tokens") or 0))
-                else:
-                    self._result = {
-                        "final_response": "⚠️ Detached worker returned malformed result payload.",
+        try:
+            for raw_line in self.proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    logger.debug("Ignoring non-JSON worker stdout line: %s", line[:200])
+                    continue
+                msg_type = data.get("type")
+                if msg_type == "status":
+                    activity = data.get("activity") or {}
+                    if isinstance(activity, dict):
+                        self._latest_status = activity
+                    continue
+                if msg_type == "approval_request":
+                    approval = data.get("approval") or {}
+                    if isinstance(approval, dict):
+                        with self._pending_approval_lock:
+                            self._pending_approval = approval
+                        if callable(self._approval_request_callback):
+                            try:
+                                self._approval_request_callback(dict(approval))
+                            except Exception:
+                                logger.debug("Detached approval callback failed", exc_info=True)
+                    continue
+                if msg_type == "result":
+                    result = data.get("result") or {}
+                    if isinstance(result, dict):
+                        terminal_result = result
+                        terminal_result.setdefault("failed", False)
+                        terminal_result.setdefault("terminal_state", "completed")
+                        terminal_result.setdefault("failure_kind", "")
+                        self.model = result.get("model") or self.model
+                        self.session_prompt_tokens = int(result.get("input_tokens") or 0)
+                        self.session_completion_tokens = int(result.get("output_tokens") or 0)
+                        self.context_compressor = SimpleNamespace(last_prompt_tokens=int(result.get("last_prompt_tokens") or 0))
+                    else:
+                        terminal_result = {
+                            "final_response": "⚠️ Detached worker returned malformed result payload.",
+                            "messages": [],
+                            "api_calls": 0,
+                            "tools": [],
+                            "failed": True,
+                            "terminal_state": "protocol_violation",
+                            "failure_kind": "malformed_result_payload",
+                        }
+                    self._set_result_once(terminal_result)
+                    return
+                if msg_type == "error":
+                    error_message = str(data.get("error") or "Detached worker failed.")
+                    self._set_result_once({
+                        "final_response": f"⚠️ {error_message}",
                         "messages": [],
                         "api_calls": 0,
                         "tools": [],
                         "failed": True,
-                        "terminal_state": "protocol_violation",
-                        "failure_kind": "malformed_result_payload",
-                    }
-                self._result_event.set()
-                return
-            if msg_type == "error":
-                error_message = str(data.get("error") or "Detached worker failed.")
-                self._result = {
-                    "final_response": f"⚠️ {error_message}",
-                    "messages": [],
-                    "api_calls": 0,
-                    "tools": [],
-                    "failed": True,
-                    "terminal_state": "failed",
-                    "failure_kind": "worker_error",
-                    "traceback": data.get("traceback"),
-                }
-                self._result_event.set()
-                return
+                        "terminal_state": "failed",
+                        "failure_kind": "worker_error",
+                        "traceback": data.get("traceback"),
+                    })
+                    return
+        except Exception:
+            # A worker can leak non-UTF-8 or otherwise malformed bytes through
+            # systemd-run --pipe.  The durable result.json/error.json artifact is
+            # the source of truth; do not leave waiters blocked just because the
+            # stdout protocol reader died.
+            logger.warning(
+                "Detached worker stdout reader failed; waiting for durable artifact recovery",
+                exc_info=True,
+            )
 
-        if not self._result_event.is_set():
+        if not self._result_event.is_set() and self.proc.poll() is not None:
             self._finalize_terminal_result()
 
     def _stderr_loop(self) -> None:
@@ -369,7 +393,7 @@ class GatewayConversationWorkerHandle:
         with self._pending_approval_lock:
             self._pending_approval = None
         if not self._result_event.is_set():
-            self._result = {
+            self._set_result_once({
                 "final_response": "⚠️ Detached worker was terminated before producing a result.",
                 "messages": [],
                 "api_calls": 0,
@@ -380,8 +404,7 @@ class GatewayConversationWorkerHandle:
                 "worker_unit_name": self.unit_name,
                 "worker_run_dir": str(self.runtime_dir) if self.runtime_dir is not None else None,
                 "termination_confirmed": stopped,
-            }
-            self._result_event.set()
+            })
         return stopped
 
     def resolve_approval(self, choice: str) -> bool:
@@ -423,10 +446,12 @@ class GatewayConversationWorkerHandle:
 
     def wait_for_result_blocking(self) -> Dict[str, Any]:
         while not self._result_event.is_set():
+            if self._recover_result_from_artifacts():
+                break
             if self.proc.poll() is not None and not self._result_event.is_set():
-                time.sleep(0.05)
-            else:
-                time.sleep(0.1)
+                self._finalize_terminal_result()
+                break
+            time.sleep(0.1)
         return dict(self._result or {
             "final_response": "⚠️ Detached worker finished without a result.",
             "messages": [],
@@ -437,10 +462,12 @@ class GatewayConversationWorkerHandle:
 
     async def wait_for_result(self) -> Dict[str, Any]:
         while not self._result_event.is_set():
+            if self._recover_result_from_artifacts():
+                break
             if self.proc.poll() is not None and not self._result_event.is_set():
-                await asyncio.sleep(0.05)
-            else:
-                await asyncio.sleep(0.1)
+                self._finalize_terminal_result()
+                break
+            await asyncio.sleep(0.1)
         return self.wait_for_result_blocking()
 
 

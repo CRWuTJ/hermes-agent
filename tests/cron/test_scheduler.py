@@ -8,6 +8,48 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from agent.task_queue import TaskQueueLedger
+
+
+class TestCronTaskQueueContext:
+    def test_build_job_prompt_injects_queue_status_for_watchdog_visibility(self, tmp_path):
+        backlog = tmp_path / "backlog.jsonl"
+        ledger = TaskQueueLedger(backlog)
+        ledger.enqueue(
+            title="Queued scout",
+            task_id="queued-scout",
+            lane="research",
+            acceptance_check=["done"],
+            artifact_targets=["artifact:queued"],
+        )
+        ledger.enqueue(
+            title="Running impl",
+            task_id="running-impl",
+            lane="implementation",
+            status="running",
+            acceptance_check=["done"],
+            artifact_targets=["artifact:running"],
+        )
+        ledger.enqueue(
+            title="Blocked vault",
+            task_id="blocked-vault",
+            lane="knowledge",
+            status="blocked",
+            blocked_by=["write scope"],
+            acceptance_check=["done"],
+            artifact_targets=["artifact:blocked"],
+        )
+
+        with patch("cron.scheduler.load_config", return_value={"task_queue": {"enabled": True, "path": str(backlog)}}):
+            prompt = _build_job_prompt({"prompt": "Check background progress."})
+
+        assert "## Task Queue Status" in prompt
+        assert "queue runner remains the source of truth" in prompt
+        assert '"ready": 1' in prompt
+        assert '"running": 1' in prompt
+        assert '"blocked": 1' in prompt
+        assert '"dispatchable_count": 1' in prompt
+        assert "queued-scout" in prompt
 
 
 class TestResolveOrigin:
@@ -1115,6 +1157,44 @@ class TestBuildJobPromptMissingSkill:
             result = _build_job_prompt({"skills": ["ghost-skill", "real-skill"], "prompt": "go"})
         assert "Real skill content." in result
         assert "go" in result
+
+
+class TestTickQueueFirst:
+    """Verify queue-first cron jobs are enqueued instead of run inline."""
+
+    def test_queue_first_job_enqueues_without_running_inline(self, tmp_path):
+        fake_job = {
+            "id": "queue-first-job",
+            "name": "queue first",
+            "prompt": "do background work",
+            "enabled": True,
+            "queue_first": True,
+            "deliver": "local",
+            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+        }
+        calls = []
+
+        def fake_enqueue(job, config=None, status="ready"):
+            calls.append((job["id"], status, config))
+            return {"id": "cron_queue-first-job_1"}
+
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+             patch("cron.scheduler.advance_next_run") as advance_mock, \
+             patch("cron.scheduler.load_config", return_value={"task_queue": {"enabled": True}}), \
+             patch("gateway.task_queue_bridge.enqueue_cron_job_task", side_effect=fake_enqueue), \
+             patch("cron.scheduler.update_job") as update_mock, \
+             patch("cron.scheduler.run_job") as run_mock, \
+             patch("cron.scheduler.save_job_output"):
+            from cron.scheduler import tick
+            executed = tick(verbose=False)
+
+        assert executed == 1
+        advance_mock.assert_called_once_with("queue-first-job")
+        assert calls == [("queue-first-job", "ready", {"task_queue": {"enabled": True}})]
+        update_mock.assert_called_once()
+        run_mock.assert_not_called()
 
 
 class TestTickAdvanceBeforeRun:

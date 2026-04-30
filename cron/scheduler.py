@@ -48,7 +48,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "sms", "email", "webhook",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, effective_job_lane
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, effective_job_lane, update_job
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -531,10 +531,83 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+def _task_queue_prompt_context() -> str:
+    """Build compact queue visibility context for cron/watchdog jobs."""
+
+    try:
+        config = load_config()
+        queue_cfg = config.get("task_queue", {}) if isinstance(config, dict) else {}
+        from gateway.task_queue_bridge import task_queue_status
+
+        status = task_queue_status(config)
+        if not status.get("enabled", True):
+            return ""
+        if not status.get("exists") and not queue_cfg:
+            return ""
+        visible = {
+            "path": status.get("path"),
+            "task_count": status.get("task_count", 0),
+            "open_count": status.get("open_count", 0),
+            "status_counts": status.get("status_counts", {}),
+            "lane_counts": status.get("lane_counts", {}),
+            "dispatchable_count": status.get("dispatchable_count", 0),
+            "next_ready_ids": status.get("next_ready_ids", []),
+            "blocked_count": status.get("blocked_count", 0),
+            "validation_error_count": status.get("validation_error_count", 0),
+        }
+        if status.get("error"):
+            visible["error"] = status.get("error")
+        payload = json.dumps(visible, ensure_ascii=False, indent=2, sort_keys=True)
+        return (
+            "## Task Queue Status\n"
+            "Cron/watchdog visibility only; the queue runner remains the source of truth. "
+            "Do not start or select work directly from cron just because it appears ready.\n\n"
+            f"```json\n{payload}\n```"
+        )
+    except Exception as exc:
+        logger.debug("Failed to build task queue prompt context: %s", exc, exc_info=True)
+        return ""
+
+
+def _should_queue_first(job: dict) -> bool:
+    """Return whether a due cron job should be enqueued instead of run inline."""
+
+    return bool(job.get("queue_first") or job.get("dispatch") == "queue")
+
+
+def _enqueue_due_job_to_queue(job: dict) -> tuple[bool, str | None]:
+    """Enqueue a due cron job into the durable task queue for worker execution."""
+
+    try:
+        config = load_config()
+        from gateway.task_queue_bridge import enqueue_cron_job_task
+
+        task = enqueue_cron_job_task(job=job, config=config, status="ready")
+        if not task:
+            return False, "task queue disabled or enqueue returned no task"
+        update_job(
+            job["id"],
+            {
+                "last_status": "queued",
+                "last_error": None,
+                "last_delivery_error": None,
+            },
+        )
+        logger.info("Job '%s' queued as task %s", job.get("name", job.get("id")), task.get("id"))
+        return True, str(task.get("id"))
+    except Exception as exc:
+        logger.warning("Failed to enqueue cron job '%s' into task queue: %s", job.get("id", "?"), exc)
+        return False, str(exc)
+
+
 def _build_job_prompt(job: dict) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first."""
     prompt = job.get("prompt", "")
     skills = job.get("skills")
+
+    queue_context = _task_queue_prompt_context()
+    if queue_context:
+        prompt = f"{queue_context}\n\n{prompt}"
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
@@ -982,6 +1055,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # process crashes mid-run, the job won't re-fire on restart.
                 # One-shot jobs are left alone so they can retry on restart.
                 advance_next_run(job["id"])
+
+                if _should_queue_first(job):
+                    queued, queue_result = _enqueue_due_job_to_queue(job)
+                    if queued:
+                        executed += 1
+                    else:
+                        mark_job_run(job["id"], False, queue_result or "failed to enqueue cron job")
+                    continue
 
                 success, output, final_response, error = run_job(job)
 

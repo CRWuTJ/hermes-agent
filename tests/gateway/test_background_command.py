@@ -174,7 +174,8 @@ class TestHandleBackgroundCommand:
                     platform=platform,
                 )
                 result = await runner._handle_background_command(event)
-                assert "Background task started" in result
+                assert "Background task" in result
+                assert "Task ID:" in result
 
 
 # ---------------------------------------------------------------------------

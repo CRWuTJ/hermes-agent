@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run Claude Code through the local GPT-compatible CPA gateway without
+# changing the user's global shell environment.
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+ENV_FILE="$HERMES_HOME/.env"
+BASE_URL="${CLAUDE_GPT_BASE_URL:-${ANTHROPIC_BASE_URL:-http://127.0.0.1:8317}}"
+MODEL="${CLAUDE_GPT_MODEL:-${ANTHROPIC_MODEL:-gpt-5.5}}"
+
+_read_env_key() {
+  local key="$1"
+  python3 - "$ENV_FILE" "$key" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+key = sys.argv[2]
+if not path.exists():
+    raise SystemExit(0)
+for raw in path.read_text(errors="ignore").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    name, value = line.split("=", 1)
+    if name.strip() == key:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        print(value)
+        break
+PY
+}
+
+TOKEN="${CLAUDE_GPT_AUTH_TOKEN:-${ANTHROPIC_AUTH_TOKEN:-}}"
+if [[ -z "$TOKEN" ]]; then
+  TOKEN="$(_read_env_key CLAUDE_GPT_AUTH_TOKEN || true)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  TOKEN="$(_read_env_key ANTHROPIC_AUTH_TOKEN || true)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  # On this host, IMAGE_OPENAI_API_KEY may be the local CPA key for 8317.
+  TOKEN="$(_read_env_key IMAGE_OPENAI_API_KEY || true)"
+fi
+
+if [[ -z "$TOKEN" ]]; then
+  echo "claude-gpt: missing auth token. Set CLAUDE_GPT_AUTH_TOKEN or IMAGE_OPENAI_API_KEY in $ENV_FILE." >&2
+  exit 2
+fi
+
+export ANTHROPIC_BASE_URL="$BASE_URL"
+export ANTHROPIC_AUTH_TOKEN="$TOKEN"
+export ANTHROPIC_API_KEY="$TOKEN"
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+
+CLAUDE_BIN="${CLAUDE_GPT_CLAUDE_BIN:-claude}"
+json_mode=0
+expect_format=0
+for arg in "$@"; do
+  if [[ "$expect_format" == 1 ]]; then
+    [[ "$arg" == "json" ]] && json_mode=1
+    expect_format=0
+    continue
+  fi
+  case "$arg" in
+    --output-format=json) json_mode=1 ;;
+    --output-format) expect_format=1 ;;
+  esac
+done
+
+if [[ "$json_mode" == 1 ]]; then
+  set +e
+  output="$("$CLAUDE_BIN" "$@" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\n' "$output"
+  if printf '%s\n' "$output" | python3 -c 'import json, sys
+payload = None
+for line in reversed(sys.stdin.read().splitlines()):
+    line = line.strip()
+    if not (line.startswith("{") and line.endswith("}")):
+        continue
+    try:
+        payload = json.loads(line)
+        break
+    except Exception:
+        pass
+raise SystemExit(0 if isinstance(payload, dict) and payload.get("is_error") is False else 1)
+'
+  then
+    exit 0
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    exit 1
+  fi
+  exit "$status"
+fi
+
+exec "$CLAUDE_BIN" "$@"

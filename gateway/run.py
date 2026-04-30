@@ -545,6 +545,29 @@ def _render_gateway_tasks_block(
     return "\n".join(lines)
 
 
+def _render_durable_task_queue_block(config: Any = None) -> str:
+    try:
+        from gateway.task_queue_bridge import task_queue_status
+
+        status = task_queue_status(config)
+    except Exception:
+        return ""
+    if not status.get("enabled", True) or not status.get("exists"):
+        return ""
+    counts = status.get("status_counts") if isinstance(status.get("status_counts"), dict) else {}
+    next_ids = status.get("next_ready_ids") if isinstance(status.get("next_ready_ids"), list) else []
+    parts = [
+        f"ready={int(counts.get('ready') or 0)}",
+        f"running={int(counts.get('running') or 0)}",
+        f"blocked={int(counts.get('blocked') or 0)}",
+        f"done={int(counts.get('done') or 0)}",
+        f"dispatchable={int(status.get('dispatchable_count') or 0)}",
+    ]
+    if next_ids:
+        parts.append("next=" + ",".join(str(item) for item in next_ids[:3]))
+    return "**Durable task queue:**\n" + " · ".join(parts)
+
+
 def _describe_task_control(*, task_id: str, state: str, actions: Optional[List[str]] = None, managed: bool = False) -> Optional[str]:
     control_mode = "queued" if state == "queued" else ("managed_runtime" if managed else "read_only")
     detail_payload = build_task_detail_payload(
@@ -904,6 +927,118 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+def _natural_dispatch_enabled(config: Any = None) -> bool:
+    raw = (config or {}).get("natural_dispatch", {}) if isinstance(config, dict) else {}
+    return bool(raw.get("enabled", False))
+
+
+def _strip_task_prefix(text: str) -> str:
+    prompt = text.strip()
+    for prefix in ("帮我", "请你", "请", "你"):
+        if prompt.startswith(prefix) and len(prompt) > len(prefix):
+            prompt = prompt[len(prefix):].strip()
+            break
+    return prompt
+
+
+def _after_colon(text: str) -> str:
+    for sep in ("：", ":"):
+        if sep in text:
+            return text.split(sep, 1)[1].strip()
+    return ""
+
+
+def _is_image_generation_request(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    media_words = ("图片", "图像", "画面", "插画", "海报", "壁纸", "封面", "logo", "Logo")
+    generate_words = ("生成", "画", "画一", "画个", "画张", "制作", "设计", "出图", "做一张")
+    analysis_words = ("分析", "识别", "看一下", "检查", "这张图", "这个图")
+    return (
+        any(word in raw for word in media_words)
+        and any(word in raw for word in generate_words)
+        and not any(word in raw for word in analysis_words)
+    )
+
+
+def _is_video_generation_request(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    media_words = ("视频", "短视频", "动图", "动画", "mp4", "MP4", "影片", "镜头")
+    generate_words = ("生成", "制作", "做", "创建", "出视频", "做一个", "生成一个")
+    analysis_words = ("分析", "识别", "看一下", "检查", "这段视频", "这个视频")
+    return (
+        any(word in raw for word in media_words)
+        and any(word in raw for word in generate_words)
+        and not any(word in raw for word in analysis_words)
+    )
+
+
+def _parse_natural_dispatch(text: str, config: Any = None) -> Optional[Dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    cfg = (config or {}).get("natural_dispatch", {}) if isinstance(config, dict) else {}
+    prefixes = ["后台执行", "后台处理", "后台调研", "你自己安排后台执行", *list(cfg.get("background_prefixes") or [])]
+
+    try:
+        from gateway.self_evolution_bridge import parse_self_evolution_request
+
+        self_evolution_dispatch = parse_self_evolution_request(raw, config)
+        if self_evolution_dispatch:
+            return self_evolution_dispatch
+    except Exception:
+        pass
+
+    task_match = re.search(r"(?:任务\s*)?(bg[_-][A-Za-z0-9_\-]+)", raw)
+    if task_match:
+        task_id = task_match.group(1)
+        if any(word in raw for word in ("取消", "停掉", "停止", "先停")):
+            return {"action": "task", "task_id": task_id, "task_action": "cancel"}
+        if any(word in raw for word in ("优先", "先做", "现在做")):
+            return {"action": "task", "task_id": task_id, "task_action": "foreground"}
+        if any(word in raw for word in ("晚点", "稍后", "later")):
+            return {"action": "task", "task_id": task_id, "task_action": "later"}
+        return {"action": "task", "task_id": task_id, "task_action": ""}
+    if raw in {"刚才那个先停", "刚才那个停掉", "刚才那个取消"}:
+        return {"action": "task_latest", "task_action": "cancel"}
+    if any(phrase in raw for phrase in ("后台任务", "哪些任务", "任务列表")):
+        return {"action": "tasks"}
+    if _is_video_generation_request(raw):
+        return {"action": "video_generate", "prompt": raw}
+    if _is_image_generation_request(raw):
+        return {"action": "image_generate", "prompt": raw}
+
+    if "先别改" in raw and "只查" in raw:
+        subject = raw.split("只查", 1)[1].strip(" ，,。")
+        return {"action": "background", "prompt": f"只读检查 {subject}；不要改文件，不要重启服务。"}
+    if "然后后台" in raw:
+        prompt = raw.split("然后后台", 1)[1].strip(" ，,。")
+        return {"action": "background", "prompt": prompt}
+    for prefix in prefixes:
+        if raw.startswith(prefix):
+            prompt = _after_colon(raw) or raw[len(prefix):].strip(" ，,。")
+            if prefix == "后台调研" and not prompt.startswith("调研"):
+                prompt = "调研" + prompt
+            return {"action": "background", "prompt": prompt}
+
+    if raw in {"帮我处理一下这个", "弄一下这个", "做一下这个", "继续处理"}:
+        return {"action": "clarify", "prompt": raw}
+    if raw in {"我们继续讨论方案", "你先分析方案，不要执行", "检查一下这个方案是否合理", "后台数据怎么同步"}:
+        return None
+    if raw.startswith(("继续检查", "继续优化", "继续补完")):
+        return {"action": "background", "prompt": raw}
+    if raw.startswith("帮我排查"):
+        return {"action": "background", "prompt": _strip_task_prefix(raw)}
+    if any(word in raw for word in ("改", "补完", "修", "处理", "落地", "实现", "收尾", "验证", "测试")) and any(
+        raw.startswith(prefix) for prefix in ("帮我", "请你", "把", "根据上面的方案", "按刚才的方案", "修", "处理")
+    ):
+        return {"action": "background", "prompt": _strip_task_prefix(raw)}
+    return None
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -1059,6 +1194,20 @@ class GatewayRunner:
         if not isinstance(registry, dict):
             return None
         return registry.get(task_id)
+
+    def _active_managed_runtime_task_ids(self) -> set[str]:
+        registry = getattr(self, "_managed_runtime_tasks", {})
+        if not isinstance(registry, dict):
+            return set()
+        active: set[str] = set()
+        for task_id, entry in registry.items():
+            if not isinstance(entry, dict):
+                continue
+            task = entry.get("task")
+            if task is not None and hasattr(task, "done") and task.done():
+                continue
+            active.add(str(task_id))
+        return active
 
     def _managed_runtime_task_actions(self, task_id: str) -> List[str]:
         entry = self._get_managed_runtime_task(task_id)
@@ -1308,6 +1457,108 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _natural_task_session_key(self, source: SessionSource) -> str:
+        return self._session_key_for_source(source)
+
+    async def _handle_natural_dispatch(self, event: MessageEvent) -> Optional[str]:
+        config = _load_gateway_config()
+        if not _natural_dispatch_enabled(config):
+            return None
+        dispatch = _parse_natural_dispatch(event.text or "", config)
+        if not dispatch:
+            return None
+        if not hasattr(self, "_last_natural_task_by_session"):
+            self._last_natural_task_by_session = {}
+        action = dispatch.get("action")
+        original_text = event.text
+        if action == "background":
+            prompt = str(dispatch.get("prompt") or "").strip()
+            event.text = f"/background {prompt}"
+            try:
+                result = await self._handle_background_command(event)
+            finally:
+                event.text = original_text
+            if not result or "Task ID:" not in result:
+                return result
+            task_id = ""
+            for line in str(result).splitlines():
+                if line.startswith("Task ID:"):
+                    task_id = line.split(":", 1)[1].strip()
+                    break
+            if task_id:
+                self._last_natural_task_by_session[self._natural_task_session_key(event.source)] = task_id
+            return f"已放到后台：\n{result}"
+        if action == "tasks":
+            return await self._handle_tasks_command(event)
+        if action == "self_evolution":
+            from gateway.self_evolution_bridge import run_self_evolution_for_gateway
+
+            return run_self_evolution_for_gateway(config)
+        if action == "image_generate":
+            prompt = str(dispatch.get("prompt") or original_text or "").strip()
+            try:
+                from tools.image_generation_tool import image_generate_tool
+
+                raw_result = await asyncio.to_thread(image_generate_tool, prompt=prompt, aspect_ratio="landscape")
+                image_result = json.loads(raw_result or "{}")
+            except Exception as exc:
+                return f"Result:\n图片没有生成。\n\nBlocker:\n图片工具调用失败：{str(exc)[:160]}\n\nNext step:\n修复图片工具后再重试。"
+
+            if image_result.get("success"):
+                media_path = image_result.get("media_path")
+                image_url = image_result.get("image_url") or image_result.get("image")
+                if media_path:
+                    return f"Result:\n已生成图片。\n\nBlocker:\n无。\n\nNext step:\nMEDIA:{media_path}"
+                if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
+                    return f"Result:\n已生成图片。\n\nBlocker:\n无。\n\nNext step:\n![生成图片]({image_url})"
+                return "Result:\n图片生成接口返回成功，但没有可发送的图片路径或 URL。\n\nBlocker:\n图片结果缺少 media_path/image_url。\n\nNext step:\n补齐图片结果格式后重试。"
+
+            error = str(image_result.get("error") or "图片生成失败")[:200]
+            return f"Result:\n图片没有生成。\n\nBlocker:\n{error}\n\nNext step:\n修复图片后端配置后重试。"
+        if action == "video_generate":
+            prompt = str(dispatch.get("prompt") or original_text or "").strip()
+            try:
+                from tools.video_generation_tool import video_generate_tool
+
+                raw_result = await asyncio.to_thread(
+                    video_generate_tool,
+                    prompt=prompt,
+                    mode=str(dispatch.get("mode") or "text_to_video"),
+                    aspect_ratio=str(dispatch.get("aspect_ratio") or "landscape"),
+                )
+                video_result = json.loads(raw_result or "{}")
+            except Exception as exc:
+                return f"Result:\n视频没有生成。\n\nBlocker:\n视频工具调用失败：{str(exc)[:160]}\n\nNext step:\n修复视频工具后再重试。"
+
+            if video_result.get("success"):
+                media_path = video_result.get("media_path")
+                video_url = video_result.get("video_url") or video_result.get("video")
+                if media_path:
+                    return f"Result:\n已生成视频。\n\nBlocker:\n无。\n\nNext step:\nMEDIA:{media_path}"
+                if isinstance(video_url, str) and video_url.startswith(("http://", "https://")):
+                    return f"Result:\n已生成视频。\n\nBlocker:\n无。\n\nNext step:\n{video_url}"
+                return "Result:\n视频生成接口返回成功，但没有可发送的视频路径或 URL。\n\nBlocker:\n视频结果缺少 media_path/video_url。\n\nNext step:\n补齐视频结果格式后重试。"
+
+            error = str(video_result.get("error") or "视频生成失败")[:200]
+            return f"Result:\n视频没有生成。\n\nBlocker:\n{error}\n\nNext step:\n修复视频后端配置后重试。"
+        if action == "task_latest":
+            task_id = self._last_natural_task_by_session.get(self._natural_task_session_key(event.source))
+            if not task_id:
+                return "我不知道你指哪个任务。请发任务号，或先看一下后台任务。"
+            dispatch = {"action": "task", "task_id": task_id, "task_action": dispatch.get("task_action", "")}
+            action = "task"
+        if action == "task":
+            task_action = str(dispatch.get("task_action") or "").strip()
+            task_id = str(dispatch.get("task_id") or "").strip()
+            event.text = f"/task {task_id}{(' ' + task_action) if task_action else ''}"
+            try:
+                return await self._handle_task_command(event)
+            finally:
+                event.text = original_text
+        if action == "clarify":
+            return "我理解你想让我处理一个任务，但要处理哪个对象、能不能改、验收标准是什么还不清楚。请补一句目标。"
+        return None
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
@@ -2469,6 +2720,8 @@ class GatewayRunner:
         # Check if user is authorized
         if not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            if not source.user_id:
+                return None
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
@@ -2708,6 +2961,11 @@ class GatewayRunner:
             running_agent.interrupt(_interrupt_text)
             return None
 
+        if not event.get_command():
+            natural_response = await self._handle_natural_dispatch(event)
+            if natural_response is not None:
+                return natural_response
+
         # Check for commands
         command = event.get_command()
         
@@ -2744,6 +3002,11 @@ class GatewayRunner:
 
         if canonical == "tasks":
             return await self._handle_tasks_command(event)
+
+        if canonical == "selfevolve":
+            from gateway.self_evolution_bridge import run_self_evolution_for_gateway
+
+            return run_self_evolution_for_gateway(_load_gateway_config())
 
         if canonical == "task":
             return await self._handle_task_command(event)
@@ -4202,6 +4465,12 @@ class GatewayRunner:
             },
         )
         rendered = render_shared_tasks_block(tasks_payload, preview_formatter=_task_text_preview)
+        try:
+            durable_queue_block = _render_durable_task_queue_block(_load_gateway_config())
+            if durable_queue_block:
+                rendered = f"{rendered}\n\n{durable_queue_block}"
+        except Exception:
+            pass
         try:
             from agent.harness import get_harness_manager
 
@@ -5715,6 +5984,187 @@ class GatewayRunner:
             )
         return f"❌ {result['error']}"
 
+    def _spawn_background_task(
+        self,
+        prompt: str,
+        source: SessionSource,
+        task_id: str,
+        *,
+        queue_config: Optional[dict] = None,
+    ) -> asyncio.Task:
+        agent_holder = [None]
+        task = asyncio.create_task(
+            self._run_background_task(prompt, source, task_id, agent_holder=agent_holder, queue_config=queue_config)
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        def _cancel_runtime_task() -> None:
+            agent = agent_holder[0]
+            if agent is not None:
+                try:
+                    agent.interrupt("Background task cancelled")
+                except Exception:
+                    pass
+            if hasattr(task, "cancel"):
+                task.cancel()
+
+        self._register_managed_runtime_task(
+            task_id=task_id,
+            task=task,
+            cancel=_cancel_runtime_task,
+            kind="background",
+        )
+        return task
+
+    def _spawn_cron_queue_task(self, queued_task: dict, *, queue_config: Optional[dict] = None) -> Optional[asyncio.Task]:
+        task_id = str((queued_task or {}).get("id") or "")
+        if not task_id:
+            return None
+        task = asyncio.create_task(self._run_queued_cron_task(queued_task, queue_config=queue_config))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        def _cancel_runtime_task() -> None:
+            if hasattr(task, "cancel"):
+                task.cancel()
+
+        self._register_managed_runtime_task(
+            task_id=task_id,
+            task=task,
+            cancel=_cancel_runtime_task,
+            kind="cron_queue",
+        )
+        return task
+
+    async def _run_queued_cron_task(self, queued_task: dict, *, queue_config: Optional[dict] = None) -> None:
+        task_id = str((queued_task or {}).get("id") or "")
+        dispatch = queued_task.get("dispatch") if isinstance(queued_task, dict) else None
+        job = dispatch.get("job") if isinstance(dispatch, dict) else None
+        if not task_id or not isinstance(job, dict) or not job.get("id"):
+            try:
+                from gateway.task_queue_bridge import block_cron_queue_task
+
+                block_cron_queue_task(task_id=task_id, reason="invalid cron queue dispatch payload", config=queue_config)
+            except Exception:
+                logger.debug("Failed to block invalid cron queue task %s", task_id, exc_info=True)
+            return
+
+        _start_runtime_task(
+            task_id=task_id,
+            lane="background",
+            label="cron queue task",
+            source="queue",
+            kind="cron_queue",
+            control_mode="managed_runtime",
+            actions=["cancel"],
+        )
+        loop = asyncio.get_event_loop()
+        try:
+            def run_sync():
+                from cron.jobs import mark_job_run
+                from cron.scheduler import SILENT_MARKER, _deliver_result, run_job, save_job_output
+
+                success, output, final_response, error = run_job(job)
+                output_file = save_job_output(job["id"], output)
+                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                should_deliver = bool(deliver_content)
+                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                    should_deliver = False
+                delivery_error = None
+                if should_deliver:
+                    try:
+                        delivery_error = _deliver_result(job, deliver_content, adapters=self.adapters, loop=loop)
+                    except Exception as exc:
+                        delivery_error = str(exc)
+                        logger.error("Delivery failed for queued cron job %s: %s", job["id"], exc)
+                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                return {
+                    "success": success,
+                    "error": error,
+                    "output_file": str(output_file),
+                    "delivery_error": delivery_error,
+                }
+
+            result = await loop.run_in_executor(None, run_sync)
+            try:
+                from gateway.task_queue_bridge import block_cron_queue_task, complete_cron_queue_task
+
+                if result.get("success"):
+                    evidence = f"cron output saved: {result.get('output_file')}"
+                    complete_cron_queue_task(task_id=task_id, evidence=evidence, config=queue_config)
+                else:
+                    reason = str(result.get("error") or "queued cron task failed")[:240]
+                    block_cron_queue_task(task_id=task_id, reason=reason, config=queue_config)
+                await self._dispatch_claimed_background_tasks(queue_config)
+            except Exception:
+                logger.debug("Failed to update queued cron task %s", task_id, exc_info=True)
+        except Exception as exc:
+            logger.exception("Queued cron task %s failed", task_id)
+            try:
+                from gateway.task_queue_bridge import block_cron_queue_task
+
+                block_cron_queue_task(task_id=task_id, reason=str(exc)[:240] or type(exc).__name__, config=queue_config)
+            except Exception:
+                logger.debug("Failed to block queued cron task %s after exception", task_id, exc_info=True)
+        finally:
+            _finish_runtime_task(task_id)
+
+    async def _dispatch_claimed_background_tasks(self, queue_config: Optional[dict]) -> list[str]:
+        if not queue_config:
+            return []
+        try:
+            from gateway.task_queue_bridge import claim_ready_background_tasks, recover_abandoned_background_tasks
+
+            recovered = recover_abandoned_background_tasks(
+                config=queue_config,
+                active_task_ids=self._active_managed_runtime_task_ids(),
+            )
+            if recovered:
+                logger.info("Recovered %d abandoned queued background task(s)", len(recovered))
+            claim = claim_ready_background_tasks(config=queue_config)
+        except Exception:
+            logger.debug("Failed to claim queued background tasks", exc_info=True)
+            return []
+
+        started = ((claim.to_dict().get("task") or {}).get("started") if claim else []) or []
+        dispatched: list[str] = []
+        for task in started:
+            dispatch = task.get("dispatch") if isinstance(task, dict) else None
+            if not isinstance(dispatch, dict):
+                continue
+            source_data = dispatch.get("source")
+            if not isinstance(source_data, dict):
+                continue
+            try:
+                source = SessionSource.from_dict(source_data)
+            except Exception:
+                logger.debug("Queued background task %s has invalid source", task.get("id"), exc_info=True)
+                continue
+            task_id = str(task.get("id") or "")
+            prompt = str(dispatch.get("prompt") or task.get("title") or "").strip()
+            if not task_id or not prompt:
+                continue
+            self._spawn_background_task(prompt, source, task_id, queue_config=queue_config)
+            dispatched.append(task_id)
+
+        try:
+            from gateway.task_queue_bridge import claim_ready_cron_tasks
+
+            cron_claim = claim_ready_cron_tasks(config=queue_config)
+            cron_started = ((cron_claim.to_dict().get("task") or {}).get("started") if cron_claim else []) or []
+        except Exception:
+            logger.debug("Failed to claim queued cron tasks", exc_info=True)
+            cron_started = []
+
+        for task in cron_started:
+            task_id = str((task or {}).get("id") or "")
+            if not task_id:
+                continue
+            self._spawn_cron_queue_task(task, queue_config=queue_config)
+            dispatched.append(task_id)
+        return dispatched
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -5733,37 +6183,57 @@ class GatewayRunner:
 
         source = event.source
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
-        agent_holder = [None]
+        queue_config = None
+        queue_first = False
+        queued_only = False
+        try:
+            queue_config = _load_gateway_config()
+            from gateway.task_queue_bridge import (
+                claim_ready_background_tasks,
+                enqueue_background_task,
+                recover_abandoned_background_tasks,
+                task_queue_enabled,
+            )
+
+            queue_first = task_queue_enabled(queue_config)
+            enqueue_background_task(
+                prompt=prompt,
+                source=source,
+                task_id=task_id,
+                config=queue_config,
+                status="ready" if queue_first else "running",
+            )
+            if queue_first:
+                recovered = recover_abandoned_background_tasks(
+                    config=queue_config,
+                    active_task_ids=self._active_managed_runtime_task_ids(),
+                )
+                if recovered:
+                    logger.info("Recovered %d abandoned queued background task(s)", len(recovered))
+                claim = claim_ready_background_tasks(config=queue_config, max_count=1, task_id=task_id)
+                started = ((claim.to_dict().get("task") or {}).get("started") if claim else []) or []
+                queued_only = task_id not in {str(task.get("id")) for task in started}
+        except Exception:
+            queue_first = False
+            logger.debug("Failed to enqueue/claim background task %s in durable queue", task_id, exc_info=True)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        if queued_only:
+            return f'⏳ Background task queued: "{preview}"\nTask ID: {task_id}\nIt will start when the queue has capacity.'
 
         # Fire-and-forget the background task
-        _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id, agent_holder=agent_holder)
-        )
-        self._background_tasks.add(_task)
-        _task.add_done_callback(self._background_tasks.discard)
-
-        def _cancel_runtime_task() -> None:
-            agent = agent_holder[0]
-            if agent is not None:
-                try:
-                    agent.interrupt("Background task cancelled")
-                except Exception:
-                    pass
-            if hasattr(_task, "cancel"):
-                _task.cancel()
-
-        self._register_managed_runtime_task(
-            task_id=task_id,
-            task=_task,
-            cancel=_cancel_runtime_task,
-            kind="background",
-        )
+        self._spawn_background_task(prompt, source, task_id, queue_config=queue_config)
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str, agent_holder: Optional[list] = None
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        agent_holder: Optional[list] = None,
+        queue_config: Optional[dict] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         adapter = self.adapters.get(source.platform)
@@ -5787,6 +6257,12 @@ class GatewayRunner:
         try:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
+                try:
+                    from gateway.task_queue_bridge import block_background_task
+
+                    block_background_task(task_id=task_id, reason="no provider credentials configured", config=queue_config)
+                except Exception:
+                    logger.debug("Failed to block durable queue task %s after credential failure", task_id, exc_info=True)
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -5898,8 +6374,23 @@ class GatewayRunner:
                     metadata=_thread_metadata,
                 )
 
+            try:
+                from gateway.task_queue_bridge import complete_background_task
+
+                evidence = "background response delivered" if response else "background task completed with no response"
+                complete_background_task(task_id=task_id, evidence=evidence, config=queue_config)
+                await self._dispatch_claimed_background_tasks(queue_config)
+            except Exception:
+                logger.debug("Failed to complete durable queue task %s", task_id, exc_info=True)
+
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            try:
+                from gateway.task_queue_bridge import block_background_task
+
+                block_background_task(task_id=task_id, reason=str(e)[:240] or type(e).__name__, config=queue_config)
+            except Exception:
+                logger.debug("Failed to block durable queue task %s after exception", task_id, exc_info=True)
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -8974,7 +9465,33 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _dispatch_ready_queue_from_ticker(queue_dispatcher=None, loop=None) -> list[str]:
+    """Wake the durable background-task queue from the cron ticker.
+
+    Cron remains the watchdog/ticker; actual work is claimed and executed by the
+    gateway queue dispatcher so ready tasks do not wait for another user event.
+    """
+    if queue_dispatcher is None:
+        return []
+    try:
+        queue_config = _load_gateway_config()
+        result = queue_dispatcher(queue_config)
+        if asyncio.iscoroutine(result):
+            if loop is None:
+                logger.debug("Queue dispatcher returned coroutine but no event loop was provided")
+                return []
+            future = asyncio.run_coroutine_threadsafe(result, loop)
+            timeout = float(os.getenv("HERMES_QUEUE_DISPATCH_TIMEOUT", "5"))
+            result = future.result(timeout=timeout)
+        if isinstance(result, list):
+            return [str(item) for item in result]
+        return []
+    except Exception as exc:
+        logger.debug("Queue dispatcher wakeup failed: %s", exc, exc_info=True)
+        return []
+
+
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, queue_dispatcher=None):
     """
     Background thread that ticks the cron scheduler at a regular interval.
     
@@ -9000,6 +9517,10 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
             cron_tick(verbose=False, adapters=adapters, loop=loop)
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
+
+        dispatched = _dispatch_ready_queue_from_ticker(queue_dispatcher, loop)
+        if dispatched:
+            logger.info("Queue dispatcher started %d task(s): %s", len(dispatched), ", ".join(dispatched[:8]))
 
         tick_count += 1
 
@@ -9213,7 +9734,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={
+            "adapters": runner.adapters,
+            "loop": asyncio.get_running_loop(),
+            "queue_dispatcher": runner._dispatch_claimed_background_tasks,
+        },
         daemon=True,
         name="cron-ticker",
     )

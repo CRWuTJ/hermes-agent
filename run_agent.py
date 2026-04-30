@@ -4223,6 +4223,8 @@ class AIAgent:
         """
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
+        hard_timeout = float(os.getenv("HERMES_API_HARD_TIMEOUT", "0") or 0)
+        hard_timeout_start = time.monotonic()
 
         def _call():
             try:
@@ -4248,7 +4250,23 @@ class AIAgent:
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         while t.is_alive():
-            t.join(timeout=0.3)
+            join_timeout = 0.3
+            if hard_timeout > 0:
+                remaining = hard_timeout - (time.monotonic() - hard_timeout_start)
+                join_timeout = max(0.001, min(join_timeout, remaining))
+            t.join(timeout=join_timeout)
+            if hard_timeout > 0 and t.is_alive() and (time.monotonic() - hard_timeout_start) >= hard_timeout:
+                try:
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="hard_timeout_abort")
+                except Exception:
+                    pass
+                try:
+                    self._replace_primary_openai_client(reason="api_hard_timeout")
+                except Exception:
+                    pass
+                raise TimeoutError(f"API call exceeded hard timeout of {hard_timeout:.2f}s")
             if self._interrupt_requested:
                 # Force-close the in-flight worker-local HTTP connection to stop
                 # token generation without poisoning the shared client used to
@@ -4770,10 +4788,30 @@ class AIAgent:
         else:
             _stream_stale_timeout = _stream_stale_timeout_base
 
+        hard_timeout = float(os.getenv("HERMES_API_HARD_TIMEOUT", "0") or 0)
+        hard_timeout_start = time.monotonic()
+
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         while t.is_alive():
-            t.join(timeout=0.3)
+            join_timeout = 0.3
+            if hard_timeout > 0:
+                remaining = hard_timeout - (time.monotonic() - hard_timeout_start)
+                join_timeout = max(0.001, min(join_timeout, remaining))
+            t.join(timeout=join_timeout)
+
+            if hard_timeout > 0 and t.is_alive() and (time.monotonic() - hard_timeout_start) >= hard_timeout:
+                try:
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="hard_timeout_abort")
+                except Exception:
+                    pass
+                try:
+                    self._replace_primary_openai_client(reason="api_hard_timeout")
+                except Exception:
+                    pass
+                raise TimeoutError(f"Streaming API call exceeded hard timeout of {hard_timeout:.2f}s")
 
             # Detect stale streams: connections kept alive by SSE pings
             # but delivering no real chunks.  Kill the client so the

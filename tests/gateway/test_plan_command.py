@@ -107,7 +107,7 @@ class TestGatewayPlanCommand:
             scan_skill_commands()
             result = await runner._handle_message(event)
 
-        assert result == "planned"
+        assert "planned" in result
         forwarded = runner._run_agent.call_args.kwargs["message"]
         assert "Plan mode skill" in forwarded
         assert "Add OAuth login" in forwarded

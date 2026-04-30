@@ -171,6 +171,16 @@ class TestBackwardCompat:
         assert "web_search" in names
         assert "terminal" in names
 
+    def test_video_generate_is_discovered(self):
+        names = get_all_tool_names()
+        assert "video_generate" in names
+        assert get_toolset_for_tool("video_generate") == "video_gen"
+
+    def test_claude_code_task_is_discovered(self):
+        names = get_all_tool_names()
+        assert "claude_code_task" in names
+        assert get_toolset_for_tool("claude_code_task") == "delegation"
+
     def test_get_toolset_for_tool(self):
         result = get_toolset_for_tool("web_search")
         assert result is not None

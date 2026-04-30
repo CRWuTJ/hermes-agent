@@ -18,6 +18,7 @@ DEFAULT_HARNESS_CONFIG = {
     "enabled": False,
     "db_path": "",
     "default_autonomy_target": "bounded",
+    "extra_write_roots": [],
     "plan": {
         "always_require_for_surfaces": ["cron", "delegate", "background"],
         "max_direct_chars": 280,
@@ -62,6 +63,10 @@ DEFAULT_HARNESS_CONFIG = {
         "capture_tool_results": True,
         "result_preview_chars": 280,
     },
+    "execution_governance": {
+        "enabled": True,
+        "require_knowledge_disposition_for_plan_required": True,
+    },
     "rate_limits": {
         "subscription_retry_seconds": 1800,
         "pause_high_value_models": True,
@@ -93,6 +98,22 @@ _READ_ONLY_TOOLS = {
 _FILE_MUTATION_TOOLS = {"write_file", "patch", "browser_type"}
 _PLAN_ARTIFACT_TOOL_NAMES = {"write_file", "patch"}
 _ALWAYS_ALLOWED_META_TOOLS = {"todo", "memory", "clarify", "session_search", "skill_view", "skills_list"}
+_KNOWLEDGE_DISPOSITION_TOOLS = {"memory", "skill_manage"}
+_KNOWLEDGE_DIR_NAMES = {"00 Inbox", "01 Sources", "02 Wiki", "03 Playbooks", "04 Tasks", "05 Reviews"}
+_KNOWLEDGE_ROOT_FILES = {"SCHEMA.md", "index.md", "log.md"}
+_KNOWLEDGE_DISPOSITION_PHRASES = (
+    "knowledge disposition:",
+    "no durable knowledge",
+    "no reusable knowledge",
+    "知识沉淀：",
+    "知识库沉淀：",
+    "已沉淀",
+    "已写入知识库",
+    "沉淀到知识库",
+    "无需沉淀",
+    "无沉淀价值",
+    "无可复用",
+)
 _TERMINAL_MUTATION_PATTERNS = [
     r"(^|\\s)(rm|mv|cp|chmod|chown|mkdir|touch|tee|sed|perl|python|python3|node|npm|pnpm|yarn|pip|poetry|git\\s+(apply|checkout|switch|restore|commit|merge|rebase)|make|cargo|go|docker|kubectl|systemctl)($|\\s)",
     r">",
@@ -232,6 +253,16 @@ def _normalize_goal(text: str, limit: int = 240) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 1].rstrip() + "…"
+
+
+def _final_response_has_knowledge_disposition(final_response: str) -> bool:
+    normalized = (final_response or "").lower()
+    return any(phrase.lower() in normalized for phrase in _KNOWLEDGE_DISPOSITION_PHRASES)
+
+
+def _looks_like_knowledge_path(path: Path) -> bool:
+    parts = {str(part) for part in path.parts}
+    return bool(parts.intersection(_KNOWLEDGE_DIR_NAMES)) or path.name in _KNOWLEDGE_ROOT_FILES
 
 
 def _workstream_matches(text: str) -> dict[str, int]:
@@ -793,6 +824,27 @@ class HarnessManager:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             return f".hermes/plans/{stamp}-{safe_slug}.md"
 
+    def _admitted_write_scope(self, workspace_root: str) -> list[str]:
+        roots: list[str] = []
+        configured_extra = self.config.get("extra_write_roots") or []
+        if isinstance(configured_extra, (str, os.PathLike)):
+            extra_roots = [configured_extra]
+        elif isinstance(configured_extra, (list, tuple, set)):
+            extra_roots = list(configured_extra)
+        else:
+            extra_roots = []
+
+        for raw_root in [workspace_root, *extra_roots]:
+            if not str(raw_root or "").strip():
+                continue
+            try:
+                root = str(_safe_path(raw_root))
+            except Exception:
+                continue
+            if root not in roots:
+                roots.append(root)
+        return roots
+
     def admit_turn(
         self,
         *,
@@ -814,7 +866,10 @@ class HarnessManager:
         evidence_requirements = ["final_response"]
         if plan_mode == "plan_required":
             acceptance_criteria.insert(0, "Create or update the plan artifact before broad implementation.")
-            evidence_requirements.extend(["plan_artifact", "verification_evidence"])
+            acceptance_criteria.append(
+                "Record knowledge disposition before completion: deposit durable findings or state no durable knowledge."
+            )
+            evidence_requirements.extend(["plan_artifact", "verification_evidence", "knowledge_disposition"])
 
         workstream = classify_workstream(user_request)
         out_of_scope_workstreams = infer_out_of_scope_workstreams(user_request, workstream)
@@ -831,7 +886,7 @@ class HarnessManager:
             workspace_root=workspace_root,
             plan_artifact_path=plan_artifact_path,
             acceptance_criteria=acceptance_criteria,
-            write_scope=[workspace_root] if workspace_root else [],
+            write_scope=self._admitted_write_scope(workspace_root),
             side_effect_budget="bounded_write",
             autonomy_target=self.config.get("default_autonomy_target", "bounded"),
             runtime_budgets={"max_iterations": max_iterations},
@@ -1077,6 +1132,32 @@ class HarnessManager:
         verification_tools = set(self.config.get("acceptance", {}).get("verification_tools", []))
         return tool_name in verification_tools
 
+    def _governance_requires_knowledge_disposition(self, task: dict[str, Any]) -> bool:
+        governance_cfg = self.config.get("execution_governance", {})
+        if not bool(governance_cfg.get("enabled", True)):
+            return False
+        if not bool(governance_cfg.get("require_knowledge_disposition_for_plan_required", True)):
+            return False
+        return task.get("plan_mode") == "plan_required"
+
+    def _is_knowledge_disposition_call(self, task: dict[str, Any], tool_name: str, args: dict[str, Any]) -> bool:
+        if tool_name in _KNOWLEDGE_DISPOSITION_TOOLS:
+            return True
+        if tool_name not in {"write_file", "patch"}:
+            return False
+        candidate_paths = self._resolve_candidate_paths(task, tool_name, args)
+        if not candidate_paths:
+            return False
+        write_roots = self._task_write_roots(task)
+        for candidate in candidate_paths:
+            if not _looks_like_knowledge_path(candidate):
+                continue
+            if not write_roots:
+                return True
+            if any(_is_subpath(candidate, root) for root in write_roots):
+                return True
+        return False
+
     def _is_read_only_tool(self, tool_name: str, args: dict[str, Any]) -> bool:
         if tool_name == "terminal":
             return not _terminal_is_mutating((args or {}).get("command", ""))
@@ -1246,6 +1327,13 @@ class HarnessManager:
                 self.store.transition_state(task_id, "admitted")
         elif task and task.get("state") in {"admitted", "planning"} and self._is_mutating_tool(tool_name, args):
             self.store.transition_state(task_id, "active")
+
+        if task and self._is_knowledge_disposition_call(task, tool_name, args):
+            self.store.append_event(
+                task_id,
+                "evidence.knowledge_disposition",
+                {"tool_name": tool_name, "tool_call_id": tool_call_id, "source": "tool"},
+            )
 
         if task and self._is_verification_tool(tool_name, args):
             self.store.append_event(
@@ -1654,6 +1742,15 @@ class HarnessManager:
         events = self.store.get_events(task_id)
         has_plan_artifact = any(artifact.get("artifact_kind") == "plan_artifact" for artifact in artifacts)
         has_verification_evidence = any(event.get("event_type") == "evidence.verification" for event in events)
+        has_knowledge_disposition = any(event.get("event_type") == "evidence.knowledge_disposition" for event in events)
+        if self._governance_requires_knowledge_disposition(task) and not has_knowledge_disposition:
+            has_knowledge_disposition = _final_response_has_knowledge_disposition(final_response)
+            if has_knowledge_disposition:
+                self.store.append_event(
+                    task_id,
+                    "evidence.knowledge_disposition",
+                    {"source": "final_response", "response_preview": _normalize_goal(final_response, limit=180)},
+                )
         drift_detected = any(event.get("event_type") == "drift.detected" for event in events)
 
         if interrupted:
@@ -1665,6 +1762,8 @@ class HarnessManager:
         elif drift_detected:
             new_state = "needs_replan"
         elif plan_mode == "plan_required" and require_acceptance and not has_verification_evidence:
+            new_state = "needs_replan"
+        elif self._governance_requires_knowledge_disposition(task) and not has_knowledge_disposition:
             new_state = "needs_replan"
         elif plan_mode == "plan_required" and require_acceptance:
             new_state = "needs_acceptance"
@@ -1699,6 +1798,8 @@ class HarnessManager:
                 reason = "drift_detected"
             elif plan_mode == "plan_required" and require_acceptance and not has_verification_evidence:
                 reason = "missing_verification_evidence"
+            elif self._governance_requires_knowledge_disposition(task) and not has_knowledge_disposition:
+                reason = "missing_knowledge_disposition"
             self.store.append_event(
                 task_id,
                 "gate.replan.required",

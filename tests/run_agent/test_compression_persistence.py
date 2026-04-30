@@ -49,8 +49,8 @@ class TestFlushAfterCompression:
     def test_flush_after_compression_with_long_history(self):
         """The actual bug: conversation_history longer than compressed messages.
 
-        Before the fix, flush_from = max(len(conversation_history), 0) = 200,
-        but messages only has ~30 entries, so messages[200:] is empty.
+        Before the fix, flush_from = max(len(conversation_history), 0) = 50,
+        but messages only has ~30 entries, so messages[50:] is empty.
         After the fix, conversation_history is cleared to None after compression,
         so flush_from = max(0, 0) = 0, and ALL compressed messages are written.
         """
@@ -62,17 +62,19 @@ class TestFlushAfterCompression:
 
             agent = self._make_agent(db)
 
-            # Simulate the original long history (200 messages)
+            # Simulate the original long history.  Keep the count large enough
+            # to reproduce stale-history skipping but small enough not to trip
+            # the suite-wide per-test SIGALRM on slower full-suite xdist runs.
             original_history = [
                 {"role": "user" if i % 2 == 0 else "assistant",
                  "content": f"message {i}"}
-                for i in range(200)
+                for i in range(50)
             ]
 
             # First, flush original messages to the original session
             agent._flush_messages_to_session_db(original_history, [])
             original_rows = db.get_messages("original-session")
-            assert len(original_rows) == 200
+            assert len(original_rows) == 50
 
             # Now simulate compression: new session, reset idx, shorter messages
             agent.session_id = "compressed-session"

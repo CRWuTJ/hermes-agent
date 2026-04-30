@@ -204,6 +204,37 @@ class TestTelegramBotCommands:
             assert isinstance(name, str)
             assert isinstance(desc, str)
 
+    def test_clamps_long_sanitized_core_command_names(self, monkeypatch):
+        """Telegram rejects command names longer than 32 characters.
+
+        Built-in and plugin commands both flow through COMMAND_REGISTRY, so the
+        core command list must enforce the same length limit as skills before
+        TelegramAdapter calls set_my_commands().
+        """
+        import hermes_cli.commands as command_mod
+
+        long_a = "telegram-control-surface-command-name-a"
+        long_b = "telegram-control-surface-command-name-b"
+        monkeypatch.setattr(
+            command_mod,
+            "COMMAND_REGISTRY",
+            [
+                *command_mod.COMMAND_REGISTRY,
+                CommandDef(long_a, "Long Telegram command A", "Info"),
+                CommandDef(long_b, "Long Telegram command B", "Info"),
+            ],
+        )
+
+        names = [
+            name
+            for name, _desc in command_mod.telegram_bot_commands()
+            if name.startswith("telegram_control_surface_comman")
+        ]
+
+        assert len(names) == 2
+        assert all(len(name) <= command_mod._CMD_NAME_LIMIT for name in names)
+        assert len(set(names)) == 2
+
     def test_no_hyphens_in_command_names(self):
         """Telegram does not support hyphens in command names."""
         for name, _ in telegram_bot_commands():

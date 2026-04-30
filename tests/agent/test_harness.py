@@ -145,7 +145,7 @@ def test_finalize_turn_moves_to_acceptance_after_plan_and_verification(tmp_path)
 
     final_state = manager.finalize_turn(
         task_id="task-4",
-        final_response="done",
+        final_response="done\nKnowledge disposition: no durable knowledge to deposit.",
         completed=True,
         interrupted=False,
         api_calls=4,
@@ -160,6 +160,100 @@ def test_finalize_turn_moves_to_acceptance_after_plan_and_verification(tmp_path)
     assert any(event["event_type"] == "tool.started" for event in events)
     assert any(event["event_type"] == "tool.completed" for event in events)
     assert any(event["event_type"] == "gate.acceptance.required" for event in events)
+
+
+def test_finalize_turn_requires_knowledge_disposition_for_plan_required_tasks(tmp_path):
+    manager = HarnessManager(_config(tmp_path))
+    contract = _admit_plan_required_task(manager, task_id="task-knowledge-disposition")
+
+    manager.record_tool_complete(
+        task_id="task-knowledge-disposition",
+        tool_name="write_file",
+        args={"path": contract.plan_artifact_path, "content": "# plan"},
+        result='{"ok": true}',
+        session_id="session-task-knowledge-disposition",
+        tool_call_id="call-plan",
+    )
+    manager.record_tool_complete(
+        task_id="task-knowledge-disposition",
+        tool_name="read_file",
+        args={"path": contract.plan_artifact_path},
+        result="# plan",
+        session_id="session-task-knowledge-disposition",
+        tool_call_id="call-read",
+    )
+
+    final_state = manager.finalize_turn(
+        task_id="task-knowledge-disposition",
+        final_response="done",
+        completed=True,
+        interrupted=False,
+        api_calls=4,
+        message_count=6,
+    )
+    events = manager.store.get_events("task-knowledge-disposition")
+
+    assert final_state == "needs_replan"
+    assert any(
+        event["event_type"] == "gate.replan.required"
+        and event["payload"].get("reason") == "missing_knowledge_disposition"
+        for event in events
+    )
+
+
+def test_vault_write_satisfies_knowledge_disposition_gate(tmp_path):
+    config = _config(tmp_path)
+    repo = tmp_path / "repo"
+    vault = tmp_path / "vault"
+    config["harness"]["extra_write_roots"] = [str(vault)]
+    manager = HarnessManager(config)
+    contract = manager.admit_turn(
+        task_id="task-vault-disposition",
+        session_id="session-task-vault-disposition",
+        surface="cron",
+        platform="cron",
+        user_request="Retrofit Hermes knowledge workflow",
+        workspace_root=str(repo),
+        max_iterations=40,
+    )
+
+    manager.record_tool_complete(
+        task_id="task-vault-disposition",
+        tool_name="write_file",
+        args={"path": contract.plan_artifact_path, "content": "# plan"},
+        result='{"ok": true}',
+        session_id="session-task-vault-disposition",
+        tool_call_id="call-plan",
+    )
+    manager.record_tool_complete(
+        task_id="task-vault-disposition",
+        tool_name="write_file",
+        args={"path": str(vault / "02 Wiki" / "Workflow Gate.md"), "content": "# Workflow Gate"},
+        result='{"ok": true}',
+        session_id="session-task-vault-disposition",
+        tool_call_id="call-vault",
+    )
+    manager.record_tool_complete(
+        task_id="task-vault-disposition",
+        tool_name="read_file",
+        args={"path": str(vault / "02 Wiki" / "Workflow Gate.md")},
+        result="# Workflow Gate",
+        session_id="session-task-vault-disposition",
+        tool_call_id="call-read",
+    )
+
+    final_state = manager.finalize_turn(
+        task_id="task-vault-disposition",
+        final_response="done",
+        completed=True,
+        interrupted=False,
+        api_calls=5,
+        message_count=7,
+    )
+    events = manager.store.get_events("task-vault-disposition")
+
+    assert final_state == "needs_acceptance"
+    assert any(event["event_type"] == "evidence.knowledge_disposition" for event in events)
 
 
 def test_repeated_scope_violations_trigger_drift_and_needs_replan(tmp_path):
@@ -196,6 +290,67 @@ def test_repeated_scope_violations_trigger_drift_and_needs_replan(tmp_path):
     assert second["allowed"] is False
     assert row["state"] == "needs_replan"
     assert any(event["event_type"] == "drift.detected" for event in events)
+
+
+def test_extra_write_roots_are_admitted_without_widening_to_unrelated_paths(tmp_path):
+    config = _config(tmp_path)
+    repo = tmp_path / "repo"
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    config["harness"]["extra_write_roots"] = [str(vault)]
+    manager = HarnessManager(config)
+
+    manager.admit_turn(
+        task_id="task-extra-root",
+        session_id="session-extra-root",
+        surface="cli",
+        platform="cli",
+        user_request="write vault note",
+        workspace_root=str(repo),
+        max_iterations=10,
+    )
+
+    row = manager.store.get_task("task-extra-root")
+    allowed = manager.preflight_tool_call(
+        task_id="task-extra-root",
+        tool_name="write_file",
+        args={"path": str(vault / "03 Playbooks" / "note.md"), "content": "# note"},
+        session_id="session-extra-root",
+        tool_call_id="call-vault",
+    )
+    blocked = manager.preflight_tool_call(
+        task_id="task-extra-root",
+        tool_name="write_file",
+        args={"path": str(outside / "rogue.md"), "content": "x"},
+        session_id="session-extra-root",
+        tool_call_id="call-outside",
+    )
+
+    assert str(repo.resolve()) in row["write_scope"]
+    assert str(vault.resolve()) in row["write_scope"]
+    assert allowed["allowed"] is True
+    assert blocked["allowed"] is False
+
+
+def test_extra_write_roots_accepts_single_string_without_iterating_characters(tmp_path):
+    config = _config(tmp_path)
+    repo = tmp_path / "repo"
+    vault = tmp_path / "vault"
+    config["harness"]["extra_write_roots"] = str(vault)
+    manager = HarnessManager(config)
+
+    manager.admit_turn(
+        task_id="task-extra-root-string",
+        session_id="session-extra-root-string",
+        surface="cli",
+        platform="cli",
+        user_request="write vault note",
+        workspace_root=str(repo),
+        max_iterations=10,
+    )
+
+    row = manager.store.get_task("task-extra-root-string")
+    assert row["write_scope"] == [str(repo.resolve()), str(vault.resolve())]
 
 
 def test_process_events_are_recorded_for_harnessed_tasks(tmp_path):

@@ -38,6 +38,28 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    # HarnessManager is a process-global singleton. Reset it after HERMES_HOME
+    # changes so one test's enabled harness/config/database cannot leak into
+    # API/status payload tests running later in the same xdist worker.
+    harness_mod = sys.modules.get("agent.harness")
+    if harness_mod is not None and hasattr(harness_mod, "reset_harness_manager"):
+        harness_mod.reset_harness_manager()
+    # Some tests import cli.py and mutate its process-global runtime config.
+    # xdist workers reuse the process across tests, so reload it after switching
+    # HERMES_HOME.  Use the current test home instead of an empty dict so tests
+    # that instantiate HermesCLI still receive the normal default sections.
+    cli_mod = sys.modules.get("cli")
+    if cli_mod is not None and hasattr(cli_mod, "CLI_CONFIG"):
+        if hasattr(cli_mod, "_hermes_home"):
+            monkeypatch.setattr(cli_mod, "_hermes_home", fake_home, raising=False)
+        if hasattr(cli_mod, "load_cli_config"):
+            monkeypatch.setattr(cli_mod, "CLI_CONFIG", cli_mod.load_cli_config(), raising=False)
+        else:
+            monkeypatch.setattr(cli_mod, "CLI_CONFIG", {}, raising=False)
 
 
 @pytest.fixture()

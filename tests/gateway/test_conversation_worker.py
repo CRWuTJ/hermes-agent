@@ -952,6 +952,47 @@ def test_handle_recovers_result_from_artifact_when_stdout_result_missing(tmp_pat
     assert result["terminal_state"] == "completed"
 
 
+def test_handle_recovers_result_artifact_after_stdout_reader_crashes(tmp_path):
+    runtime_dir = tmp_path / "gwconv" / "run-bad-stdout"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "result.json").write_text(json.dumps({
+        "final_response": "artifact survived bad stdout",
+        "messages": [],
+        "api_calls": 3,
+        "tools": ["terminal"],
+        "terminal_state": "completed",
+    }), encoding="utf-8")
+
+    class _BrokenStdout:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    class _Proc:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = _BrokenStdout()
+            self.stderr = io.StringIO("")
+
+        def poll(self):
+            return None
+
+    handle = worker_runtime.GatewayConversationWorkerHandle(
+        proc=_Proc(),
+        unit_name="hermes-gwconv-test",
+        runtime_dir=runtime_dir,
+        worker_run_id="run-bad-stdout",
+    )
+
+    result = handle.wait_for_result_blocking()
+
+    assert result["final_response"] == "artifact survived bad stdout"
+    assert result["failed"] is False
+    assert result["terminal_state"] == "completed"
+
+
 def test_handle_recovers_error_from_artifact_when_stdout_result_missing(tmp_path):
     runtime_dir = tmp_path / "gwconv" / "run-err"
     runtime_dir.mkdir(parents=True)

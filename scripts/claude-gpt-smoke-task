@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ $# -gt 0 ]]; then
+  ROOT="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1")"
+  case "$ROOT" in
+    /tmp/claude-gpt-smoke-*) ;;
+    *)
+      echo "refusing unsafe smoke root: $ROOT" >&2
+      exit 2
+      ;;
+  esac
+  rm -rf "$ROOT"
+  mkdir -p "$ROOT"
+else
+  ROOT="$(mktemp -d "${TMPDIR:-/tmp}/claude-gpt-smoke-XXXXXX")"
+fi
+cd "$ROOT"
+
+cat > calculator.py <<'PY'
+def add(a, b):
+    return a - b
+PY
+
+cat > test_calculator.py <<'PY'
+from calculator import add
+
+
+def test_add_positive_numbers():
+    assert add(2, 3) == 5
+
+
+def test_add_negative_numbers():
+    assert add(-2, -3) == -5
+PY
+
+cat > task.md <<'MD'
+Fix calculator.py so the tests pass. Do not create new files. After editing, run python3 -m pytest -q. Reply with exactly CLAUDE_GPT_CODING_OK if the test run passes.
+MD
+
+set +e
+"$SCRIPT_DIR/claude-gpt" \
+  -p "Read task.md and complete it." \
+  --model "${CLAUDE_GPT_MODEL:-gpt-5.5}" \
+  --output-format json \
+  --max-turns 6 \
+  --no-session-persistence \
+  --allowedTools "Read,Edit,Bash(python3 -m pytest *)"
+status=$?
+set -e
+# Claude Code can return a non-zero process exit even when the JSON payload says success.
+# Callers must parse is_error/result instead of relying only on the process status.
+exit "$status"

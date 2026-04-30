@@ -1172,23 +1172,42 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
 
     if configured_base_url:
+        runtime = None
+        if configured_provider and not configured_api_key:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = resolve_runtime_provider(
+                    requested=configured_provider,
+                    explicit_base_url=configured_base_url,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"Delegation base_url is configured with provider '{configured_provider}', "
+                    f"but provider credentials could not be resolved: {exc}. "
+                    "Set delegation.api_key, fix the provider auth, or remove delegation.base_url."
+                ) from exc
+
         api_key = (
             configured_api_key
+            or str((runtime or {}).get("api_key") or "").strip()
             or os.getenv("OPENAI_API_KEY", "").strip()
         )
         if not api_key:
             raise ValueError(
                 "Delegation base_url is configured but no API key was found. "
-                "Set delegation.api_key or OPENAI_API_KEY."
+                "Set delegation.api_key, configure delegation.provider with credentials, or set OPENAI_API_KEY."
             )
 
         base_lower = configured_base_url.lower()
-        provider = "custom"
-        api_mode = "chat_completions"
+        provider = str((runtime or {}).get("provider") or "").strip() or "custom"
+        api_mode = str((runtime or {}).get("api_mode") or "").strip() or "chat_completions"
         provider_lower = (configured_provider or "").lower()
         if "chatgpt.com/backend-api/codex" in base_lower or "codex" in provider_lower:
-            provider = configured_provider or "openai-codex"
-            api_mode = "codex_responses"
+            provider = configured_provider or provider or "openai-codex"
+            api_mode = api_mode or "codex_responses"
+            if api_mode == "chat_completions":
+                api_mode = "codex_responses"
         elif "api.anthropic.com" in base_lower:
             provider = "anthropic"
             api_mode = "anthropic_messages"

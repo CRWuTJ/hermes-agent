@@ -186,6 +186,8 @@ def popen_transient_unit(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     return proc, unit_name

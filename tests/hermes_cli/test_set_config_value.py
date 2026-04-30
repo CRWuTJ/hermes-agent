@@ -127,6 +127,12 @@ class TestConfigYamlRouting:
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
 
+    def test_yaml_list_value_goes_to_config_as_list(self, _isolated_hermes_home):
+        set_config_value("harness.extra_write_roots", "['/mnt/e/hermes']")
+        config = _read_config(_isolated_hermes_home)
+        assert "extra_write_roots:" in config
+        assert "- /mnt/e/hermes" in config
+
 
 # ---------------------------------------------------------------------------
 # Empty / falsy values — regression tests for #4277

@@ -114,6 +114,8 @@ class TestDetachedRuntime(unittest.TestCase):
         self.assertEqual(mock_popen.call_args.kwargs['stdout'], subprocess.PIPE)
         self.assertEqual(mock_popen.call_args.kwargs['stderr'], subprocess.PIPE)
         self.assertEqual(mock_popen.call_args.kwargs['text'], True)
+        self.assertEqual(mock_popen.call_args.kwargs['encoding'], 'utf-8')
+        self.assertEqual(mock_popen.call_args.kwargs['errors'], 'replace')
         self.assertEqual(mock_popen.call_args.kwargs['bufsize'], 1)
 
     def test_wait_for_main_pid_polls_until_pid(self):

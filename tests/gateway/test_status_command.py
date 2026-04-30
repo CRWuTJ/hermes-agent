@@ -9,6 +9,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageTaskEnvelope
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from agent.task_queue import TaskQueueLedger
 
 
 def _make_source() -> SessionSource:
@@ -513,6 +514,7 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
     )
 
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(
         "agent.model_metadata.get_model_context_length",
         lambda *_args, **_kwargs: 100000,
@@ -597,6 +599,37 @@ async def test_tasks_command_reports_session_queue_and_live_runtime_tasks():
     assert "**Active runtime tasks:** 1" in result
     assert "`bg-1` · cron/scout · background task · source=gateway" in result
     assert "↳ /task bg-1 · /task bg-1 cancel" in result
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_appends_durable_queue_summary(tmp_path):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].pending_tasks_snapshot.return_value = []
+    backlog = tmp_path / "backlog.jsonl"
+    ledger = TaskQueueLedger(backlog)
+    ledger.enqueue(title="Queued", task_id="queued", lane="research", acceptance_check=["done"], artifact_targets=["a"])
+    ledger.enqueue(title="Running", task_id="running", lane="implementation", status="running", acceptance_check=["done"], artifact_targets=["b"])
+    ledger.enqueue(title="Blocked", task_id="blocked", lane="knowledge", status="blocked", blocked_by=["scope"], acceptance_check=["done"], artifact_targets=["c"])
+
+    with patch("gateway.run._load_gateway_config", return_value={"task_queue": {"enabled": True, "path": str(backlog)}}), \
+         patch("gateway.run.task_lane_registry.status_snapshot", return_value={"active_count": 0, "lane_counts": {}, "tasks": []}):
+        result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Durable task queue:**" in result
+    assert "ready=1" in result
+    assert "running=1" in result
+    assert "blocked=1" in result
+    assert "dispatchable=1" in result
+    assert "next=queued" in result
 
 
 @pytest.mark.asyncio

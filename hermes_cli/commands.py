@@ -77,6 +77,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("tasks", "List queued and active gateway tasks", "Session",
                gateway_only=True),
+    CommandDef("selfevolve", "Run a read-only Hermes self-evolution review", "Session",
+               gateway_only=True, aliases=("self-evolve", "globalreview", "global-review")),
     CommandDef(
         "task",
         "Show details for one queued or active gateway task",
@@ -372,7 +374,8 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
 
     Telegram command names cannot contain hyphens, so they are replaced with
     underscores.  Aliases are skipped -- Telegram shows one menu entry per
-    canonical command.
+    canonical command.  Names are also clamped to Telegram's 32-character
+    command limit, including plugin commands registered in COMMAND_REGISTRY.
     """
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
@@ -382,7 +385,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         tg_name = _sanitize_telegram_name(cmd.name)
         if tg_name:
             result.append((tg_name, cmd.description))
-    return result
+    return _clamp_command_names(result, reserved=set())
 
 
 _CMD_NAME_LIMIT = 32

@@ -28,15 +28,20 @@ Usage:
     )
 """
 
+import base64
 import json
 import logging
 import os
 import datetime
 import threading
 import uuid
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import Dict, Any, Optional, Union
 from urllib.parse import urlencode
 import fal_client
+from hermes_constants import get_hermes_home
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import managed_nous_tools_enabled
@@ -81,10 +86,117 @@ VALID_IMAGE_SIZES = [
 VALID_OUTPUT_FORMATS = ["jpeg", "png"]
 VALID_ACCELERATION_MODES = ["none", "regular", "high"]
 
+OPENAI_IMAGE_SIZE_MAP = {
+    "landscape": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+}
+DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
+DEFAULT_OPENAI_IMAGE_TIMEOUT = 240
+
 _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
 _managed_fal_client = None
 _managed_fal_client_config = None
 _managed_fal_client_lock = threading.Lock()
+
+
+def _openai_image_config() -> Optional[Dict[str, Any]]:
+    """Return OpenAI-compatible image backend config from environment."""
+    base_url = os.getenv("IMAGE_OPENAI_BASE_URL", "").strip().rstrip("/")
+    api_key = os.getenv("IMAGE_OPENAI_API_KEY", "").strip()
+    model = os.getenv("IMAGE_OPENAI_MODEL", DEFAULT_OPENAI_IMAGE_MODEL).strip() or DEFAULT_OPENAI_IMAGE_MODEL
+    if not base_url or not api_key:
+        return None
+    try:
+        timeout = int(os.getenv("IMAGE_OPENAI_TIMEOUT", str(DEFAULT_OPENAI_IMAGE_TIMEOUT)))
+    except ValueError:
+        timeout = DEFAULT_OPENAI_IMAGE_TIMEOUT
+    return {"base_url": base_url, "api_key": api_key, "model": model, "timeout": timeout}
+
+
+def _has_openai_image_backend() -> bool:
+    return _openai_image_config() is not None
+
+
+def _openai_image_size(aspect_ratio: str) -> str:
+    aspect = aspect_ratio.lower().strip() if aspect_ratio else DEFAULT_ASPECT_RATIO
+    return OPENAI_IMAGE_SIZE_MAP.get(aspect, OPENAI_IMAGE_SIZE_MAP[DEFAULT_ASPECT_RATIO])
+
+
+def _save_openai_b64_image(image_b64: str, *, output_format: str = DEFAULT_OUTPUT_FORMAT) -> str:
+    image_bytes = base64.b64decode(image_b64)
+    ext = ".jpg" if output_format == "jpeg" else ".png"
+    out_dir = get_hermes_home() / "generated-images"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"image_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    out_path.write_bytes(image_bytes)
+    return str(out_path)
+
+
+def _generate_openai_image(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    num_images: int,
+    output_format: str,
+) -> Dict[str, Any]:
+    """Generate an image through an OpenAI-compatible /images/generations backend."""
+    cfg = _openai_image_config()
+    if not cfg:
+        raise ValueError("IMAGE_OPENAI_BASE_URL and IMAGE_OPENAI_API_KEY are required for OpenAI image backend")
+
+    payload = {
+        "model": cfg["model"],
+        "prompt": prompt.strip(),
+        "size": _openai_image_size(aspect_ratio),
+        "n": num_images,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{cfg['base_url']}/images/generations",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg['api_key']}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=cfg["timeout"]) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+        raise ValueError(f"OpenAI image backend HTTP {exc.code}: {body[:500]}") from exc
+
+    parsed = json.loads(raw or "{}")
+    images = parsed.get("data") or []
+    if not images:
+        raise ValueError("OpenAI image backend returned no images")
+    first = images[0] if isinstance(images[0], dict) else {}
+    revised_prompt = first.get("revised_prompt")
+    image_b64 = first.get("b64_json")
+    image_url = first.get("url")
+
+    result = {
+        "success": True,
+        "provider": "openai",
+        "model": cfg["model"],
+        "image": None,
+        "media_path": None,
+    }
+    if revised_prompt:
+        result["revised_prompt"] = revised_prompt
+    if image_b64:
+        path = _save_openai_b64_image(image_b64, output_format=output_format)
+        result["image"] = path
+        result["media_path"] = path
+    elif image_url:
+        result["image"] = image_url
+        result["image_url"] = image_url
+    else:
+        raise ValueError("OpenAI image backend returned neither b64_json nor url")
+    return result
 
 
 def _resolve_managed_fal_gateway():
@@ -409,11 +521,27 @@ def image_generate_tool(
     start_time = datetime.datetime.now()
     
     try:
-        logger.info("Generating %s image(s) with FLUX 2 Pro: %s", num_images, prompt[:80])
+        logger.info("Generating %s image(s): %s", num_images, prompt[:80])
         
         # Validate prompt
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
+
+        if _has_openai_image_backend():
+            response_data = _generate_openai_image(
+                prompt=prompt,
+                aspect_ratio=aspect_ratio_lower,
+                num_images=num_images,
+                output_format=output_format,
+            )
+            generation_time = (datetime.datetime.now() - start_time).total_seconds()
+            debug_call_data["success"] = True
+            debug_call_data["images_generated"] = 1
+            debug_call_data["generation_time"] = generation_time
+            debug_call_data["provider"] = "openai"
+            _debug.log_call("image_generate_tool", debug_call_data)
+            _debug.save()
+            return json.dumps(response_data, indent=2, ensure_ascii=False)
         
         # Check API key availability
         if not (os.getenv("FAL_KEY") or _resolve_managed_fal_gateway()):
@@ -552,6 +680,9 @@ def check_image_generation_requirements() -> bool:
         bool: True if requirements are met, False otherwise
     """
     try:
+        if _has_openai_image_backend():
+            return True
+
         # Check API key
         if not check_fal_api_key():
             return False

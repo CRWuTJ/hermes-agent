@@ -763,6 +763,34 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "env-openai-key")
         self.assertEqual(creds["provider"], "custom")
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_direct_endpoint_with_provider_uses_provider_credentials_when_api_key_empty(self, mock_resolve):
+        parent = _make_mock_parent(depth=0)
+        mock_resolve.return_value = {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "provider-key",
+            "api_mode": "codex_responses",
+        }
+        cfg = {
+            "model": "gpt-5.5",
+            "provider": "gpt-mainline-codex-local",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "",
+        }
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["provider"], "gpt-mainline-codex-local")
+        self.assertEqual(creds["base_url"], "http://127.0.0.1:8317/v1")
+        self.assertEqual(creds["api_key"], "provider-key")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        mock_resolve.assert_called_once_with(
+            requested="gpt-mainline-codex-local",
+            explicit_base_url="http://127.0.0.1:8317/v1",
+        )
+
     def test_direct_endpoint_does_not_fall_back_to_openrouter_api_key_env(self):
         parent = _make_mock_parent(depth=0)
         cfg = {
