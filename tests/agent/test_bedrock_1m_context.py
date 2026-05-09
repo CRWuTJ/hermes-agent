@@ -15,23 +15,26 @@ from unittest.mock import MagicMock, patch
 class TestBedrockContext1MBeta:
     """``context-1m-2025-08-07`` must reach Bedrock Claude requests."""
 
-    def test_common_betas_includes_1m(self):
+    def test_common_betas_excludes_1m_for_native_safety(self):
         from agent.anthropic_adapter import _COMMON_BETAS, _CONTEXT_1M_BETA
 
         assert _CONTEXT_1M_BETA == "context-1m-2025-08-07"
-        assert _CONTEXT_1M_BETA in _COMMON_BETAS
+        assert _CONTEXT_1M_BETA not in _COMMON_BETAS
 
-    def test_common_betas_for_native_anthropic_includes_1m(self):
-        """Native Anthropic endpoints (and Bedrock with empty base_url) get 1M."""
+    def test_common_betas_for_native_anthropic_exclude_1m(self):
+        """Native Anthropic endpoints do not get 1M unless explicitly gated."""
         from agent.anthropic_adapter import (
             _common_betas_for_base_url,
             _CONTEXT_1M_BETA,
         )
 
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(None)
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url("")
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url(None)
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url("")
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url(
             "https://api.anthropic.com"
+        )
+        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(
+            "https://example.openai.azure.com/anthropic"
         )
 
     def test_common_betas_strips_1m_for_minimax(self):
@@ -88,7 +91,7 @@ class TestBedrockContext1MBeta:
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-7",
+            model="anthropic.claude-opus-4-6",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
             max_tokens=1024,

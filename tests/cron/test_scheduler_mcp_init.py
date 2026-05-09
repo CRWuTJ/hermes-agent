@@ -20,6 +20,15 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 
+def _fake_runtime_provider(**_kwargs):
+    return {
+        "provider": "openai",
+        "api_key": "test-api-key",
+        "base_url": "https://api.openai.com/v1",
+        "api_mode": None,
+    }
+
+
 def test_run_job_calls_discover_mcp_tools_before_agent_construction():
     """The LLM-path branch of run_job must call discover_mcp_tools() before
     the AIAgent construction, so MCP tools are in the registry by the time
@@ -54,6 +63,7 @@ def test_run_job_calls_discover_mcp_tools_before_agent_construction():
 
     with patch("tools.mcp_tool.discover_mcp_tools", side_effect=fake_discover), \
          patch("run_agent.AIAgent", _FakeAgent), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_fake_runtime_provider), \
          patch("cron.scheduler._resolve_cron_enabled_toolsets", return_value=None):
         scheduler.run_job(job)
 
@@ -100,6 +110,7 @@ def test_run_job_tolerates_discover_mcp_tools_failure():
         "tools.mcp_tool.discover_mcp_tools",
         side_effect=fake_discover_that_raises,
     ), patch("run_agent.AIAgent", _FakeAgent), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_fake_runtime_provider), \
          patch("cron.scheduler._resolve_cron_enabled_toolsets", return_value=None):
         # Should NOT raise
         success, doc, final_response, error = scheduler.run_job(job)

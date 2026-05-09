@@ -9845,7 +9845,11 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                guardrails = getattr(self, "_tool_guardrails", None)
+                if guardrails is None:
+                    guardrails = ToolCallGuardrailController()
+                    self._tool_guardrails = guardrails
+                guardrail_decision = guardrails.before_call(function_name, function_args)
                 if not guardrail_decision.allows_execution:
                     block_result = self._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True

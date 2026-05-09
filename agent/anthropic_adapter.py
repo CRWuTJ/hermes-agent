@@ -1963,11 +1963,16 @@ def build_anthropic_kwargs(
             base_url,
             drop_context_1m_beta=drop_context_1m_beta,
         ))
+        if (
+            _is_bedrock_model_id(model)
+            and not drop_context_1m_beta
+            and _CONTEXT_1M_BETA not in betas
+        ):
+            betas.append(_CONTEXT_1M_BETA)
         if is_oauth:
             betas.extend(_OAUTH_ONLY_BETAS)
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
 

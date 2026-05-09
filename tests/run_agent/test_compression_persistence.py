@@ -63,6 +63,7 @@ class TestFlushAfterCompression:
             db = SessionDB(db_path=db_path)
 
             agent = self._make_agent(db)
+            agent._last_flushed_db_idx = 0
 
             # Simulate the original long history (200 messages)
             original_history = [
@@ -72,7 +73,8 @@ class TestFlushAfterCompression:
             ]
 
             # First, flush original messages to the original session
-            agent._flush_messages_to_session_db(original_history, [])
+            db.create_session(session_id="original-session", source="test")
+            db.replace_messages("original-session", original_history)
             original_rows = db.get_messages("original-session")
             assert len(original_rows) == 200
 
