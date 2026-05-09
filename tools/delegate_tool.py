@@ -130,6 +130,87 @@ MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected u
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
 _MAX_SPAWN_DEPTH_CAP = 3
+PLACEHOLDER_API_KEYS = frozenset({"", "no-key-required"})
+
+
+def _canonical_base_url(base_url: Any) -> str:
+    return str(base_url or "").strip().rstrip("/")
+
+
+def _is_local_adapter_url(base_url: str) -> bool:
+    lowered = str(base_url or "").lower()
+    return (
+        lowered.startswith("http://127.0.0.1:")
+        or lowered.startswith("http://localhost:")
+        or lowered.startswith("http://[::1]:")
+    )
+
+
+def _is_placeholder_api_key(api_key: Any) -> bool:
+    return str(api_key or "").strip().lower() in PLACEHOLDER_API_KEYS
+
+
+def _extract_parent_api_key(parent_agent) -> str:
+    parent_api_key = str(getattr(parent_agent, "api_key", None) or "").strip()
+    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
+        parent_api_key = str(parent_agent._client_kwargs.get("api_key") or "").strip()
+    return parent_api_key
+
+
+def _delegation_requires_real_api_key(creds: Dict[str, Any], configured_provider: Optional[str] = None) -> bool:
+    api_mode = str(creds.get("api_mode") or "").strip().lower()
+    provider = str(configured_provider or creds.get("provider") or "").strip().lower()
+    base_url = str(creds.get("base_url") or "").strip().lower()
+    return (
+        api_mode == "codex_responses"
+        or "codex" in provider
+        or "chatgpt.com/backend-api/codex" in base_url
+    )
+
+
+def _parent_runtime_matches_credentials(creds: Dict[str, Any], parent_agent) -> bool:
+    if parent_agent is None:
+        return False
+    target_base_url = _canonical_base_url(creds.get("base_url"))
+    parent_base_url = _canonical_base_url(getattr(parent_agent, "base_url", None))
+    if not target_base_url or not parent_base_url or target_base_url != parent_base_url:
+        return False
+
+    target_api_mode = str(creds.get("api_mode") or "").strip()
+    parent_api_mode = str(getattr(parent_agent, "api_mode", "") or "").strip()
+    if target_api_mode and parent_api_mode and target_api_mode != parent_api_mode:
+        return False
+    return True
+
+
+def _resolve_usable_delegation_api_key(
+    creds: Dict[str, Any],
+    configured_provider: Optional[str],
+    parent_agent,
+) -> str:
+    api_key = str(creds.get("api_key") or "").strip()
+    if not _is_placeholder_api_key(api_key):
+        return api_key
+
+    if _delegation_requires_real_api_key(creds, configured_provider):
+        parent_api_key = _extract_parent_api_key(parent_agent)
+        if (
+            parent_api_key
+            and not _is_placeholder_api_key(parent_api_key)
+            and _parent_runtime_matches_credentials(creds, parent_agent)
+        ):
+            return parent_api_key
+        provider_label = configured_provider or creds.get("provider") or "delegation"
+        raise ValueError(
+            f"Delegation provider '{provider_label}' resolved but has no usable API key. "
+            "Set delegation.api_key, fix the named provider credentials, or disable child_api_keys if the endpoint cannot mint child keys."
+        )
+
+    provider = str(creds.get("provider") or "").strip().lower()
+    base_url = str(creds.get("base_url") or "").strip()
+    if provider == "custom" or _is_local_adapter_url(base_url):
+        return api_key or "no-key-required"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -972,9 +1053,7 @@ def _build_child_agent(
         child_depth=child_depth,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
-    parent_api_key = getattr(parent_agent, "api_key", None)
-    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
-        parent_api_key = parent_agent._client_kwargs.get("api_key")
+    parent_api_key = _extract_parent_api_key(parent_agent)
 
     # Resolve the child's effective model early so it can ride on every event.
     effective_model_for_cb = model or getattr(parent_agent, "model", None)
@@ -1946,6 +2025,13 @@ def delegate_task(
     # children inherit from the parent.
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = dict(creds)
+        if creds.get("provider") or creds.get("base_url") or creds.get("api_mode") or creds.get("api_key"):
+            creds["api_key"] = _resolve_usable_delegation_api_key(
+                creds,
+                str(cfg.get("provider") or "").strip() or None,
+                parent_agent,
+            )
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2366,22 +2452,26 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
         ) from exc
 
-    api_key = runtime.get("api_key", "")
-    if not api_key:
-        raise ValueError(
-            f"Delegation provider '{configured_provider}' resolved but has no API key. "
-            f"Set the appropriate environment variable or run 'hermes auth'."
-        )
-
-    return {
+    creds = {
         "model": configured_model or runtime.get("model") or None,
         "provider": runtime.get("provider"),
         "base_url": runtime.get("base_url"),
-        "api_key": api_key,
+        "api_key": runtime.get("api_key", ""),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
+    creds["api_key"] = _resolve_usable_delegation_api_key(
+        creds,
+        configured_provider,
+        parent_agent,
+    )
+    if not creds["api_key"] and creds.get("provider") != "custom":
+        raise ValueError(
+            f"Delegation provider '{configured_provider}' resolved but has no API key. "
+            f"Set the appropriate environment variable or run 'hermes auth'."
+        )
+    return creds
 
 
 def _load_config() -> dict:

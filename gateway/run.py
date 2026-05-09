@@ -4871,6 +4871,93 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _load_natural_dispatch_context(self, source: SessionSource, limit: int = 6) -> list[str]:
+        """Load a small recent transcript window for bare continuation admission."""
+        store = getattr(self, "session_store", None)
+        if not store:
+            return []
+        try:
+            session_entry = store.get_or_create_session(source)
+            history = store.load_transcript(session_entry.session_id)
+        except Exception:
+            logger.debug("Natural dispatch context load failed", exc_info=True)
+            return []
+
+        context: list[str] = []
+        for item in (history or [])[-limit:]:
+            content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        part_text = part.get("text") or part.get("content")
+                        if part_text:
+                            parts.append(str(part_text))
+                    elif part:
+                        parts.append(str(part))
+                content = " ".join(parts)
+            if content:
+                text = str(content).strip()
+                if text:
+                    context.append(text[:600])
+        return context
+
+    def _build_natural_dispatch_continuation_prompt(self, original_text: str, context: list[str]) -> str:
+        recent = [item.strip().replace("\n", " ") for item in context if item and item.strip()]
+        excerpt = "\n".join(f"- {item[:400]}" for item in recent[-4:])
+        if not excerpt:
+            excerpt = "- No recent transcript excerpt was available."
+        return (
+            "Continue the active Telegram workstream from the recent transcript. "
+            f"The user sent: {(original_text or '').strip() or 'continue'}.\n\n"
+            f"Recent context:\n{excerpt}"
+        )
+
+    async def _maybe_handle_natural_dispatch(self, event: MessageEvent, source: SessionSource) -> Optional[str]:
+        """Route complex Telegram natural-language work to /background before agent execution."""
+        try:
+            if source.platform != Platform.TELEGRAM:
+                return None
+            if event.message_type != MessageType.TEXT or event.get_command():
+                return None
+            from gateway.natural_dispatch import (
+                classify_natural_dispatch,
+                is_bare_continuation_message,
+                is_execution_acceptance_message,
+            )
+
+            needs_context = (
+                is_bare_continuation_message(event.text or "")
+                or is_execution_acceptance_message(event.text or "")
+            )
+            context = self._load_natural_dispatch_context(source) if needs_context else []
+            decision = classify_natural_dispatch(
+                event.text or "",
+                getattr(self, "config", None),
+                context=context,
+            )
+            if not decision.should_background:
+                return None
+
+            prompt = (event.text or "").strip()
+            if decision.reason in {"continuation_context", "accepted_execution_context"}:
+                prompt = self._build_natural_dispatch_continuation_prompt(event.text or "", context)
+
+            bg_event = MessageEvent(
+                text=f"/background {prompt}",
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=getattr(event, "raw_message", None),
+                message_id=getattr(event, "message_id", None),
+                reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                reply_to_text=getattr(event, "reply_to_text", None),
+                channel_prompt=getattr(event, "channel_prompt", None),
+            )
+            return await self._handle_background_command(bg_event)
+        except Exception:
+            logger.debug("Natural dispatch admission failed; falling back to foreground", exc_info=True)
+            return None
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -5794,6 +5881,11 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        if not command:
+            _natural_dispatch_response = await self._maybe_handle_natural_dispatch(event, source)
+            if _natural_dispatch_response is not None:
+                return _natural_dispatch_response
 
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about
@@ -14957,6 +15049,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     """
     from cron.scheduler import tick as cron_tick
     from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
+    from gateway.status import write_runtime_heartbeat
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -14967,10 +15060,45 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
+        stale_after_seconds = _cron_ticker_stale_after_seconds(interval)
         try:
-            cron_tick(verbose=False, adapters=adapters, loop=loop)
+            write_runtime_heartbeat(
+                "cron_ticker",
+                phase="tick_started",
+                interval_seconds=interval,
+                stale_after_seconds=stale_after_seconds,
+            )
+        except Exception as e:
+            logger.debug("Cron ticker heartbeat start update error: %s", e)
+        try:
+            _run_cron_tick_with_heartbeat(
+                cron_tick,
+                adapters=adapters,
+                loop=loop,
+                interval=interval,
+                heartbeat_writer=write_runtime_heartbeat,
+            )
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
+            try:
+                write_runtime_heartbeat(
+                    "cron_ticker",
+                    phase="tick_error",
+                    interval_seconds=interval,
+                    stale_after_seconds=stale_after_seconds,
+                )
+            except Exception as heartbeat_error:
+                logger.debug("Cron ticker heartbeat error update error: %s", heartbeat_error)
+        else:
+            try:
+                write_runtime_heartbeat(
+                    "cron_ticker",
+                    phase="tick_ok",
+                    interval_seconds=interval,
+                    stale_after_seconds=stale_after_seconds,
+                )
+            except Exception as e:
+                logger.debug("Cron ticker heartbeat ok update error: %s", e)
 
         tick_count += 1
 
@@ -15031,6 +15159,91 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")
+
+
+def _cron_ticker_stale_after_seconds(interval: int) -> int:
+    """Return health-guard staleness threshold for cron loop heartbeats."""
+    return max(int(interval) * 4, int(interval) + 180)
+
+
+def _cron_ticker_running_heartbeat_max_seconds(interval: int) -> float:
+    """Bound how long a single cron tick may self-report as still running."""
+    raw = os.getenv("HERMES_CRON_TICK_HEARTBEAT_MAX_SECONDS", "").strip()
+    if raw:
+        try:
+            configured = float(raw)
+            if configured > 0:
+                return configured
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid HERMES_CRON_TICK_HEARTBEAT_MAX_SECONDS=%r; using default",
+                raw,
+            )
+
+    raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    try:
+        cron_timeout = float(raw_cron_timeout) if raw_cron_timeout else 600.0
+        if cron_timeout <= 0:
+            cron_timeout = 600.0
+    except (TypeError, ValueError):
+        cron_timeout = 600.0
+
+    return max(900.0, cron_timeout + float(interval) + 120.0)
+
+
+def _run_cron_tick_with_heartbeat(
+    cron_tick,
+    *,
+    adapters,
+    loop,
+    interval: int,
+    heartbeat_writer,
+    heartbeat_period_seconds: Optional[float] = None,
+):
+    """Run one cron tick while refreshing heartbeats during legitimate long work."""
+    import concurrent.futures
+
+    stale_after_seconds = _cron_ticker_stale_after_seconds(interval)
+    max_running_seconds = _cron_ticker_running_heartbeat_max_seconds(interval)
+    heartbeat_period = (
+        float(heartbeat_period_seconds)
+        if heartbeat_period_seconds is not None
+        else min(30.0, max(5.0, float(interval) / 2.0))
+    )
+    started = time.monotonic()
+    warned_overdue = False
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="hermes-cron-tick",
+    ) as pool:
+        future = pool.submit(cron_tick, verbose=False, adapters=adapters, loop=loop)
+        while True:
+            try:
+                return future.result(timeout=heartbeat_period)
+            except concurrent.futures.TimeoutError:
+                elapsed = time.monotonic() - started
+                if elapsed <= max_running_seconds:
+                    try:
+                        heartbeat_writer(
+                            "cron_ticker",
+                            phase="tick_running",
+                            interval_seconds=interval,
+                            stale_after_seconds=stale_after_seconds,
+                        )
+                    except Exception as e:
+                        logger.debug("Cron ticker running heartbeat update error: %s", e)
+                    continue
+
+                if not warned_overdue:
+                    warned_overdue = True
+                    logger.warning(
+                        "Cron tick exceeded %.0fs heartbeat window; suppressing "
+                        "running heartbeats so the external health guard can recover "
+                        "if the tick is wedged.",
+                        max_running_seconds,
+                    )
+                return future.result()
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:

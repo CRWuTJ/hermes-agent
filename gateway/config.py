@@ -417,6 +417,9 @@ class GatewayConfig:
 
     # User-defined quick commands (slash commands that bypass the agent loop)
     quick_commands: Dict[str, Any] = field(default_factory=dict)
+
+    # Natural-language admission control for Telegram foreground/background routing.
+    natural_dispatch: Dict[str, Any] = field(default_factory=lambda: {"enabled": True})
     
     # Storage paths
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
@@ -529,6 +532,7 @@ class GatewayConfig:
             },
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
+            "natural_dispatch": self.natural_dispatch,
             "sessions_dir": str(self.sessions_dir),
             "always_log_local": self.always_log_local,
             "stt_enabled": self.stt_enabled,
@@ -573,6 +577,10 @@ class GatewayConfig:
         if not isinstance(quick_commands, dict):
             quick_commands = {}
 
+        natural_dispatch = data.get("natural_dispatch", {"enabled": True})
+        if not isinstance(natural_dispatch, dict):
+            natural_dispatch = {"enabled": True}
+
         stt_enabled = data.get("stt_enabled")
         if stt_enabled is None:
             stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
@@ -598,6 +606,7 @@ class GatewayConfig:
             reset_by_platform=reset_by_platform,
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
+            natural_dispatch=natural_dispatch,
             sessions_dir=sessions_dir,
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
             stt_enabled=_coerce_bool(stt_enabled, True),
@@ -681,6 +690,17 @@ def load_gateway_config() -> GatewayConfig:
                         "Ignoring invalid quick_commands in config.yaml "
                         "(expected mapping, got %s)",
                         type(qc).__name__,
+                    )
+
+            natural_dispatch = yaml_cfg.get("natural_dispatch")
+            if natural_dispatch is not None:
+                if isinstance(natural_dispatch, dict):
+                    gw_data["natural_dispatch"] = natural_dispatch
+                else:
+                    logger.warning(
+                        "Ignoring invalid natural_dispatch in config.yaml "
+                        "(expected mapping, got %s)",
+                        type(natural_dispatch).__name__,
                     )
 
             stt_cfg = yaml_cfg.get("stt")

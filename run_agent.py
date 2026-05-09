@@ -11095,6 +11095,16 @@ class AIAgent:
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
 
+        _learning_capability_context = ""
+        if "learning_absorption" in self.valid_tool_names:
+            try:
+                from tools.learning_absorption_tool import build_capability_invocation_context
+
+                _query = original_user_message if isinstance(original_user_message, str) else ""
+                _learning_capability_context = build_capability_invocation_context(_query) or ""
+            except Exception as exc:
+                logger.debug("learning capability context build failed: %s", exc)
+
         # Main conversation loop
         api_call_count = 0
         final_response = None
@@ -11306,6 +11316,8 @@ class AIAgent:
                             _injections.append(_fenced)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
+                    if _learning_capability_context:
+                        _injections.append(_learning_capability_context)
                     if _injections:
                         _base = api_msg.get("content", "")
                         if isinstance(_base, str):
@@ -14278,6 +14290,18 @@ class AIAgent:
                         break  # First non-empty string wins
             except Exception as exc:
                 logger.warning("transform_llm_output hook failed: %s", exc)
+
+        # Learning self-review: the response has already been finalized for
+        # the user. This only records obvious speech-policy mismatches and
+        # must never mutate the reply.
+        if final_response and not interrupted and "learning_absorption" in self.valid_tool_names:
+            try:
+                if isinstance(original_user_message, str):
+                    from tools.learning_absorption_tool import evaluate_speech_response
+
+                    evaluate_speech_response(original_user_message, final_response)
+            except Exception as exc:
+                logger.debug("learning speech self-review failed: %s", exc)
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.

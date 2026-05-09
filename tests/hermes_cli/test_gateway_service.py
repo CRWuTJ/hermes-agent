@@ -37,6 +37,14 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    def test_systemd_definition_normalization_ignores_path_env_drift(self):
+        installed = '[Service]\nEnvironment="PATH=/usr/bin:/bin"\nWorkingDirectory=/repo\n'
+        expected = '[Service]\nEnvironment="PATH=/usr/local/bin:/usr/bin:/bin"\nWorkingDirectory=/repo\n'
+
+        assert gateway_cli._normalize_service_definition(installed) == (
+            gateway_cli._normalize_service_definition(expected)
+        )
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")

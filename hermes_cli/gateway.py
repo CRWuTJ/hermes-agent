@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1971,7 +1972,13 @@ WantedBy=default.target
 """
 
 def _normalize_service_definition(text: str) -> str:
-    return "\n".join(line.rstrip() for line in text.strip().splitlines())
+    normalized = "\n".join(line.rstrip() for line in text.strip().splitlines())
+    return re.sub(
+        r'^Environment="PATH=.*"$',
+        'Environment="PATH=__HERMES_PATH__"',
+        normalized,
+        flags=re.M,
+    )
 
 
 def _normalize_launchd_plist_for_comparison(text: str) -> str:

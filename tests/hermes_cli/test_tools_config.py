@@ -11,6 +11,7 @@ from hermes_cli.tools_config import (
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
+    _print_tools_list,
     _reconfigure_tool,
     _save_platform_tools,
     _toolset_has_keys,
@@ -198,6 +199,16 @@ def test_get_platform_tools_includes_enabled_mcp_servers_by_default():
     assert "exa" in enabled
     assert "web-search-prime" in enabled
     assert "disabled-server" not in enabled
+
+
+def test_print_tools_list_marks_disabled_mcp_servers(capsys):
+    _print_tools_list(set(), {"obsidian": {"command": "npx", "enabled": False}}, "cli")
+
+    output = capsys.readouterr().out
+
+    assert "obsidian" in output
+    assert "disabled" in output
+    assert "all tools enabled" not in output
 
 
 def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_selection():

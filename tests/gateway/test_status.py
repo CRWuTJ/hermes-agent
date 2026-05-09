@@ -334,6 +334,41 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_runtime_heartbeat_overwrites_stale_cron_ticker(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 1000.0,
+            "kind": "hermes-gateway",
+            "gateway_state": "running",
+            "platforms": {"telegram": {"state": "connected"}},
+            "heartbeats": {
+                "cron_ticker": {
+                    "updated_at": "2025-01-01T00:00:00+00:00",
+                    "interval_seconds": 60,
+                    "stale_after_seconds": 180,
+                    "phase": "tick_started",
+                }
+            },
+            "updated_at": "2025-01-01T00:00:00+00:00",
+        }))
+
+        status.write_runtime_heartbeat(
+            "cron_ticker",
+            phase="tick_ok",
+            interval_seconds=60,
+            stale_after_seconds=240,
+        )
+
+        payload = status.read_runtime_status()
+        heartbeat = payload["heartbeats"]["cron_ticker"]
+        assert payload["pid"] == os.getpid()
+        assert payload["platforms"]["telegram"]["state"] == "connected"
+        assert heartbeat["phase"] == "tick_ok"
+        assert heartbeat["stale_after_seconds"] == 240
+        assert heartbeat["updated_at"] != "2025-01-01T00:00:00+00:00"
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):

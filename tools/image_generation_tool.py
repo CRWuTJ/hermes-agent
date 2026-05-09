@@ -20,19 +20,25 @@ Pricing shown in UI strings is as-of the initial commit; we accept drift and
 update when it's noticed.
 """
 
+import base64
 import json
 import logging
 import os
 import datetime
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlencode
 
-import fal_client
+try:
+    import fal_client
+except ImportError:  # pragma: no cover - exercised through availability checks
+    fal_client = None
 
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from hermes_cli.config import get_hermes_home
 from tools.tool_backend_helpers import (
     fal_key_is_configured,
     managed_nous_tools_enabled,
@@ -294,6 +300,12 @@ DEFAULT_MODEL = "fal-ai/flux-2/klein/9b"
 
 DEFAULT_ASPECT_RATIO = "landscape"
 VALID_ASPECT_RATIOS = ("landscape", "square", "portrait")
+OPENAI_IMAGE_DEFAULT_MODEL = "gpt-image-2"
+OPENAI_IMAGE_SIZE_MAP = {
+    "landscape": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +326,174 @@ _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
 _managed_fal_client = None
 _managed_fal_client_config = None
 _managed_fal_client_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible Images API lane
+# ---------------------------------------------------------------------------
+def _coerce_openai_image_timeout(value: Any) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return 60.0
+    return max(timeout, 1.0)
+
+
+def _resolve_openai_image_config(*, backup: bool = False) -> Optional[Dict[str, Any]]:
+    prefix = "IMAGE_OPENAI_BACKUP_" if backup else "IMAGE_OPENAI_"
+    base_url = os.getenv(f"{prefix}BASE_URL", "").strip()
+    api_key = os.getenv(f"{prefix}API_KEY", "").strip()
+    if not base_url or not api_key:
+        return None
+    model = os.getenv(f"{prefix}MODEL", "").strip() or OPENAI_IMAGE_DEFAULT_MODEL
+    timeout = _coerce_openai_image_timeout(os.getenv(f"{prefix}TIMEOUT") or os.getenv("IMAGE_OPENAI_TIMEOUT"))
+    return {
+        "base_url": base_url.rstrip("/"),
+        "api_key": api_key,
+        "model": model,
+        "timeout": timeout,
+        "role": "backup" if backup else "primary",
+    }
+
+
+def _resolve_openai_image_configs() -> list[Dict[str, Any]]:
+    configs: list[Dict[str, Any]] = []
+    primary = _resolve_openai_image_config()
+    backup = _resolve_openai_image_config(backup=True)
+    if primary:
+        configs.append(primary)
+    if backup:
+        configs.append(backup)
+    return configs
+
+
+def _generated_images_dir() -> Path:
+    path = get_hermes_home() / "generated-images"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _image_extension(content_type: str | None, output_format: str | None = None) -> str:
+    fmt = str(output_format or "").strip().lower()
+    if fmt in {"jpg", "jpeg"}:
+        return ".jpg"
+    if fmt in {"webp", "png"}:
+        return f".{fmt}"
+    content = str(content_type or "").lower()
+    if "jpeg" in content or "jpg" in content:
+        return ".jpg"
+    if "webp" in content:
+        return ".webp"
+    return ".png"
+
+
+def _write_generated_image(data: bytes, *, output_format: str | None = None, content_type: str | None = None) -> str:
+    ext = _image_extension(content_type, output_format)
+    path = _generated_images_dir() / f"image_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    path.write_bytes(data)
+    return str(path)
+
+
+def _decode_b64_image(value: str) -> bytes:
+    return base64.b64decode(str(value or "").encode("ascii"))
+
+
+def _extract_first_openai_image(data: Dict[str, Any]) -> Dict[str, Any]:
+    items = data.get("data")
+    if not isinstance(items, list) or not items:
+        raise ValueError("OpenAI-compatible image endpoint returned no image data")
+    first = items[0]
+    if not isinstance(first, dict):
+        raise ValueError("OpenAI-compatible image endpoint returned invalid image data")
+    return first
+
+
+def _post_openai_image_request(
+    config: Dict[str, Any],
+    prompt: str,
+    *,
+    aspect_ratio: str,
+    output_format: str,
+) -> Dict[str, Any]:
+    import httpx
+
+    url = f"{config['base_url']}/images/generations"
+    payload: Dict[str, Any] = {
+        "model": config["model"],
+        "prompt": prompt,
+        "size": OPENAI_IMAGE_SIZE_MAP.get(aspect_ratio, OPENAI_IMAGE_SIZE_MAP[DEFAULT_ASPECT_RATIO]),
+    }
+    if output_format:
+        payload["output_format"] = output_format
+    headers = {"Authorization": f"Bearer {config['api_key']}"}
+
+    with httpx.Client(timeout=config["timeout"]) as client:
+        try:
+            response = client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+        except Exception as exc:
+            status = _extract_http_status(exc)
+            if status != 400 or "size" not in payload:
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload.pop("size", None)
+            response = client.post(url, headers=headers, json=fallback_payload)
+            response.raise_for_status()
+
+        image_item = _extract_first_openai_image(response.json())
+        if image_item.get("b64_json"):
+            image_bytes = _decode_b64_image(image_item["b64_json"])
+            content_type = f"image/{output_format or 'png'}"
+        elif image_item.get("url"):
+            download = client.get(str(image_item["url"]), headers=headers)
+            download.raise_for_status()
+            image_bytes = download.content
+            content_type = download.headers.get("content-type")
+        else:
+            raise ValueError("OpenAI-compatible image endpoint returned neither b64_json nor url")
+
+    file_path = _write_generated_image(
+        image_bytes,
+        output_format=output_format,
+        content_type=content_type,
+    )
+    return {
+        "success": True,
+        "image": file_path,
+        "media": f"MEDIA:{file_path}",
+        "file_path": file_path,
+        "model": config["model"],
+        "backend": "openai-compatible",
+        "backend_role": config["role"],
+    }
+
+
+def _generate_openai_image(
+    prompt: str,
+    *,
+    aspect_ratio: str,
+    output_format: str,
+) -> Dict[str, Any]:
+    configs = _resolve_openai_image_configs()
+    if not configs:
+        raise ValueError("IMAGE_OPENAI_BASE_URL and IMAGE_OPENAI_API_KEY are required")
+    last_error: BaseException | None = None
+    for config in configs:
+        try:
+            return _post_openai_image_request(
+                config,
+                prompt,
+                aspect_ratio=aspect_ratio,
+                output_format=output_format,
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "OpenAI-compatible image backend '%s' failed: %s",
+                config.get("role"),
+                exc,
+            )
+    raise RuntimeError(f"All OpenAI-compatible image backends failed: {last_error}") from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +518,8 @@ class _ManagedFalSyncClient:
     """Small per-instance wrapper around fal_client.SyncClient for managed queue hosts."""
 
     def __init__(self, *, key: str, queue_run_origin: str):
+        if fal_client is None:
+            raise RuntimeError("fal_client is required for managed FAL gateway mode")
         sync_client_class = getattr(fal_client, "SyncClient", None)
         if sync_client_class is None:
             raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
@@ -438,6 +620,8 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
+        if fal_client is None:
+            raise RuntimeError("fal_client is required for FAL image generation")
         return fal_client.submit(model, arguments=arguments, headers=request_headers)
 
     managed_client = _get_managed_fal_client(managed_gateway)
@@ -659,12 +843,6 @@ def image_generate_tool(
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
 
-        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
-            message = "FAL_KEY environment variable not set"
-            if managed_nous_tools_enabled():
-                message += " and managed FAL gateway is unavailable"
-            raise ValueError(message)
-
         aspect_lc = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
         if aspect_lc not in VALID_ASPECT_RATIOS:
             logger.warning(
@@ -672,6 +850,27 @@ def image_generate_tool(
                 aspect_ratio, DEFAULT_ASPECT_RATIO,
             )
             aspect_lc = DEFAULT_ASPECT_RATIO
+
+        if _resolve_openai_image_configs():
+            response_data = _generate_openai_image(
+                prompt.strip(),
+                aspect_ratio=aspect_lc,
+                output_format=(output_format or "png"),
+            )
+            generation_time = (datetime.datetime.now() - start_time).total_seconds()
+            debug_call_data["model"] = response_data.get("model", model_id)
+            debug_call_data["success"] = True
+            debug_call_data["images_generated"] = 1
+            debug_call_data["generation_time"] = generation_time
+            _debug.log_call("image_generate_tool", debug_call_data)
+            _debug.save()
+            return json.dumps(response_data, indent=2, ensure_ascii=False)
+
+        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
+            message = "FAL_KEY environment variable not set"
+            if managed_nous_tools_enabled():
+                message += " and managed FAL gateway is unavailable"
+            raise ValueError(message)
 
         overrides: Dict[str, Any] = {}
         if num_inference_steps is not None:
@@ -787,9 +986,10 @@ def check_image_generation_requirements() -> bool:
     providers is resolved per-call by ``image_gen.provider``.
     """
     try:
-        if check_fal_api_key():
-            fal_client  # noqa: F401 — SDK presence check
+        if _resolve_openai_image_configs():
             return True
+        if check_fal_api_key():
+            return fal_client is not None
     except ImportError:
         pass
 

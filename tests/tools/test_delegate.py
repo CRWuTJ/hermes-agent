@@ -784,7 +784,10 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["base_url"], "https://openrouter.ai/api/v1")
         self.assertEqual(creds["api_key"], "sk-or-test-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
-        mock_resolve.assert_called_once_with(requested="openrouter")
+        mock_resolve.assert_called_once_with(
+            requested="openrouter",
+            target_model="google/gemini-3-flash-preview",
+        )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_uses_runtime_model_when_config_model_missing(self, mock_resolve):
@@ -804,7 +807,10 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["model"], "server-default-model")
         self.assertEqual(creds["provider"], "custom")
         self.assertEqual(creds["base_url"], "https://my-server.example/v1")
-        mock_resolve.assert_called_once_with(requested="custom:my-server")
+        mock_resolve.assert_called_once_with(
+            requested="custom:my-server",
+            target_model=None,
+        )
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
@@ -868,7 +874,10 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["provider"], "nous")
         self.assertEqual(creds["base_url"], "https://inference-api.nousresearch.com/v1")
         self.assertEqual(creds["api_key"], "nous-agent-key-xyz")
-        mock_resolve.assert_called_once_with(requested="nous")
+        mock_resolve.assert_called_once_with(
+            requested="nous",
+            target_model="hermes-3-llama-3.1-8b",
+        )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
@@ -895,6 +904,46 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials(cfg, parent)
         self.assertIn("no API key", str(ctx.exception))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_codex_named_provider_placeholder_key_reuses_matching_parent_key(self, mock_resolve):
+        """Codex-style named custom providers must not pass placeholder auth to children."""
+        mock_resolve.return_value = {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "no-key-required",
+            "api_mode": "codex_responses",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "http://127.0.0.1:8317/v1"
+        parent.api_key = "parent-auth-key"
+        parent.api_mode = "codex_responses"
+        cfg = {"model": "gpt-5.5", "provider": "gpt-mainline-codex-local"}
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["api_key"], "parent-auth-key")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_codex_named_provider_placeholder_key_raises_when_parent_cannot_supply_key(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "no-key-required",
+            "api_mode": "codex_responses",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://openrouter.ai/api/v1"
+        parent.api_key = "parent-auth-key"
+        parent.api_mode = "chat_completions"
+        cfg = {"model": "gpt-5.5", "provider": "gpt-mainline-codex-local"}
+
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_delegation_credentials(cfg, parent)
+
+        self.assertIn("no usable API key", str(ctx.exception))
+        self.assertIn("gpt-mainline-codex-local", str(ctx.exception))
 
     def test_missing_config_keys_inherit_parent(self):
         """When config dict has no model/provider keys at all, inherits parent."""

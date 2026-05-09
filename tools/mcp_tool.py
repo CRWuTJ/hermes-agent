@@ -249,6 +249,11 @@ _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
 if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
     logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
 
+_MISSING_MCP_SDK_MESSAGE = (
+    "MCP SDK is not installed; install the optional 'mcp' package "
+    "or disable/remove MCP servers."
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1179,6 +1184,9 @@ class MCPServerTask:
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
+        if not _MCP_AVAILABLE:
+            raise ImportError(_MISSING_MCP_SDK_MESSAGE)
+
         command = config.get("command")
         args = config.get("args", [])
         user_env = config.get("env")
@@ -1259,6 +1267,9 @@ class MCPServerTask:
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
+        if not _MCP_AVAILABLE:
+            raise ImportError(_MISSING_MCP_SDK_MESSAGE)
+
         if not _MCP_HTTP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires HTTP transport but "

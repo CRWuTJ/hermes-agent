@@ -436,6 +436,43 @@ def write_runtime_status(
     _write_json_file(path, payload)
 
 
+def write_runtime_heartbeat(
+    name: str,
+    *,
+    phase: str,
+    interval_seconds: Optional[int] = None,
+    stale_after_seconds: Optional[int] = None,
+) -> None:
+    """Persist a lightweight heartbeat for a gateway background loop."""
+    heartbeat_name = str(name or "").strip()
+    if not heartbeat_name:
+        raise ValueError("heartbeat name is required")
+
+    path = _get_runtime_status_path()
+    payload = _read_json_file(path) or _build_runtime_status_record()
+    payload.setdefault("platforms", {})
+    payload.setdefault("kind", _GATEWAY_KIND)
+    payload["pid"] = os.getpid()
+    payload["start_time"] = _get_process_start_time(os.getpid())
+    payload["updated_at"] = _utc_now_iso()
+
+    heartbeats = payload.get("heartbeats")
+    if not isinstance(heartbeats, dict):
+        heartbeats = {}
+
+    entry: dict[str, Any] = {
+        "updated_at": _utc_now_iso(),
+        "phase": str(phase),
+    }
+    if interval_seconds is not None:
+        entry["interval_seconds"] = int(interval_seconds)
+    if stale_after_seconds is not None:
+        entry["stale_after_seconds"] = int(stale_after_seconds)
+    heartbeats[heartbeat_name] = entry
+    payload["heartbeats"] = heartbeats
+    _write_json_file(path, payload)
+
+
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
     return _read_json_file(_get_runtime_status_path())
